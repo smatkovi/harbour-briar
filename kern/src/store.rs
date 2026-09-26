@@ -28,6 +28,18 @@ pub struct TransportState {
     pub out_stream: u64,
     /// Next expected incoming stream number, per time period
     pub in_stream: BTreeMap<String, u64>,
+    /// Der Lauschport, den die Gegenseite gemeldet hat. Briar wuerfelt ihn
+    /// beim ersten Start aus 32768..65535 und behaelt ihn -- eine feste
+    /// Nummer gibt es dort nicht. Ohne diesen Wert laesst sich weder eine
+    /// gelernte Absenderadresse vervollstaendigen noch eine Hotspot-Adresse
+    /// raten.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Fassung der zuletzt uebernommenen Eigenschaftsmeldung. Briar laesst
+    /// strikt die hoehere gewinnen; ohne das kann eine verspaetet
+    /// eintreffende alte Meldung eine neuere ueberschreiben.
+    #[serde(default)]
+    pub props_version: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -190,6 +202,16 @@ pub struct State {
     pub tor_key: Option<String>,
     #[serde(default)]
     pub tor_onion: Option<String>,
+    /// Die zuletzt benutzten eigenen LAN-Adressen, neueste zuerst -- Briars
+    /// PREF_LAN_IP_PORTS. Sie ueberlebt Neustart und Netzwechsel: kommt man
+    /// heim, steht die Heimadresse noch drin und passt wieder.
+    #[serde(default)]
+    pub lan_recent: Vec<String>,
+    /// Was davon zuletzt an die Kontakte ging -- Briars PROP_IP_PORTS. Getrennt
+    /// gefuehrt, damit ein blosses Umsortieren zwischen zwei bekannten Netzen
+    /// keine Eigenschaftsmeldung an alle Kontakte ausloest.
+    #[serde(default)]
+    pub lan_published: String,
     #[serde(default)]
     pub pending: Vec<PendingContact>,
     #[serde(default)]

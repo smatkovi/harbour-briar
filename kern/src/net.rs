@@ -30,7 +30,9 @@ use std::time::Duration;
 /// How many stream numbers ahead of the expected one a tag is still
 /// recognised -- Briar's reordering window.
 const WINDOW: u64 = 32;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// Wie in Briars LanTcpPluginFactory. Zusammen mit dem Sieb in dial() faellt
+// der schlimmste Fall von fuenf vollen Wartezeiten auf wenige Sekunden.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Shared = Arc<Mutex<Store>>;
@@ -190,8 +192,14 @@ fn reachable_by_a_contact(o: [u8; 4]) -> bool {
 /// UDP-Verbindung zum fest eingetragenen 192.168.1.1 verriet -- ausserhalb des
 /// Heimnetzes war das die Mobilfunkadresse, und die Gegenseite stand ohne Weg
 /// da.
-pub fn local_ips() -> Vec<String> {
-    let mut found: Vec<(u32, String)> = Vec::new();
+/// Wie `local_ips()`, aber mit der Netzmaskenlaenge -- die wird beim
+/// Aufzaehlen ohnehin berechnet und war bisher nur zum Sortieren da.
+/// Alle brauchbaren eigenen IPv4-Netze, engste Maske zuerst -- Adresse und
+/// Maskenlaenge. `local_ips()` setzt darauf auf; die Maskenlaenge wird beim
+/// Aufzaehlen ohnehin berechnet und war bisher nur zum Sortieren da, wird
+/// beim Waehlen aber gebraucht.
+pub fn local_nets() -> Vec<(std::net::Ipv4Addr, u32)> {
+    let mut found: Vec<(u32, std::net::Ipv4Addr)> = Vec::new();
     unsafe {
         let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut list) != 0 {
@@ -222,10 +230,10 @@ pub fn local_ips() -> Vec<String> {
             };
             // Dieselbe Adresse kann mit mehreren Masken eingetragen sein
             // (Mobilfunk meldet hier /8 und /24). Es zaehlt die engste.
-            let text = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
-            match found.iter_mut().find(|(_, a)| *a == text) {
+            let ip = std::net::Ipv4Addr::from(octets);
+            match found.iter_mut().find(|(_, a)| *a == ip) {
                 Some(seen) => seen.0 = seen.0.max(prefix),
-                None => found.push((prefix, text)),
+                None => found.push((prefix, ip)),
             }
         }
         libc::freeifaddrs(list);
@@ -235,7 +243,13 @@ pub fn local_ips() -> Vec<String> {
     // engen privaten Netzen das richtige ist, sagt die Adresse nicht; das
     // entscheidet beim Waehlen der erste, der antwortet.
     found.sort_by(|a, b| b.0.cmp(&a.0));
-    found.into_iter().map(|(_, a)| a).collect()
+    found.into_iter().map(|(prefix, ip)| (ip, prefix)).collect()
+}
+
+/// Jede IPv4-Adresse dieses Geraets, unter der ein Kontakt im selben Netz es
+/// erreichen koennte, engste Maske zuerst.
+pub fn local_ips() -> Vec<String> {
+    local_nets().into_iter().map(|(ip, _)| ip.to_string()).collect()
 }
 
 /// Die vorderste unserer Adressen -- fuer die Statusanzeige, die nur eine
@@ -244,35 +258,90 @@ pub fn local_ip() -> Option<String> {
     local_ips().into_iter().next()
 }
 
-/// Eine gemeldete Liste, wie wir sie aufbewahren: Eintraege beschnitten, leere
-/// weg, Reihenfolge unangetastet -- die Gegenseite hat ihr engstes Netz nach
-/// vorne gestellt.
+/// Briars Obergrenze fuer den Wert einer Transporteigenschaft
+/// (MAX_PROPERTY_LENGTH), gemessen in UTF-8-Bytes. Das ist keine Hoeflichkeit,
+/// sondern eine Protokollgrenze: der Pruefer auf der Gegenseite laeuft ueber
+/// **jede** eingehende Eigenschaftsnachricht und verwirft bei Ueberlaenge die
+/// ganze Nachricht, nicht nur den zu langen Wert. Eine unbegrenzte Liste macht
+/// uns damit fuer echtes Briar unsichtbar.
+const MAX_PROPERTY_LENGTH: usize = 100;
+
+/// Ein `ip:port` streng lesen. Streng heisst vor allem: die Adresse wird als
+/// Zahlenform geparst und nie aufgeloest. Briar baut denselben Schutz mit
+/// einem Punkt-Quad-Muster ein ("Ensure getByName() won't perform a DNS
+/// lookup") -- sonst kann ein Kontakt uns mit einer gemeldeten Adresse zu
+/// einer Namensabfrage verleiten.
+fn parse_ip_port(entry: &str) -> Option<(std::net::Ipv4Addr, u16)> {
+    let (host, port) = entry.trim().rsplit_once(':')?;
+    let address: std::net::Ipv4Addr = host.trim().parse().ok()?;
+    let port: u16 = port.trim().parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((address, port))
+}
+
+/// Eine gemeldete Liste, wie wir sie aufbewahren: nur lesbare `ip:port`
+/// bleiben, die Reihenfolge bleibt unangetastet -- die Gegenseite hat ihr
+/// engstes Netz nach vorne gestellt. Ein kaputtes Stueck wird still
+/// uebersprungen und verwirft nie die ganze Liste.
 fn clean_address_list(list: &str) -> String {
     list.split(',')
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
+        .filter_map(|e| parse_ip_port(e).map(|(a, p)| format!("{}:{}", a, p)))
         .collect::<Vec<_>>()
         .join(",")
 }
 
+/// Die eigenen Adressen ins Gedaechtnis aufnehmen, neueste zuerst, und auf
+/// Briars Laengengrenze kuerzen. Gibt zurueck, ob eine davon neu war -- nur
+/// dann muessen die Kontakte etwas erfahren. Ein blosses Umsortieren zwischen
+/// zwei bekannten Netzen bleibt fuer sie unsichtbar, genau wie bei Briar.
+fn note_local_addresses(state: &mut crate::store::State) -> bool {
+    let port = state.listen_port;
+    let mut neu = false;
+    // Rueckwaerts einfuegen, damit am Ende die engste Maske vorne steht:
+    // local_ips() liefert sie bereits in dieser Reihenfolge.
+    for ip in local_ips().into_iter().rev() {
+        let eintrag = format!("{}:{}", ip, port);
+        if let Some(stelle) = state.lan_recent.iter().position(|e| *e == eintrag) {
+            state.lan_recent.remove(stelle);
+        } else {
+            neu = true;
+        }
+        state.lan_recent.insert(0, eintrag);
+    }
+    // Am Ende kuerzen, bis die verbundene Zeichenkette hineinpasst. Rusts
+    // String::len() zaehlt UTF-8-Bytes und misst damit genau das, was Briars
+    // Pruefer misst.
+    while state.lan_recent.len() > 1
+        && state.lan_recent.join(",").len() > MAX_PROPERTY_LENGTH
+    {
+        state.lan_recent.pop();
+    }
+    neu
+}
+
+/// Sind ausser den LAN-Adressen keine anderen Eigenschaften dabei? Nur dann
+/// darf eine unveraenderte Adressliste das Melden verhindern -- eine neue
+/// Onion- oder Bluetooth-Adresse muss immer durch.
+fn properties_nur_lan(props: &BTreeMap<String, BTreeMap<String, String>>) -> bool {
+    props.len() == 1 && props.contains_key(LAN_TRANSPORT_ID)
+}
+
 fn local_properties(
     port: u16,
+    recent: &[String],
     bluetooth: bool,
     onion: Option<String>,
 ) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut props = BTreeMap::new();
     let mut lan = BTreeMap::new();
     lan.insert("port".to_string(), port.to_string());
-    // Alle Netze auf einmal, durch Komma getrennt -- genau das Format, das
-    // Briar selbst meldet. Wer auf einem davon mit uns steht, findet uns.
-    let addresses = local_ips();
-    if !addresses.is_empty() {
-        let list = addresses
-            .iter()
-            .map(|ip| format!("{}:{}", ip, port))
-            .collect::<Vec<_>>()
-            .join(",");
-        lan.insert("ipPorts".to_string(), list);
+    // Die zuletzt benutzten Adressen, neueste zuerst -- nicht die gerade
+    // vorhandenen. So bleibt die Heimadresse eingetragen, wenn man unterwegs
+    // ist, und passt beim Heimkommen wieder.
+    if !recent.is_empty() {
+        lan.insert("ipPorts".to_string(), recent.join(","));
     }
     props.insert(LAN_TRANSPORT_ID.to_string(), lan);
     if let Some(onion) = onion.filter(|o| !o.is_empty()) {
@@ -761,8 +830,13 @@ impl Node {
             )
         };
         let their_handshake_public = key_from_hex(&their_public_hex);
-        let (our_private, our_public, our_seed, our_name, our_signature_public, port, bluetooth, onion) = {
-            let store = self.store.lock().unwrap();
+        let (our_private, our_public, our_seed, our_name, our_signature_public,
+             port, recent, bluetooth, onion) = {
+            let mut store = self.store.lock().unwrap();
+            // Beim Handschlag ebenfalls erst das Adressgedaechtnis
+            // fortschreiben: der frische Kontakt soll sofort alle Netze
+            // kennen, in denen wir zuletzt standen.
+            note_local_addresses(&mut store.state);
             let identity = store.identity().ok_or_else(|| bad("no identity yet"))?;
             (
                 key_from_hex(&identity.handshake_private),
@@ -771,6 +845,7 @@ impl Node {
                 identity.name.clone(),
                 key_from_hex(&identity.signature_public),
                 store.state.listen_port,
+                store.state.lan_recent.clone(),
                 store.state.bluetooth,
                 store.state.tor_onion.clone(),
             )
@@ -825,7 +900,7 @@ impl Node {
         let local = ContactInfo {
             name: our_name,
             public_key: our_signature_public.to_vec(),
-            properties: local_properties(port, bluetooth, onion),
+            properties: local_properties(port, &recent, bluetooth, onion),
             timestamp: now_ms(),
         };
         let local_timestamp = local.timestamp;
@@ -876,6 +951,7 @@ impl Node {
                             address: Some(address.clone()),
                             out_stream: 0,
                             in_stream: BTreeMap::new(),
+                            ..Default::default()
                         });
                 }
                 contact.last_seen = now_ms();
@@ -909,6 +985,7 @@ impl Node {
                         address: Some(address),
                         out_stream: 0,
                         in_stream: BTreeMap::new(),
+                        ..Default::default()
                     },
                 );
             }
@@ -948,10 +1025,33 @@ impl Node {
     pub fn connect_contact(&self, id: u32, transport_id: &str) -> std::io::Result<()> {
         let address = {
             let store = self.store.lock().unwrap();
-            store
-                .contact(id)
-                .and_then(|c| c.address(transport_id))
-                .ok_or_else(|| bad("no address for this contact"))?
+            let contact = store.contact(id).ok_or_else(|| bad("no such contact"))?;
+            let mut address = contact
+                .address(transport_id)
+                .ok_or_else(|| bad("no address for this contact"))?;
+            // Zwei geratene Hotspot-Adressen anhaengen, sobald der Port der
+            // Gegenseite bekannt ist. Spannt sie gerade selbst einen
+            // Zugangspunkt auf, ist sie dort erreichbar, ohne dass wir je
+            // davon gehoert haetten. Briar raet an derselben Stelle dieselben
+            // beiden. Geraten wird nur beim Waehlen, nicht gespeichert --
+            // sonst stuenden die Vermutungen dauerhaft im Kontakt und die
+            // zwei Wege, auf denen eine Adresse ankommt, waeren verschieden.
+            if transport_id == LAN_TRANSPORT_ID {
+                if let Some(port) = contact
+                    .transports
+                    .get(LAN_TRANSPORT_ID)
+                    .and_then(|t| t.port)
+                {
+                    for geraten in ["192.168.43.1", "192.168.49.1"] {
+                        let eintrag = format!("{}:{}", geraten, port);
+                        if !address.split(',').any(|e| e.trim() == eintrag) {
+                            address.push(',');
+                            address.push_str(&eintrag);
+                        }
+                    }
+                }
+            }
+            address
         };
         let conn = dial(transport_id, &address)?;
         let peer_ip = match &conn {
@@ -967,12 +1067,24 @@ impl Node {
         let transports: Vec<String> = {
             let store = self.store.lock().unwrap();
             match store.contact(id) {
-                Some(contact) => contact
-                    .transports
-                    .iter()
-                    .filter(|(_, state)| state.address.is_some())
-                    .map(|(transport, _)| transport.clone())
-                    .collect(),
+                Some(contact) => {
+                    // Feste Folge statt der alphabetischen Ordnung der
+                    // BTreeMap: dort stuende Bluetooth vorne. Briar ordnet
+                    // ausdruecklich LAN vor Bluetooth ("Prefer LAN to
+                    // Bluetooth"); Tor kommt zuletzt, weil es das langsamste
+                    // und teuerste ist.
+                    [LAN_TRANSPORT_ID, BLUETOOTH_TRANSPORT_ID, TOR_TRANSPORT_ID]
+                        .iter()
+                        .filter(|t| {
+                            contact
+                                .transports
+                                .get(**t)
+                                .map(|s| s.address.is_some())
+                                .unwrap_or(false)
+                        })
+                        .map(|t| t.to_string())
+                        .collect()
+                }
                 None => return Err(bad("no such contact")),
             }
         };
@@ -1016,17 +1128,30 @@ impl Node {
             // message, so they are repeated until the peer acknowledges them
             // -- a peer that was still running an older version when we first
             // announced them would otherwise never hear them again.
+            // Erst das Gedaechtnis fortschreiben, dann daraus melden.
+            let etwas_neu = note_local_addresses(&mut store.state);
             let properties = local_properties(
                 store.state.listen_port,
+                &store.state.lan_recent,
                 store.state.bluetooth,
                 store.state.tor_onion.clone(),
             );
+            // Nur verteilen, wenn sich an der Liste wirklich etwas geaendert
+            // hat. Ein Wechsel zwischen zwei schon bekannten Netzen sortiert
+            // nur um und bleibt fuer die Kontakte unsichtbar -- sonst laege
+            // bei jedem Netzwechsel eine neue Nachricht an jeden Kontakt im
+            // Ausgangskorb.
+            let liste = store.state.lan_recent.join(",");
+            let liste_neu = etwas_neu || liste != store.state.lan_published;
+            if liste_neu {
+                store.state.lan_published = liste;
+            }
             let fingerprint = properties_fingerprint(&properties);
-            if store
+            let noch_nicht_gemeldet = store
                 .contact(contact_id)
                 .map(|c| c.sent_properties.as_deref() != Some(fingerprint.as_str()))
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if noch_nicht_gemeldet && (liste_neu || !properties_nur_lan(&properties)) {
                 let our_author = store
                     .identity()
                     .map(|i| key_from_hex(&i.author_id))
@@ -1195,9 +1320,14 @@ impl Node {
                 }
                 if transport_id == LAN_TRANSPORT_ID {
                     let state = contact.transport_mut(LAN_TRANSPORT_ID);
+                    // Der Port kommt aus dem, was die Gegenseite gemeldet hat,
+                    // nicht aus einer festen Nummer: echtes Briar wuerfelt
+                    // ihn beim ersten Start aus 32768..65535, eine feste 7327
+                    // waere dort immer falsch. Ohne bekannten Port wird gar
+                    // nichts gelernt.
                     if state.address.is_none() {
-                        if let Some(ip) = peer_ip {
-                            state.address = Some(format!("{}:{}", ip, DEFAULT_PORT));
+                        if let (Some(ip), Some(port)) = (peer_ip, state.port) {
+                            state.address = Some(format!("{}:{}", ip, port));
                         }
                     }
                 }
@@ -1265,7 +1395,7 @@ impl Node {
             // An address the peer announced. A known transport keeps its
             // entry -- only the address inside it is refreshed -- so stream
             // counters survive.
-            if let Some((transport, _version, values)) = sync::parse_properties_update(body) {
+            if let Some((transport, version, values)) = sync::parse_properties_update(body) {
                 let address = match transport.as_str() {
                     t if t == LAN_TRANSPORT_ID => values
                         .get("ipPorts")
@@ -1276,14 +1406,37 @@ impl Node {
                     t if t == TOR_TRANSPORT_ID => values.get("onion3").cloned(),
                     _ => None,
                 };
-                if let (Some(address), Some(contact)) = (address, store.contact_mut(contact_id)) {
+                // Der gemeldete Lauschport. Briar wuerfelt ihn einmal und
+                // behaelt ihn; ohne ihn laesst sich weder eine gelernte
+                // Absenderadresse vervollstaendigen noch eine Hotspot-Adresse
+                // raten.
+                let gemeldeter_port = values
+                    .get("port")
+                    .and_then(|p| p.trim().parse::<u16>().ok())
+                    .filter(|p| *p != 0);
+                if let Some(contact) = store.contact_mut(contact_id) {
                     let entry = contact.transport_mut(&transport);
-                    if entry.address.as_deref() != Some(address.as_str()) {
-                        entry.address = Some(address.clone());
-                        log(&format!(
-                            "contact {} announced {} for {}",
-                            contact_id, address, transport
-                        ));
+                    // Strikt die hoehere Fassung gewinnt. Ohne das kann eine
+                    // verspaetet eintreffende alte Meldung eine neuere
+                    // ueberschreiben -- Briar laesst das nicht zu.
+                    let version = version.max(0) as u64;
+                    if version != 0 && version <= entry.props_version {
+                        return true;
+                    }
+                    if version != 0 {
+                        entry.props_version = version;
+                    }
+                    if let Some(port) = gemeldeter_port {
+                        entry.port = Some(port);
+                    }
+                    if let Some(address) = address {
+                        if entry.address.as_deref() != Some(address.as_str()) {
+                            entry.address = Some(address.clone());
+                            log(&format!(
+                                "contact {} announced {} for {}",
+                                contact_id, address, transport
+                            ));
+                        }
                     }
                 }
                 return true;
@@ -1594,32 +1747,55 @@ fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         return Ok(Conn::Bluetooth(stream));
     }
-    // Die Gegenseite meldet jedes Netz, in dem sie steht, das engste zuerst.
-    // Welcher Eintrag antwortet, ist der, in dem wir zusammen stehen -- also
-    // der Reihe nach alle versuchen. Ein Daemon, der nur den ersten nimmt,
-    // erreicht eine Gegenseite mit mehreren Adressen nie wieder.
-    use std::net::ToSocketAddrs;
-    let mut last = bad("cannot resolve address");
-    for entry in address.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        let resolved: Vec<std::net::SocketAddr> = match entry.to_socket_addrs() {
-            Ok(addrs) => addrs.collect(),
-            Err(err) => {
-                last = err;
-                continue;
+    // Die Gegenseite meldet jedes Netz, in dem sie zuletzt stand, das engste
+    // zuerst. Welcher Eintrag antwortet, ist der, in dem wir zusammen stehen.
+    //
+    // Vorher wird gesiebt, und das ist kein Feinschliff: eine Liste mit fuenf
+    // veralteten Adressen aus fremden Netzen kostete sonst fuenf volle
+    // Zeitueberschreitungen, auf dem N9 spuerbare Sekunden. Briar siebt an
+    // derselben Stelle.
+    let eigene = local_nets();
+    let mut last = bad("no reachable address");
+    for (ziel, port) in address.split(',').filter_map(parse_ip_port) {
+        // Nur Adressen, die ein Gegenueber im selben Netz haben kann -- und
+        // nur solche, die zu einem unserer eigenen Netze praefixgleich sind.
+        // Eine Adresse aus einem Netz, in dem wir gar nicht stehen, kann uns
+        // nicht antworten.
+        if !reachable_by_a_contact(ziel.octets()) {
+            continue;
+        }
+        if eigene.iter().any(|(ip, _)| *ip == ziel) {
+            continue;                       // das sind wir selbst
+        }
+        if !eigene
+            .iter()
+            .any(|(ip, prefix)| same_network(*ip, *prefix, ziel))
+        {
+            continue;
+        }
+        let candidate = std::net::SocketAddr::from((ziel, port));
+        match TcpStream::connect_timeout(&candidate, CONNECT_TIMEOUT) {
+            Ok(socket) => {
+                socket.set_read_timeout(Some(IO_TIMEOUT))?;
+                socket.set_write_timeout(Some(IO_TIMEOUT))?;
+                return Ok(Conn::Tcp(socket));
             }
-        };
-        for candidate in resolved {
-            match TcpStream::connect_timeout(&candidate, CONNECT_TIMEOUT) {
-                Ok(socket) => {
-                    socket.set_read_timeout(Some(IO_TIMEOUT))?;
-                    socket.set_write_timeout(Some(IO_TIMEOUT))?;
-                    return Ok(Conn::Tcp(socket));
-                }
-                Err(err) => last = err,
-            }
+            Err(err) => last = err,
         }
     }
     Err(last)
+}
+
+/// Liegen zwei Adressen im selben Netz? Verglichen werden die ersten `prefix`
+/// Bits -- bitweise, nicht byteweise, sonst waere ein /20 falsch beurteilt.
+fn same_network(local: std::net::Ipv4Addr, prefix: u32, remote: std::net::Ipv4Addr) -> bool {
+    if prefix == 0 || prefix > 32 {
+        return false;
+    }
+    let a = u32::from_be_bytes(local.octets());
+    let b = u32::from_be_bytes(remote.octets());
+    let maske = if prefix == 32 { u32::MAX } else { !(u32::MAX >> prefix) };
+    a & maske == b & maske
 }
 
 fn bad(msg: &str) -> std::io::Error {
@@ -1670,4 +1846,69 @@ pub fn local_author(store: &Store) -> Option<(Author, SecretKey)> {
         },
         key_from_hex(&identity.signature_seed),
     ))
+}
+
+#[cfg(test)]
+mod adress_tests {
+    use super::*;
+
+    #[test]
+    fn ip_port_wird_streng_gelesen() {
+        assert_eq!(
+            parse_ip_port("192.168.1.21:7327"),
+            Some(("192.168.1.21".parse().unwrap(), 7327))
+        );
+        // Kein Name: ein Kontakt darf uns nicht zu einer Namensabfrage
+        // verleiten. Genau dagegen baut Briar sein Punkt-Quad-Muster ein.
+        assert_eq!(parse_ip_port("briarproject.org:7327"), None);
+        assert_eq!(parse_ip_port("192.168.1.21:0"), None);
+        assert_eq!(parse_ip_port("192.168.1.21"), None);
+        assert_eq!(parse_ip_port("nonsens"), None);
+    }
+
+    #[test]
+    fn kaputte_stuecke_verwerfen_nicht_die_liste() {
+        assert_eq!(
+            clean_address_list("192.168.1.21:7327, murks, 10.0.0.2:9"),
+            "192.168.1.21:7327,10.0.0.2:9"
+        );
+    }
+
+    #[test]
+    fn gleiches_netz_wird_bitweise_verglichen() {
+        let a: std::net::Ipv4Addr = "192.168.1.21".parse().unwrap();
+        assert!(same_network(a, 24, "192.168.1.99".parse().unwrap()));
+        assert!(!same_network(a, 24, "192.168.2.99".parse().unwrap()));
+        // /20 faellt byteweise auf die Nase, bitweise nicht.
+        let b: std::net::Ipv4Addr = "10.0.16.1".parse().unwrap();
+        assert!(same_network(b, 20, "10.0.31.255".parse().unwrap()));
+        assert!(!same_network(b, 20, "10.0.32.1".parse().unwrap()));
+        assert!(!same_network(a, 0, "192.168.1.22".parse().unwrap()));
+    }
+
+    #[test]
+    fn gedaechtnis_bleibt_unter_briars_laengengrenze() {
+        // Briars Pruefer verwirft bei Ueberlaenge die GANZE
+        // Eigenschaftsnachricht, nicht nur den zu langen Wert -- eine
+        // unbegrenzte Liste macht uns fuer echtes Briar unsichtbar.
+        let mut liste: Vec<String> = Vec::new();
+        for i in 1..=12 {
+            liste.insert(0, format!("192.168.{}.21:45678", i));
+            while liste.len() > 1 && liste.join(",").len() > MAX_PROPERTY_LENGTH {
+                liste.pop();
+            }
+        }
+        let verbunden = liste.join(",");
+        assert!(
+            verbunden.len() <= MAX_PROPERTY_LENGTH,
+            "zu lang: {} Byte -- {}",
+            verbunden.len(),
+            verbunden
+        );
+        // Die zuletzt gesehene Adresse steht vorne.
+        assert!(verbunden.starts_with("192.168.12.21:45678"));
+        // Und es bleibt mehr als eine uebrig, sonst waere das Gedaechtnis
+        // nutzlos.
+        assert!(liste.len() >= 4, "nur {} Eintraege", liste.len());
+    }
 }
