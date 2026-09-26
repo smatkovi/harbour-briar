@@ -92,12 +92,29 @@ public:
         return QString();
     }
 
-    // Ein einzelnes Bild lesen, ohne die Breitenreihe von decode(). Die
-    // Kamera am N9 liefert 816 px breite Rahmen; dort liefe decode() dreimal
-    // ueber fast dasselbe Bild, zweimal davon mit SmoothTransformation.
-    static QString decodeFrame(const QImage &frame)
+    // Dasselbe wie decode(), aber ohne Objekt -- die Kamera-Klasse liest so
+    // das zuletzt aufgenommene Foto.
+    static QString decodeStatic(const QString &file)
     {
-        return decodeImage(frame);
+        QString path = file;
+        if (path.startsWith(QLatin1String("file://")))
+            path = path.mid(7);
+        QImage image(path);
+        if (image.isNull())
+            return QString();
+        // Gross, klein, im Original: ein formatfuellender Code will die
+        // erste Stufe, ein kleiner im Bild die zweite, und bei einem
+        // unscharfen Foto helfen weniger Bildpunkte mehr als mehr.
+        const int widths[3] = { 1280, 1600, 800 };
+        for (int i = 0; i < 3; ++i) {
+            QImage scaled = image;
+            if (widths[i] > 0 && image.width() > widths[i])
+                scaled = image.scaledToWidth(widths[i], Qt::SmoothTransformation);
+            const QString text = decodeImage(scaled);
+            if (!text.isEmpty())
+                return text;
+        }
+        return decodeImage(image);
     }
 
 private:

@@ -2,99 +2,120 @@ import QtQuick 1.1
 import com.nokia.meego 1.0
 import "Briar.js" as Briar
 
-// Fotografiert den QR-Code des anderen Geraets ab.
+// Den QR-Code des anderen Geraets einlesen.
 //
-// Kein Camera-Element aus QtMultimediaKit: dessen Unterbau (camerabin) kommt
-// auf diesen Geraeten nicht ueber PAUSED hinaus und zeigt stumm Schwarz --
-// QCamera meldet dabei faelschlich ActiveState, ein onError kommt nie.
-// Die Aufnahme macht deshalb "kamera" (meego/kamera.h) ueber camsrcbin, den
-// Weg, den auch die Kamera-App des Systems geht. Eine laufende Vorschau gibt
-// Qt 4.7 hier ohnehin nicht her -- stattdessen liest die Kamera Rahmen, bis
-// ein Code darin steht.
+// Aufgenommen wird mit der Kamera-App des Systems, gelesen wird hier. Das
+// ist kein Umweg, sondern der einzige Weg, der auf diesen Geraeten traegt:
+// das QML-Kameraelement zeigt stumm Schwarz (sein Unterbau camerabin kommt
+// nicht ueber PAUSED hinaus), und selbst aufnehmen ginge zwar, aber ohne
+// Sucherbild -- und ohne Sucher trifft man einen Code auf einem Bildschirm
+// nicht. Die Kamera-App hat Sucher und einen Autofokus, der auch einen
+// dichten Code scharf bekommt.
 Page {
     id: seite
 
-    property string meldung: fenster.tr("scanHint")
-    property bool laeuft: false
+    property string meldung: fenster.tr("scanCameraHint")
 
     tools: ToolBarLayout {
         ToolIcon {
-            // Absichtlich immer bedienbar: der Knopf muss gerade dann gehen,
-            // wenn etwas klemmt. pageStack.pop() loest ueber Deactivating das
-            // Aufraeumen aus, das ist der Notausgang.
             platformIconId: "toolbar-back"
             onClicked: pageStack.pop()
         }
     }
 
-    // Beim Verlassen die Kamera freigeben: libomap3camd laesst sich nur
-    // einmal oeffnen, und eine Seite, die sie behaelt, sperrt sie fuer jede
-    // andere App -- und fuer den naechsten Besuch dieser Seite.
+    // Zurueck aus der Kamera-App oder aus MeeScan: erst die Zwischenablage
+    // (MeeScan legt den Code dort ab), dann das frische Foto.
     onStatusChanged: {
-        if (status === PageStatus.Deactivating)
-            kamera.abbrechen()
+        if (status !== PageStatus.Active) return
+        if (seite.wartetAufMeeScan) {
+            seite.wartetAufMeeScan = false
+            var ausAblage = kamera.ablageLesen()
+            if (ausAblage && seite.uebernehmen(ausAblage))
+                return
+            seite.meldung = fenster.tr("scanNothing")
+        }
+        if (seite.wartetAufFoto) {
+            seite.wartetAufFoto = false
+            seite.lesen()
+        }
     }
 
-    Connections {
-        target: kamera
+    property bool wartetAufFoto: false
+    property bool wartetAufMeeScan: false
 
-        onScharf: seite.meldung = fenster.tr("scanning")
+    // Einen gelesenen Text als Kontakt uebernehmen. Gibt false zurueck, wenn
+    // kein briar://-Link darin steht.
+    function uebernehmen(text) {
+        var gefunden = Briar.qrParse(text)
+        if (!gefunden || !gefunden.link)
+            return false
+        pageStack.pop()
+        pageStack.push(Qt.resolvedUrl("AddContactPage.qml"), {
+            "vorgabeLink": gefunden.link,
+            "vorgabeAdresse": gefunden.address,
+            "vorgabeBluetooth": gefunden.bluetooth,
+            "vorgabeOnion": gefunden.onion
+        })
+        return true
+    }
 
-        onErkannt: {
-            seite.laeuft = false
-            var gefunden = Briar.qrParse(text)
-            if (!gefunden || !gefunden.link) {
-                seite.meldung = fenster.tr("scanNothing")
-                return
-            }
-            pageStack.pop()
-            pageStack.push(Qt.resolvedUrl("AddContactPage.qml"), {
-                "vorgabeLink": gefunden.link,
-                "vorgabeAdresse": gefunden.address,
-                "vorgabeBluetooth": gefunden.bluetooth,
-                "vorgabeOnion": gefunden.onion
-            })
+    function lesen() {
+        var alter = kamera.alterDesLetztenFotos()
+        if (alter < 0) {
+            seite.meldung = fenster.tr("scanNoPhoto")
+            return
         }
-
-        onFehlgeschlagen: {
-            seite.laeuft = false
-            // "Zeit" heisst: die Kamera lief, es war nur kein Code zu lesen.
-            seite.meldung = grund === "Zeit" ? fenster.tr("scanNothing")
-                                             : fenster.tr("scanFailed")
-        }
-
-        onAbgebrochen: seite.laeuft = false
+        seite.meldung = fenster.tr("scanning")
+        var text = kamera.letztenCodeLesen()
+        if (!text || !seite.uebernehmen(text))
+            seite.meldung = fenster.tr("scanNothing")
     }
 
     Column {
         anchors { fill: parent; margins: 24 }
-        spacing: 24
+        spacing: 20
 
-        Item { width: 1; height: 32 }
+        Item { width: 1; height: 24 }
 
         Label {
             width: parent.width
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
-            font.pixelSize: 22
+            font.pixelSize: 20
             text: seite.meldung
         }
 
-        BusyIndicator {
+        // MeeScan zuerst, wenn es da ist: es hat als einziges einen Sucher,
+        // mit dem man zielen kann.
+        Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            running: seite.laeuft
-            visible: seite.laeuft
+            text: fenster.tr("scanWithMeeScan")
+            visible: kamera.meeScanVorhanden()
+            onClicked: {
+                seite.wartetAufMeeScan = true
+                if (!kamera.meeScanOeffnen()) {
+                    seite.wartetAufMeeScan = false
+                    seite.meldung = fenster.tr("scanFailed")
+                }
+            }
         }
 
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: fenster.tr("scanTake")
-            enabled: !seite.laeuft
+            text: fenster.tr("scanOpenCamera")
             onClicked: {
-                seite.laeuft = true
-                seite.meldung = fenster.tr("scanning")
-                kamera.aufnehmen()
+                seite.wartetAufFoto = true
+                if (!kamera.oeffnen()) {
+                    seite.wartetAufFoto = false
+                    seite.meldung = fenster.tr("scanFailed")
+                }
             }
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: fenster.tr("scanReadPhoto")
+            onClicked: seite.lesen()
         }
     }
 }

@@ -86,18 +86,6 @@ static void dienstStarten()
 int main(int argc, char *argv[])
 {
     sitzungsBusSetzen();
-    // Vor QApplication, und nicht mit argc/argv: QApplication haelt argc per
-    // Referenz fuer die ganze Laufzeit, da soll GStreamer nicht
-    // hineinschneiden. gst_init_check statt gst_init, weil gst_init im
-    // Fehlerfall per g_error() den Prozess abbricht -- eine Nebenfunktion
-    // darf die App nicht mitnehmen.
-    GError *gstFehler = 0;
-    if (!gst_init_check(0, 0, &gstFehler)) {
-        qWarning("GStreamer laesst sich nicht starten: %s",
-                 gstFehler ? gstFehler->message : "unbekannt");
-        if (gstFehler) g_error_free(gstFehler);
-    }
-
     QApplication app(argc, argv);
 
     // Without this the virtual keyboard never appears once the hardware one
