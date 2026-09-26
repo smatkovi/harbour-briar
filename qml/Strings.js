@@ -89,6 +89,8 @@ var table = {
     backgroundHint:   { de: "Nachrichten kommen auch an, wenn die App geschlossen ist, und melden sich als Benachrichtigung.",
                         en: "Messages keep arriving while the app is closed, and announce themselves as a notification." },
     scanQr:           { de: "QR-Code abfotografieren",      en: "Photograph a QR code" },
+    scanLiveHint:     { de: "Den QR-Code des anderen Geräts vor die Kamera halten.",
+                        en: "Hold the other device's QR code in front of the camera." },
     scanHint:         { de: "Den QR-Code des anderen Geräts formatfüllend aufnehmen.",
                         en: "Take a picture of the other device's QR code, filling the frame." },
     scanTake:         { de: "Aufnehmen",                    en: "Take the picture" },

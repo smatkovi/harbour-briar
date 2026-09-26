@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import QtMultimedia 5.0
+import Amber.QrFilter 1.0
 import Sailfish.Silica 1.0
 import "../Briar.js" as Briar
 
@@ -10,7 +11,7 @@ Page {
     id: page
     allowedOrientations: Orientation.Portrait
 
-    property string message: app.tr("scanHint")
+    property string message: app.tr("scanLiveHint")
     property bool busy: false
 
     Camera {
@@ -50,13 +51,41 @@ Page {
         height: parent.height - footer.height
         source: camera
         fillMode: VideoOutput.PreserveAspectFit
-        // Aus der Einbaulage des Sensors, nicht fest verdrahtet: die Seite
-        // steht im Hochformat, der Sensor sitzt quer, und um wie viel er
-        // gedreht ist, weiss nur das Geraet. Mit einer festen -90 steht das
-        // Sucherbild auf manchen Geraeten quer.
-        // Das aufgenommene Bild beruehrt das nicht -- quirc findet den Code
-        // in jeder Lage; die Drehung ist nur fuers Auge.
-        orientation: -camera.orientation
+        // Die Seite steht im Hochformat, der Sensor sitzt quer. camera.orientation
+        // laesst sich auf diesem Geraet nicht auslesen (der Kamera-Stack
+        // braucht ein echtes Fenster, headless stuerzt er ab), also steht hier
+        // ein fester Wert. Das Erkennen beruehrt das ohnehin nicht -- der
+        // Filter unten liest den Code in jeder Lage; die Drehung ist fuers Auge.
+        orientation: 90
+
+        // Liest den Code laufend aus dem Sucherbild. Das Modul gehoert zu
+        // Sailfish (qr-filter-qml-plugin) und ist dasselbe, das die
+        // Kamera-App benutzt -- kein Foto, kein Knopf, kein Umweg.
+        filters: [ qrLeser ]
+    }
+
+    QrFilter {
+        id: qrLeser
+        active: !page.busy
+
+        onDecodeFinished: {
+            if (!result)
+                return
+            page.busy = true
+            qrLeser.clearResult()
+            var found = Briar.qrParse(result)
+            if (!found || !found.link) {
+                page.busy = false
+                page.message = app.tr("scanNothing")
+                return
+            }
+            pageStack.replace(Qt.resolvedUrl("AddContactPage.qml"), {
+                "prefillLink": found.link,
+                "prefillAddress": found.address,
+                "prefillBluetooth": found.bluetooth,
+                "prefillOnion": found.onion
+            })
+        }
     }
 
     Column {
