@@ -158,6 +158,14 @@ fn main() {
             ));
             *gemerkt = jetzt;
             drop(gemerkt);
+            // Das neue Netz sofort ins Adressgedaechtnis, damit die naechste
+            // Runde es schon melden kann.
+            {
+                let mut store = watch_store.lock().unwrap();
+                if briarkern::net::note_local_addresses(&mut store.state) {
+                    let _ = store.save();
+                }
+            }
             let node = Node::new(Arc::clone(&watch_store));
             node.poll();
         });

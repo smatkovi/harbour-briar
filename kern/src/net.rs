@@ -296,7 +296,7 @@ fn clean_address_list(list: &str) -> String {
 /// Briars Laengengrenze kuerzen. Gibt zurueck, ob eine davon neu war -- nur
 /// dann muessen die Kontakte etwas erfahren. Ein blosses Umsortieren zwischen
 /// zwei bekannten Netzen bleibt fuer sie unsichtbar, genau wie bei Briar.
-fn note_local_addresses(state: &mut crate::store::State) -> bool {
+pub fn note_local_addresses(state: &mut crate::store::State) -> bool {
     let port = state.listen_port;
     let mut neu = false;
     // Rueckwaerts einfuegen, damit am Ende die engste Maske vorne steht:
@@ -514,6 +514,16 @@ impl Node {
             };
             complained = false;
             log(&format!("listening on port {}", port));
+            // Beim Binden die eigenen Adressen ins Gedaechtnis nehmen -- das
+            // ist Briars Zeitpunkt dafuer. Ohne das fuellt es sich erst beim
+            // ersten Abgleich, und ein Geraet ohne Kontaktverkehr haette gar
+            // keins.
+            {
+                let mut store = self.store.lock().unwrap();
+                if note_local_addresses(&mut store.state) {
+                    let _ = store.save();
+                }
+            }
             // The socket is bound to 0.0.0.0, so it survives a change of
             // address; only a broken socket brings us back to binding.
             let mut failures = 0;

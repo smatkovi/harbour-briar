@@ -899,11 +899,18 @@ fn status(store: &Shared) -> Value {
     // waere jede Kopplung wieder an ein einziges Netz genagelt.
     let lan_port = locked.state.listen_port;
     let lan_addresses = {
-        let list = crate::net::local_ips()
-            .iter()
-            .map(|ip| format!("{}:{}", ip, lan_port))
-            .collect::<Vec<_>>()
-            .join(",");
+        // Aus dem Gedaechtnis, nicht aus den gerade vorhandenen Adressen:
+        // hier muss genau das stehen, was die Kontakte gemeldet bekommen,
+        // sonst traegt der QR-Code etwas anderes als der Ausgangskorb.
+        let list = if locked.state.lan_recent.is_empty() {
+            crate::net::local_ips()
+                .iter()
+                .map(|ip| format!("{}:{}", ip, lan_port))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            locked.state.lan_recent.join(",")
+        };
         if list.is_empty() {
             None
         } else {
