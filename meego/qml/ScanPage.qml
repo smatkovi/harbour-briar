@@ -27,13 +27,6 @@ Page {
     // (MeeScan legt den Code dort ab), dann das frische Foto.
     onStatusChanged: {
         if (status !== PageStatus.Active) return
-        if (seite.wartetAufMeeScan) {
-            seite.wartetAufMeeScan = false
-            var ausAblage = kamera.ablageLesen()
-            if (ausAblage && seite.uebernehmen(ausAblage))
-                return
-            seite.meldung = fenster.tr("scanNothing")
-        }
         if (seite.wartetAufFoto) {
             seite.wartetAufFoto = false
             seite.lesen()
@@ -41,7 +34,19 @@ Page {
     }
 
     property bool wartetAufFoto: false
-    property bool wartetAufMeeScan: false
+
+    // MeeScan laeuft als eigenes Programm im Vordergrund; wir lesen nur mit.
+    Connections {
+        target: kamera
+        onMeeScanErkannt: {
+            if (!seite.uebernehmen(text))
+                seite.meldung = fenster.tr("scanNothing")
+        }
+        onMeeScanBeendet: seite.meldung = fenster.tr("scanNothing")
+    }
+
+    // Beim Verlassen der Seite MeeScan nicht weiterlaufen lassen.
+    Component.onDestruction: kamera.meeScanBeenden()
 
     // Einen gelesenen Text als Kontakt uebernehmen. Gibt false zurueck, wenn
     // kein briar://-Link darin steht.
@@ -92,11 +97,9 @@ Page {
             text: fenster.tr("scanWithMeeScan")
             visible: kamera.meeScanVorhanden()
             onClicked: {
-                seite.wartetAufMeeScan = true
-                if (!kamera.meeScanOeffnen()) {
-                    seite.wartetAufMeeScan = false
+                seite.meldung = fenster.tr("scanning")
+                if (!kamera.meeScanStarten())
                     seite.meldung = fenster.tr("scanFailed")
-                }
             }
         }
 

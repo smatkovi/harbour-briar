@@ -25,6 +25,7 @@
 // am dichten Code regelmaessig gescheitert war.
 
 #include <QApplication>
+#include <QByteArray>
 #include <QClipboard>
 #include <QDateTime>
 #include <QDir>
@@ -33,7 +34,15 @@
 #include <QObject>
 #include <QProcess>
 #include <QString>
+#include <QSocketNotifier>
 #include <QStringList>
+
+#include <errno.h>
+#include <pty.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "../src/qrcode.h"
 
@@ -42,7 +51,11 @@ class Kamera : public QObject
     Q_OBJECT
 
 public:
-    explicit Kamera(QObject *parent = 0) : QObject(parent) {}
+    explicit Kamera(QObject *parent = 0)
+        : QObject(parent), m_master(-1), m_kind(-1), m_wachen(0),
+          m_gefunden(false), m_marke(false), m_zeilenNachMarke(0) {}
+
+    ~Kamera() { meeScanBeenden(); }
 
     // Startet die Kamera-App. Sie legt sich vor die eigene Oberflaeche; ist
     // das Foto gemacht, kommt der Anwender ueber den Aufgabenumschalter
@@ -65,26 +78,54 @@ public:
         return QFile::exists(QLatin1String("/opt/MeeScan/bin/MeeScan"));
     }
 
-    // Startet MeeScan. Es legt den gelesenen Code in die Zwischenablage; beim
-    // Zurueckkommen wird sie ausgelesen. (Die CES-Chor-App faengt stattdessen
-    // seine Debug-Ausgabe ueber ein Pty ab -- das braucht es nur, wenn die
-    // Zwischenablage nichts hergibt.)
-    Q_INVOKABLE bool meeScanOeffnen()
+    // Startet MeeScan und liest mit, was es findet.
+    //
+    // Das Mitlesen geht ueber ein Pty, nicht ueber eine Roehre: MeeScan
+    // puffert seine Ausgabe, wenn sie nicht an einem Endgeraet haengt, und
+    // dann kommt bis zum Programmende nichts an. Auf die Zwischenablage ist
+    // auch kein Verlass -- nachgemessen: MeeScan legt den Code dort nicht ab.
+    // Denselben Umweg nimmt die CES-Chor-App auf demselben Geraet.
+    //
+    // Das Ausgabemuster ist:  barcode found:  /  <Typ>  /  <Inhalt>
+    Q_INVOKABLE bool meeScanStarten()
     {
-        merkeAblage();
-        return QProcess::startDetached(QLatin1String("/opt/MeeScan/bin/MeeScan"));
+        meeScanBeenden();
+        m_puffer.clear();
+        m_gefunden = false;
+        m_marke = false;
+        m_zeilenNachMarke = 0;
+
+        int master = -1;
+        const pid_t kind = forkpty(&master, 0, 0, 0);
+        if (kind < 0) return false;
+        if (kind == 0) {
+            // Im Kind: MeeScan braucht einen Bildschirm.
+            if (!getenv("DISPLAY")) setenv("DISPLAY", ":0", 1);
+            execl("/opt/MeeScan/bin/MeeScan", "MeeScan", (char *)0);
+            _exit(127);
+        }
+        m_master = master;
+        m_kind = kind;
+        m_wachen = new QSocketNotifier(master, QSocketNotifier::Read, this);
+        connect(m_wachen, SIGNAL(activated(int)), this, SLOT(lesbar()));
+        return true;
     }
 
-    // Was in der Zwischenablage steht -- aber nur, wenn es sich seit dem
-    // Start von MeeScan geaendert hat. Sonst laese man beim blossen Oeffnen
-    // der Seite einen alten Inhalt wieder ein.
-    Q_INVOKABLE QString ablageLesen()
+    // Beenden und aufraeumen. Darf beliebig oft kommen.
+    Q_INVOKABLE void meeScanBeenden()
     {
-        const QClipboard *ablage = QApplication::clipboard();
-        if (!ablage) return QString();
-        const QString jetzt = ablage->text();
-        if (jetzt.isEmpty() || jetzt == m_ablageVorher) return QString();
-        return jetzt;
+        if (m_wachen) {
+            m_wachen->setEnabled(false);
+            m_wachen->deleteLater();
+            m_wachen = 0;
+        }
+        if (m_master >= 0) { ::close(m_master); m_master = -1; }
+        if (m_kind > 0) {
+            ::kill(m_kind, SIGTERM);
+            int zustand = 0;
+            ::waitpid(m_kind, &zustand, WNOHANG);
+            m_kind = -1;
+        }
     }
 
     // Gibt es ueberhaupt ein Foto, und wie alt ist es? Damit kann die
@@ -106,14 +147,64 @@ public:
         return QrCode::decodeStatic(foto.absoluteFilePath());
     }
 
-private:
-    void merkeAblage()
+signals:
+    // MeeScan hat etwas gelesen.
+    void meeScanErkannt(const QString &text);
+    // MeeScan ist beendet worden, ohne etwas zu finden.
+    void meeScanBeendet();
+
+private slots:
+    void lesbar()
     {
-        const QClipboard *ablage = QApplication::clipboard();
-        m_ablageVorher = ablage ? ablage->text() : QString();
+        char block[4096];
+        const ssize_t gelesen = ::read(m_master, block, sizeof(block));
+        if (gelesen <= 0) {
+            // EIO heisst hier: das Kind ist weg. Alles andere auch.
+            meeScanBeenden();
+            if (!m_gefunden) emit meeScanBeendet();
+            return;
+        }
+        m_puffer.append(block, int(gelesen));
+        int bruch;
+        while ((bruch = m_puffer.indexOf('\n')) >= 0) {
+            QString zeile = QString::fromUtf8(m_puffer.left(bruch)).trimmed();
+            m_puffer.remove(0, bruch + 1);
+            zeileVerarbeiten(zeile);
+        }
     }
 
-    QString m_ablageVorher;
+private:
+    // barcode found:  ->  naechste Zeile ist der Typ  ->  dann der Inhalt.
+    void zeileVerarbeiten(QString zeile)
+    {
+        if (zeile.isEmpty()) return;
+        if (zeile.contains(QLatin1String("barcode found:"))) {
+            m_marke = true;
+            m_zeilenNachMarke = 0;
+            return;
+        }
+        if (!m_marke) return;
+        ++m_zeilenNachMarke;
+        if (m_zeilenNachMarke == 1) return;      // der Typ, uninteressant
+        // Die zweite Zeile nach der Marke ist der Inhalt, oft in
+        // Anfuehrungszeichen.
+        if (zeile.startsWith(QLatin1Char('"')) && zeile.endsWith(QLatin1Char('"')))
+            zeile = zeile.mid(1, zeile.length() - 2);
+        m_marke = false;
+        if (zeile.isEmpty() || m_gefunden) return;
+        m_gefunden = true;
+        const QString text = zeile;
+        meeScanBeenden();
+        emit meeScanErkannt(text);
+    }
+
+    int m_master;
+    pid_t m_kind;
+    QSocketNotifier *m_wachen;
+    QByteArray m_puffer;
+    bool m_gefunden;
+    bool m_marke;
+    int m_zeilenNachMarke;
 
     // Das neueste Bild aus dem Kameraordner. Harmattan legt alles flach
     // dorthin (26020011.jpg), Unterordner gibt es nicht.

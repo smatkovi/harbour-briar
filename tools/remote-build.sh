@@ -58,7 +58,9 @@ for m in QtCore QtGui QtNetwork QtScript QtDeclarative; do
 done
 LDFLAGS="--sysroot=$SYSROOT -static-libstdc++ -static-libgcc -Wl,-O1 \
  -Wl,--as-needed -Wl,--exclude-libs,ALL -Wl,--dynamic-linker=/lib/ld-linux.so.3"
-LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtGui -lQtCore -lpthread"
+# -lutil liefert forkpty: MeeScan puffert seine Ausgabe, wenn sie nicht an
+# einem Endgeraet haengt, und dann kommt bis zum Programmende nichts an.
+LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtGui -lQtCore -lpthread -lutil"
 
 cd "$OUT"
 # ImagePrep is a QObject, so it needs moc. The simulator Qt's moc produces
