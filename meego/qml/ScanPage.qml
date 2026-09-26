@@ -1,10 +1,16 @@
 import QtQuick 1.1
 import com.nokia.meego 1.0
-import QtMultimediaKit 1.1
 import "Briar.js" as Briar
 
-// Fotografiert den QR-Code des anderen Geraets ab. Qt 4.7 gibt QML keine
-// Kamerabilder, darum wird ausgeloest und dann die Datei gelesen.
+// Fotografiert den QR-Code des anderen Geraets ab.
+//
+// Kein Camera-Element aus QtMultimediaKit: dessen Unterbau (camerabin) kommt
+// auf diesen Geraeten nicht ueber PAUSED hinaus und zeigt stumm Schwarz --
+// QCamera meldet dabei faelschlich ActiveState, ein onError kommt nie.
+// Die Aufnahme macht deshalb "kamera" (meego/kamera.h) ueber camsrcbin, den
+// Weg, den auch die Kamera-App des Systems geht. Eine laufende Vorschau gibt
+// Qt 4.7 hier ohnehin nicht her -- stattdessen liest die Kamera Rahmen, bis
+// ein Code darin steht.
 Page {
     id: seite
 
@@ -13,33 +19,30 @@ Page {
 
     tools: ToolBarLayout {
         ToolIcon {
+            // Absichtlich immer bedienbar: der Knopf muss gerade dann gehen,
+            // wenn etwas klemmt. pageStack.pop() loest ueber Deactivating das
+            // Aufraeumen aus, das ist der Notausgang.
             platformIconId: "toolbar-back"
             onClicked: pageStack.pop()
         }
     }
 
-    // Beim Verlassen anhalten: libomap3camd laesst sich nur einmal oeffnen,
-    // und eine Seite, die die Kamera behaelt, sperrt sie fuer jede andere
-    // App -- und fuer den naechsten Besuch dieser Seite. (Ein start() beim
-    // Betreten braucht es nicht: das Element steht nach componentComplete
-    // schon im ActiveState.)
+    // Beim Verlassen die Kamera freigeben: libomap3camd laesst sich nur
+    // einmal oeffnen, und eine Seite, die sie behaelt, sperrt sie fuer jede
+    // andere App -- und fuer den naechsten Besuch dieser Seite.
     onStatusChanged: {
         if (status === PageStatus.Deactivating)
-            kamera.stop()
+            kamera.abbrechen()
     }
 
-    Camera {
-        id: kamera
-        anchors { top: parent.top; left: parent.left; right: parent.right }
-        height: parent.height - fuss.height - 16
-        focus: true
-        captureResolution: "1280x960"
-        flashMode: Camera.FlashOff
+    Connections {
+        target: kamera
 
-        onImageSaved: {
+        onScharf: seite.meldung = fenster.tr("scanning")
+
+        onErkannt: {
             seite.laeuft = false
-            var text = QrCode.decode(path)
-            var gefunden = text ? Briar.qrParse(text) : null
+            var gefunden = Briar.qrParse(text)
             if (!gefunden || !gefunden.link) {
                 seite.meldung = fenster.tr("scanNothing")
                 return
@@ -52,37 +55,45 @@ Page {
                 "vorgabeOnion": gefunden.onion
             })
         }
-        onError: {
+
+        onFehlgeschlagen: {
             seite.laeuft = false
-            // Den Grund mitschreiben: eine stumme schwarze Flaeche ist das,
-            // was die Kamera hier vorher gezeigt hat.
-            console.log("Kamera: " + errorString)
-            seite.meldung = fenster.tr("scanFailed")
+            // "Zeit" heisst: die Kamera lief, es war nur kein Code zu lesen.
+            seite.meldung = grund === "Zeit" ? fenster.tr("scanNothing")
+                                             : fenster.tr("scanFailed")
         }
+
+        onAbgebrochen: seite.laeuft = false
     }
 
     Column {
-        id: fuss
-        anchors { bottom: parent.bottom; left: parent.left; right: parent.right
-                  margins: 16 }
-        spacing: 12
+        anchors { fill: parent; margins: 24 }
+        spacing: 24
+
+        Item { width: 1; height: 32 }
 
         Label {
             width: parent.width
             wrapMode: Text.Wrap
-            color: "#a0a0a0"
-            font.pixelSize: 20
+            horizontalAlignment: Text.AlignHCenter
+            font.pixelSize: 22
             text: seite.meldung
+        }
+
+        BusyIndicator {
+            anchors.horizontalCenter: parent.horizontalCenter
+            running: seite.laeuft
+            visible: seite.laeuft
         }
 
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: seite.laeuft ? fenster.tr("scanning") : fenster.tr("scanTake")
+            text: fenster.tr("scanTake")
             enabled: !seite.laeuft
             onClicked: {
                 seite.laeuft = true
                 seite.meldung = fenster.tr("scanning")
-                kamera.captureImage()
+                kamera.aufnehmen()
             }
         }
     }

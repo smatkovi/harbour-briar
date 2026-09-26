@@ -56,9 +56,24 @@ CXXFLAGS="--sysroot=$SYSROOT -std=gnu++17 -O2 -Wall -Wno-register \
 for m in QtCore QtGui QtNetwork QtScript QtDeclarative; do
     CXXFLAGS="$CXXFLAGS -I$QTINC/$m"
 done
+# Die Kamera (meego/kamera.h) spricht GStreamer 0.10 unmittelbar an, weil das
+# QML-Element aus QtMultimediaKit auf diesen Geraeten nicht traegt -- sein
+# Unterbau camerabin kommt nicht ueber PAUSED hinaus. libxml2 ist kein
+# Versehen: gstreamer-0.10.pc zieht es mit.
+CXXFLAGS="$CXXFLAGS -DGST_USE_UNSTABLE_API \
+ -I$SYSROOT/usr/include/gstreamer-0.10 \
+ -I$SYSROOT/usr/include/glib-2.0 \
+ -I$SYSROOT/usr/lib/glib-2.0/include \
+ -I$SYSROOT/usr/include/libxml2"
 LDFLAGS="--sysroot=$SYSROOT -static-libstdc++ -static-libgcc -Wl,-O1 \
  -Wl,--as-needed -Wl,--exclude-libs,ALL -Wl,--dynamic-linker=/lib/ld-linux.so.3"
-LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtGui -lQtCore -lpthread"
+# Bewusst OHNE -lgstphotography: kamera.h benutzt aus photography.h nur den
+# Enum-Wert fuer den Makrofokus und setzt ihn per g_object_set, ruft also
+# keine gst_photography_*-Funktion. Eine fehlende Bibliothek waere sonst kein
+# misslungener Scan, sondern eine App, die gar nicht mehr startet.
+# -lgstapp liefert gst_app_sink_pull_buffer.
+LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtGui -lQtCore -lpthread \
+ -lgstapp-0.10 -lgstreamer-0.10 -lgobject-2.0 -lglib-2.0"
 
 cd "$OUT"
 # ImagePrep is a QObject, so it needs moc. The simulator Qt's moc produces
@@ -72,6 +87,8 @@ $CXX $CXXFLAGS -c moc_dienst.cpp -o moc_dienst.o
 # device has a QR library, and quirc is four C files.
 $MOC "$SRC/src/qrcode.h" -o moc_qrcode.cpp
 $CXX $CXXFLAGS -I"$SRC/src" -c moc_qrcode.cpp -o moc_qrcode.o
+$MOC "$SRC/meego/kamera.h" -o moc_kamera.cpp
+$CXX $CXXFLAGS -I"$SRC/src" -I"$SRC/meego" -c moc_kamera.cpp -o moc_kamera.o
 QUIRCOBJS=""
 for q in quirc decode identify version_db; do
     $CC --sysroot=$SYSROOT -O2 -std=gnu99 -I"$SRC/src/quirc" \
@@ -79,5 +96,6 @@ for q in quirc decode identify version_db; do
     QUIRCOBJS="$QUIRCOBJS quirc_$q.o"
 done
 $CXX $CXXFLAGS -c "$SRC/meego/main.cpp" -o main.o
-$CXX $LDFLAGS -o briar main.o moc_imageprep.o moc_dienst.o moc_qrcode.o $QUIRCOBJS $LIBS
+$CXX $LDFLAGS -o briar main.o moc_imageprep.o moc_dienst.o moc_qrcode.o \
+ moc_kamera.o $QUIRCOBJS $LIBS
 echo "== briar (Harmattan interface): $(stat -c %s briar) B"

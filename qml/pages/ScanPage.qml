@@ -50,7 +50,13 @@ Page {
         height: parent.height - footer.height
         source: camera
         fillMode: VideoOutput.PreserveAspectFit
-        orientation: -90
+        // Aus der Einbaulage des Sensors, nicht fest verdrahtet: die Seite
+        // steht im Hochformat, der Sensor sitzt quer, und um wie viel er
+        // gedreht ist, weiss nur das Geraet. Mit einer festen -90 steht das
+        // Sucherbild auf manchen Geraeten quer.
+        // Das aufgenommene Bild beruehrt das nicht -- quirc findet den Code
+        // in jeder Lage; die Drehung ist nur fuers Auge.
+        orientation: -camera.orientation
     }
 
     Column {

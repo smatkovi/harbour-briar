@@ -61,6 +61,7 @@ static bool dienstAntwortet()
 
 #include "dienst.h"
 #include "../src/qrcode.h"
+#include "kamera.h"
 
 static void dienstStarten();
 
@@ -85,6 +86,18 @@ static void dienstStarten()
 int main(int argc, char *argv[])
 {
     sitzungsBusSetzen();
+    // Vor QApplication, und nicht mit argc/argv: QApplication haelt argc per
+    // Referenz fuer die ganze Laufzeit, da soll GStreamer nicht
+    // hineinschneiden. gst_init_check statt gst_init, weil gst_init im
+    // Fehlerfall per g_error() den Prozess abbricht -- eine Nebenfunktion
+    // darf die App nicht mitnehmen.
+    GError *gstFehler = 0;
+    if (!gst_init_check(0, 0, &gstFehler)) {
+        qWarning("GStreamer laesst sich nicht starten: %s",
+                 gstFehler ? gstFehler->message : "unbekannt");
+        if (gstFehler) g_error_free(gstFehler);
+    }
+
     QApplication app(argc, argv);
 
     // Without this the virtual keyboard never appears once the hardware one
@@ -97,6 +110,10 @@ int main(int argc, char *argv[])
     dienstStarten();
     Dienst dienst;
     QrCode qrCode;
+    // Vor der QDeclarativeView angelegt: Stapelobjekte sterben in umgekehrter
+    // Reihenfolge, und die Engine haelt beim Abbau noch eine
+    // Kontext-Eigenschaft darauf.
+    Kamera kamera;
 
     QDeclarativeView view;
     // Qt 4.7's QML has no Qt.locale(), so the interface gets the system's
@@ -107,6 +124,10 @@ int main(int argc, char *argv[])
     view.rootContext()->setContextProperty(QLatin1String("ImagePrep"), &imagePrep);
     view.rootContext()->setContextProperty(QLatin1String("dienst"), &dienst);
     view.rootContext()->setContextProperty(QLatin1String("QrCode"), &qrCode);
+    // Klein geschrieben wie "dienst": ein unbekannter Name faellt in QML 1.1
+    // nicht auf, er faellt aus -- Connections greift dann still auf das
+    // Elternobjekt zurueck.
+    view.rootContext()->setContextProperty(QLatin1String("kamera"), &kamera);
     view.setResizeMode(QDeclarativeView::SizeRootObjectToView);
     view.setSource(QUrl::fromLocalFile(QLatin1String("/opt/briar/qml/main.qml")));
     view.showFullScreen();

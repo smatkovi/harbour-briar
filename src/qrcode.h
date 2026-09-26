@@ -92,6 +92,14 @@ public:
         return QString();
     }
 
+    // Ein einzelnes Bild lesen, ohne die Breitenreihe von decode(). Die
+    // Kamera am N9 liefert 816 px breite Rahmen; dort liefe decode() dreimal
+    // ueber fast dasselbe Bild, zweimal davon mit SmoothTransformation.
+    static QString decodeFrame(const QImage &frame)
+    {
+        return decodeImage(frame);
+    }
+
 private:
     static QString cacheDir()
     {
