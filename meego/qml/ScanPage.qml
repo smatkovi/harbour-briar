@@ -18,6 +18,16 @@ Page {
         }
     }
 
+    // Beim Verlassen anhalten: libomap3camd laesst sich nur einmal oeffnen,
+    // und eine Seite, die die Kamera behaelt, sperrt sie fuer jede andere
+    // App -- und fuer den naechsten Besuch dieser Seite. (Ein start() beim
+    // Betreten braucht es nicht: das Element steht nach componentComplete
+    // schon im ActiveState.)
+    onStatusChanged: {
+        if (status === PageStatus.Deactivating)
+            kamera.stop()
+    }
+
     Camera {
         id: kamera
         anchors { top: parent.top; left: parent.left; right: parent.right }
@@ -44,6 +54,9 @@ Page {
         }
         onError: {
             seite.laeuft = false
+            // Den Grund mitschreiben: eine stumme schwarze Flaeche ist das,
+            // was die Kamera hier vorher gezeigt hat.
+            console.log("Kamera: " + errorString)
             seite.meldung = fenster.tr("scanFailed")
         }
     }
