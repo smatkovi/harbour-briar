@@ -18,18 +18,20 @@ mkdir -p "$OUT"
 # Static musl builds: Harmattan's glibc 2.10 and Sailfish's much newer one
 # both stop mattering, and nothing has to be installed beside the binary.
 cd "$SRC/kern"
-for target in aarch64-unknown-linux-musl armv7-unknown-linux-musleabi; do
+# i686 ist der Sailfish-Emulator; armv7 ist Harmattan.
+for target in aarch64-unknown-linux-musl armv7-unknown-linux-musleabi i686-unknown-linux-musl; do
     rustup target list --installed | grep -qx "$target" || rustup target add "$target"
     # Only Sailfish gets the notification side: it needs D-Bus, and
     # Harmattan has no org.freedesktop.Notifications at all.
     case $target in
-        aarch64-*) cargo build --release --target "$target" --features sfos ;;
-        *)         cargo build --release --target "$target" ;;
+        aarch64-*|i686-*) cargo build --release --target "$target" --features sfos ;;
+        *)                cargo build --release --target "$target" ;;
     esac
 done
 cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/briard" "$OUT/briard-aarch64"
 cp "$CARGO_TARGET_DIR/armv7-unknown-linux-musleabi/release/briard" "$OUT/briard-armv7"
-echo "== briard: $(stat -c %s "$OUT/briard-aarch64") B (aarch64), $(stat -c %s "$OUT/briard-armv7") B (armv7)"
+cp "$CARGO_TARGET_DIR/i686-unknown-linux-musl/release/briard" "$OUT/briard-i486"
+echo "== briard: $(stat -c %s "$OUT/briard-aarch64") B (aarch64), $(stat -c %s "$OUT/briard-armv7") B (armv7), $(stat -c %s "$OUT/briard-i486") B (i486)"
 
 # --- the Harmattan interface ---------------------------------------------
 # Qt 4.7 comes out of the Harmattan SDK's MADDE sysroot, compiled with the

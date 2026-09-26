@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the Sailfish RPM in the SDK container on the Arch machine.
 #
-#   tools/build-rpm.sh [aarch64|armv7hl] ...     (default: aarch64)
+#   tools/build-rpm.sh [aarch64|armv7hl|i486] ...   (default: aarch64)
 #
 # The daemon is not built by the RPM: it is the cross-built static binary
 # from tools/build.sh, copied into the source tree as build/harbour-briar-briard
@@ -21,12 +21,14 @@ ssh "$HOST" "mkdir -p ~/briar-build/out"
 for ARCH in $ARCHES; do
     case $ARCH in
         aarch64) DAEMON=build/briard-aarch64 ;;
+        i486)    DAEMON=build/briard-i486 ;;
         *)       DAEMON=build/briard-armv7 ;;
     esac
     [ -f "$ROOT/$DAEMON" ] || { echo "$DAEMON missing -- run tools/build.sh" >&2; exit 1; }
     cp "$ROOT/$DAEMON" "$ROOT/build/harbour-briar-briard"
     case $ARCH in
         aarch64) TORBIN=build/tor-aarch64 ;;
+        i486)    TORBIN=build/tor-i486 ;;
         *)       TORBIN=build/tor-armv7 ;;
     esac
     if [ -f "$ROOT/$TORBIN" ]; then

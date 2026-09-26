@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds a static Tor for the devices.
 #
-#   tools/build-tor.sh [aarch64|armv7]      (default: both)
+#   tools/build-tor.sh [aarch64|armv7|i486]   (default: die beiden Geraete)
 #
 # Neither device can install one: Sailfish has no Tor in its repositories and
 # Harmattan's are long dead. So Tor is cross-compiled here, statically
@@ -53,6 +53,16 @@ for ARCH in $ARCHES; do
             # OpenSSL 3 uses 64-bit atomics in its thread code. On 32-bit ARM
             # the compiler cannot inline those, so they come from libatomic,
             # and without it the link test says "no linkable openssl".
+            EXTRA_LIBS=-latomic
+            ;;
+        i486)
+            # Der Sailfish-Emulator. musl.cc nennt das Gespann i686, und
+            # OpenSSL nennt das Ziel linux-x86; gebaut wird fuer i686, weil
+            # kein 486 mehr Sailfish laeuft.
+            TRIPLE=i686-linux-musl
+            OSSL_TARGET=linux-x86
+            # Wie auf 32-Bit-ARM: OpenSSL 3 will 64-Bit-Atomics, die der
+            # Uebersetzer hier nicht einbaut.
             EXTRA_LIBS=-latomic
             ;;
         *) echo "unknown architecture: $ARCH" >&2; exit 1 ;;

@@ -1,208 +1,212 @@
-# Briar für Sailfish OS und MeeGo Harmattan
+# Briar for Sailfish OS and MeeGo Harmattan
 
-Briars Protokoll (Bramble) auf Geräten, auf denen Briar selbst nie laufen
-wird: Briar ist Java und braucht Java 8, das Nokia N9/N950 hat kein JVM und
-bekommt auch keines. Deshalb ist dies kein Port von Briars Code, sondern eine
-Neuimplementierung seiner **Drahtformate** in Rust, mit zwei Oberflächen
-darüber -- Silica auf Sailfish, `com.nokia.meego` auf Harmattan.
+Briar's protocol on phones Briar itself will never run on.
 
-Beide Oberflächen sprechen denselben Dienst (`briard`) über eine kleine
-HTTP-Schnittstelle auf `127.0.0.1:8105`, so wie es der WhatsApp-Port und
-Fluesterwind auf diesen Geräten vormachen.
+Briar is Java, and it needs Java 8. The Nokia N9 and N950 have no JVM and will
+never get one; Sailfish has no Android runtime on every device either. So this
+is **not a port of Briar's code**. It is a fresh implementation of Briar's
+**wire formats** in Rust, with two native interfaces on top — Silica on
+Sailfish OS, `com.nokia.meego` on Harmattan.
 
-## Was Briars ist
+Both interfaces talk to the same daemon (`briard`) over a small HTTP interface
+on `127.0.0.1:8105`, the same shape the WhatsApp and Signal ports on these
+devices use.
 
-Jede dieser Schichten ist gegen Referenzbytes geprüft, die aus Briars eigenem
-`bramble-core` (Release 1.5.20) stammen -- siehe `vectors/`:
+**It interoperates because every layer is checked against Briar's own bytes**,
+not because it looks similar. `vectors/java/` loads the real classes out of
+Briar's fat jar (briar-headless 1.5.20) and prints their output as
+`key=hex`; `cargo test` in `kern/` compares the Rust side against that, layer
+by layer. Without those vectors a reimplementation is guesswork.
 
-| Schicht | Datei | Prüfung |
+## Status
+
+Running and tested between a Jolla (Sailfish 5.2, aarch64), a Nokia N9 and a
+Nokia N950 (Harmattan, armv7):
+
+- Handshake and contact exchange over Wi-Fi and over Bluetooth
+- Messages both ways, with delivery receipts
+- Private groups: create, invite, join, post — posts reach members who are not
+  contacts of each other
+- Attachments up to 32 KB (images are scaled down first)
+- Tor: a statically built Tor 0.4.8.14 ships in the package; the daemon starts
+  it, publishes a hidden service and reaches peers at their onion address
+- English and German, switchable in the menu; the choice lives in the daemon,
+  so it applies to both interfaces and survives a restart
+
+The Tor path was tested twice: between two daemons on one machine (each
+reachable only by its onion address), and between the Jolla and the N950 with
+Wi-Fi and Bluetooth taken away from the contact — the message arrived over the
+hidden service. Addresses announce themselves from then on: the N950 learned
+the Jolla's onion address without anyone typing it in.
+
+Not tested: the MeeGo interface has only been looked at by hand (no screenshot
+— the device sleeps), and the attachment path is verified byte for byte on the
+build machine but only exercised on the devices.
+
+## What is Briar's, and what is not
+
+Every row below is verified against reference bytes from `bramble-core` 1.5.20
+(see `vectors/`):
+
+| Layer | File | Vectors |
 |---|---|---|
-| BLAKE2b-Ableitungen, Ed25519-Signaturen mit Etikett, X25519 | `kern/src/crypto.rs` | `hash`, `mac`, `derive_key`, `sign`, `agree_*` |
-| Transportschlüssel, Marken, Zeitabschnitte | `kern/src/transport.rs` | `static_master_key`, `hs_*`, `rot_*`, `tag_v4_s3` |
-| Stromverschlüsselung (XSalsa20-Poly1305, Rahmen) | `kern/src/stream.rs` | `stream` |
-| BDF, das Datenformat | `kern/src/bdf.rs` | `bdf_simple`, `bdf_nested`, `bdf_text` |
-| Kennungen (Autor, Gruppe, Nachricht) | `kern/src/ids.rs` | `author_id`, `group_id`, `message_id` |
-| Handschlag 0.1 und Kontaktaustausch | `kern/src/handshake.rs`, `exchange.rs` | `hs_master_*`, `ex_*` |
-| `briar://`-Links | `kern/src/ids.rs` | `link`, `link_pending_id` |
-| Sync-Protokoll, Privatgruppen, Anhänge | `kern/src/sync.rs`, `groups.rs` | Format aus dem Quelltext |
+| BLAKE2b derivations, labelled Ed25519 signatures, X25519 | `kern/src/crypto.rs` | `hash`, `mac`, `derive_key`, `sign`, `agree_*` |
+| Transport keys, tags, time periods | `kern/src/transport.rs` | `static_master_key`, `hs_*`, `rot_*`, `tag_v4_s3` |
+| Stream cipher (XSalsa20-Poly1305, frames) | `kern/src/stream.rs` | `stream` |
+| BDF, the data format | `kern/src/bdf.rs` | `bdf_simple`, `bdf_nested`, `bdf_text` |
+| Identifiers (author, group, message) | `kern/src/ids.rs` | `author_id`, `group_id`, `message_id` |
+| Handshake 0.1 and contact exchange | `kern/src/handshake.rs`, `exchange.rs` | `hs_master_*`, `ex_*` |
+| `briar://` links | `kern/src/ids.rs` | `link`, `link_pending_id` |
+| Sync protocol, private groups, attachments | `kern/src/sync.rs`, `groups.rs` | format read from the source |
 
-`vectors/java/` ist das Programm, das diese Bytes erzeugt: es lädt die echten
-Klassen aus Briars Fat-Jar und schreibt ihre Ausgaben als `schlüssel=hex`.
-`cargo test` im Verzeichnis `kern` vergleicht die Rust-Seite damit.
+What this port does **differently**, and why:
 
-## Was nicht Briars ist
+- **No Tor rendezvous for new contacts.** Briar finds a new contact over Tor.
+  Here one of the two sides enters the other's address once — on the LAN, over
+  Bluetooth, or as an onion address. After that the devices exchange addresses
+  by themselves.
+- **No SDP over Bluetooth.** Briar registers a UUID per device and looks up the
+  channel. Without a BlueZ binding this port uses a fixed RFCOMM channel (11).
+- **No forums, no blogs, no introductions.**
+- **A QR code, but not Briar's BQP.** Briar exchanges a handshake secret
+  through the code. Here the code carries the `briar://` link with the
+  addresses behind it (`?lan=…&bt=…&tor=…`); the other side photographs it and
+  has everything filled in. The encoder is our own (`src/qrencode.h`, checked
+  against zbar), the decoder is quirc (`src/quirc/`) — neither device has a QR
+  library. On the N9 the shutter fires and the picture is read afterwards: Qt
+  4.7 gives QML no live camera frames.
+- **Addresses follow Briar's shape, not its plan.** Briar's properties client
+  announces addresses as its own versioned messages; here they travel in the
+  same shape (transport, version, dictionary) through the outbox and are
+  repeated until the other side confirms. That way a contact from before Tor
+  still learns the onion address.
+- **Storage is a JSON file**, not an encrypted H2 database. The format is not
+  Briar's business — only the wire has to match.
 
-* **Kein Tor-Rendezvous.** Briar findet einen neuen Kontakt über Tor. Hier
-  trägt eine der beiden Seiten die Adresse der anderen von Hand ein -- im
-  WLAN, über Bluetooth oder als Onion-Adresse. Danach tauschen die Geräte
-  ihre Adressen selbst aus.
-* **Kein SDP über Bluetooth.** Briar meldet pro Gerät eine UUID an und sucht
-  den Kanal dazu. Ohne BlueZ-Anbindung nimmt dieser Port einen festen
-  RFCOMM-Kanal (11).
-* **Keine Foren, keine Blogs, kein Vorstellen von Kontakten
-  (Introductions).**
-* **QR-Code, aber nicht Briars BQP.** Briar tauscht über den QR-Code ein
-  Handschlag-Geheimnis und baut daraus eine Verbindung auf. Hier steht im
-  Code der briar://-Link mit den Adressen dahinter (`?lan=...&bt=...&tor=...`),
-  die Gegenseite fotografiert ihn ab und hat alles ausgefüllt. Kodierer ist
-  eigener Code (`src/qrencode.h`, gegen zbar geprüft), Dekodierer ist quirc
-  (`src/quirc/`), weil keines der beiden Geräte eine QR-Bibliothek hat. Auf
-  dem N9 wird ausgelöst und das Bild danach gelesen -- Qt 4.7 gibt QML keine
-  laufenden Kamerabilder.
-* **Adressen nach Briars Vorbild, nicht nach Briars Bauplan.** Briars
-  Eigenschaften-Client meldet Adressen als eigene, versionierte Nachrichten;
-  hier gehen sie in derselben Form (Transport, Version, Wörterbuch) durch den
-  Ausgangskorb und werden wiederholt, bis die Gegenseite sie bestätigt. So
-  erfährt auch ein Kontakt von vor Tor die Onion-Adresse.
-* Der Speicher ist eine JSON-Datei, keine verschlüsselte H2-Datenbank. Das
-  Format ist Briars Sache nicht -- nur die Leitung muss stimmen.
+## Ways to reach a contact
 
-## Wege zum Kontakt
-
-| Weg | Adresse | Voraussetzung |
+| Way | Address | Needs |
 |---|---|---|
-| WLAN | `IP:Port`, z.B. `192.168.1.12:7327` | selbes Netz |
-| Bluetooth | `40:98:4E:AD:BD:42` | gekoppelt, Bluetooth an |
-| Tor | Onion-Adresse | keine -- ein statisches Tor liegt im Paket (`tools/build-tor.sh` baut es) |
+| Wi-Fi | `IP:port`, e.g. `192.168.1.12:7327` | same network |
+| Bluetooth | `40:98:4E:AD:BD:42` | paired, Bluetooth on |
+| Tor | onion address | nothing — a static Tor ships in the package |
 
-Sind mehrere bekannt, wird der Reihe nach probiert: WLAN, Bluetooth, Tor.
+If several are known they are tried in order: Wi-Fi, Bluetooth, Tor.
 
-## Aufbau
+Tor ships with the package because none of these devices can install one:
+Sailfish has no Tor in its repositories and Harmattan's have been dead for
+years. `tools/build-tor.sh` cross-compiles Tor 0.4.8.14 statically against
+musl. On Harmattan it starts switched off (about 30 MB of RAM), on the Jolla
+switched on.
+
+## Layout
 
 ```
-kern/       Dienst in Rust (briard), statisch gegen musl
-  src/crypto.rs transport.rs stream.rs record.rs   Briars Unterbau
-  src/handshake.rs exchange.rs sync.rs groups.rs   die Protokolle
-  src/bt.rs tor.rs net.rs                          die Transporte
-  src/store.rs api.rs                              Speicher und Schnittstelle
-qml/        Silica-Oberfläche (Sailfish)
-meego/      Qt-4.7-Oberfläche und Debian-Paket (Harmattan)
-qml/Briar.js qml/Strings.js                        von beiden benutzt
-src/imageprep.h                                    Bilder verkleinern (Qt 4 und 5)
-vectors/    Referenzbytes aus bramble-core
-tools/      Bauen, Paketieren, Installieren
+kern/       the daemon in Rust (briard), static against musl
+  src/crypto.rs transport.rs stream.rs record.rs   Briar's foundation
+  src/handshake.rs exchange.rs sync.rs groups.rs   the protocols
+  src/bt.rs tor.rs net.rs                          the transports
+  src/store.rs api.rs                              storage and interface
+qml/        Silica interface (Sailfish OS)
+meego/      Qt 4.7 interface and Debian package (Harmattan)
+qml/Briar.js qml/Strings.js                        used by both
+src/imageprep.h                                    scaling images (Qt 4 and 5)
+vectors/    reference bytes from bramble-core
+tools/      building, packaging, installing
 ```
 
-## Bauen
+## Building
+
+Everything is built on a separate build machine (Rust, the musl toolchains,
+the Harmattan SDK, the Sailfish SDK container); `tools/buildhost.sh` finds it.
 
 ```sh
-tools/build.sh              # Dienst (aarch64 + armv7) und Harmattan-Oberfläche
-tools/build-rpm.sh aarch64  # Sailfish-Paket -> ~/ps/rpms/briar/
-tools/build-deb.sh 0.5      # Harmattan-Paket
-tools/build-tor.sh          # statisches Tor für beide Architekturen
+tools/build.sh                    # daemon (aarch64, armv7, i486) + Harmattan UI
+tools/build-tor.sh                # static Tor for the two devices
+tools/build-tor.sh i486           # and for the Sailfish emulator
+tools/build-rpm.sh aarch64        # Sailfish package -> ~/ps/rpms/briar/
+tools/build-rpm.sh armv7hl i486   # the other two Sailfish architectures
+tools/build-deb.sh 0.20           # Harmattan package
 ```
 
-Gebaut wird auf dem Arch-Rechner (Rust, musl-Toolchains, Harmattan-SDK,
-Sailfish-SDK-Container); `tools/buildhost.sh` findet ihn.
+The daemon is **not** built by the RPM: it is the cross-built static binary
+from `tools/build.sh`, copied into the tree so qmake can install it. One
+consequence worth knowing: the architecture of the package and the architecture
+of the binaries inside it come from different places, so check them — an
+`i486` package must not end up carrying an ARM daemon.
 
-## Installieren
+## Installing
 
 ```sh
-sudo rpm -Uvh ~/ps/rpms/briar/harbour-briar-0.5.0-1.aarch64.rpm
+sudo rpm -Uvh harbour-briar-0.20.0-1.aarch64.rpm
 N9_HOST=192.168.1.15 tools/install-meego.sh briar_0.20_armel.deb
 ```
 
-Auf Harmattan **`aegis-dpkg -i`**, nicht `dpkg -i`: sonst landen die Dateien
-ohne registrierte Prüfsummen und lassen sich nicht starten ("Operation not
-permitted").
+On Harmattan use **`aegis-dpkg -i`**, never plain `dpkg -i`: otherwise the
+files land without registered checksums and nothing out of the package will
+start ("Operation not permitted").
 
-## Sailfish: dieselben Griffe wie die anderen Apps
+## Sailfish OS integration
 
-* **Benachrichtigungen** kommen aus dem Dienst (nicht aus der Oberfläche),
-  also auch bei geschlossener App. Kategorie `x-nemo.messaging.im`, eine
-  Benachrichtigung je Chat -- die nächste Nachricht ersetzt die vorige.
-* **Antworten direkt in der Benachrichtigung**: die Fernaktion `reply` mit
-  `x-nemo-remote-action-type-reply=input` ruft
-  `harbour.briar.Backend.Reply(kontakt, text)` am Sitzungsbus. Der Dienst
-  reicht den Text an seine eigene HTTP-Schnittstelle weiter, damit eine
-  Antwort aus der Benachrichtigung genau denselben Weg nimmt wie eine aus
-  der App.
-* **Antippen öffnet den Chat**: Fernaktion `default` an
-  `harbour.briar.Gui.openChat`; läuft die App nicht, startet sie der
-  D-Bus-Dienst (`dbus/harbour.harbour-briar.service`).
-* **Dienst im Hintergrund** (freiwillig): `harbour-briar-briard.service` als
-  Benutzer-Einheit, ein Schalter unter „Mein Link" legt sie um
-  (`systemctl --user enable --now`).
-* **„Mit Briar senden"** im Teilen-Menü: `harbour-briar-share.desktop` mit
-  `X-Share-Methods`, dazu das Objekt `/share/briar_share` in der App, das
-  die Datei annimmt und nach dem Empfänger fragt.
-* Der Dienst spricht D-Bus nur in der Sailfish-Ausgabe (`--features sfos`);
-  Harmattan hat `org.freedesktop.Notifications` gar nicht.
+- **Notifications come from the daemon**, not from the interface, so they
+  arrive with the app closed. Category `x-nemo.messaging.im`, one notification
+  per chat — the next message replaces the previous one.
+- **Replying inside the notification**: the remote action `reply` with
+  `x-nemo-remote-action-type-reply=input` calls
+  `harbour.briar.Backend.Reply(contact, text)` on the session bus. The daemon
+  passes the text to its own HTTP interface, so a reply from the notification
+  takes exactly the same path as one from the app.
+- **Tapping opens the chat**: remote action `default` to
+  `harbour.briar.Gui.openChat`; if the app is not running, the D-Bus service
+  starts it.
+- **Background daemon** (optional): `harbour-briar-briard.service` as a user
+  unit, a switch under "My link" flips it.
+- **"Send with Briar"** in the share menu: `harbour-briar-share.desktop` with
+  `X-Share-Methods`.
+- The daemon speaks D-Bus only in the Sailfish build (`--features sfos`);
+  Harmattan has no `org.freedesktop.Notifications` at all.
 
-## Wenn das Netz kommt und geht
+**No sandbox**: the desktop file sets `Sandboxing=Disabled`. `Base.permission`
+allows the `unix` protocol family, `Internet` adds `inet`, `inet6` and
+`netlink`, and **no** permission under `/etc/sailjail/permissions` mentions
+Bluetooth — a raw `AF_BLUETOOTH` socket fails inside the sandbox with errno 95.
+On top of that the sandbox ends with the window, while the daemon is supposed
+to keep running.
 
-Die Lauscher geben nicht mehr auf. Früher stieg der Bluetooth-Lauscher aus,
-wenn beim Start nicht gebunden werden konnte -- war Bluetooth zu dem
-Zeitpunkt aus, blieb es für die ganze Laufzeit stumm. Jetzt versuchen WLAN-
-und Bluetooth-Lauscher es alle fünf Sekunden erneut (und melden das nur
-einmal), und nach mehreren fehlgeschlagenen `accept` wird der Sockel
-weggeworfen und neu gebunden. Die Tor-Steuerverbindung wird jede Minute
-geprüft; reißt sie ab, wird der versteckte Dienst neu veröffentlicht --
-mit demselben Schlüssel, also unter derselben Adresse.
+## MeeGo: inside the built-in Messages app
 
-Dazu ein Wächter am **Systembus**, der wartet statt zu fragen: ConnMan
-(Sailfish), ICd2 (Harmattan) und BlueZ melden, wenn ein Netz kommt oder
-geht. Erst dann wird nachgesehen, ob sich die eigenen Adressen geändert
-haben, und gegebenenfalls sofort abgeglichen. Kein Takt, kein Aufwachen im
-Ruhezustand -- geprüft: sechs Nachrichten an ein gesperrtes, schlafendes
-Gerät kamen mit 0 s Verzug an, der eingehende Verbindungsaufbau weckt es
-selbst.
+On the N9 and N950 the message bridge carries Briar into the stock Messages
+app — the same bridge that already brings WhatsApp, Signal, Telegram and Matrix
+there. It needed almost nothing: the daemon answers the four routes the bridge
+knows from the other services.
 
-## MeeGo: in der Nachrichten-App
-
-Auf dem N9/N950 trägt die [Nachrichtenbrücke](../nachrichtenbruecke) Briar
-in die eingebaute Nachrichten-App -- dieselbe Brücke, die schon WhatsApp,
-Signal, Telegram und Matrix dorthin bringt. Sie brauchte dafür fast nichts:
-der Dienst beantwortet zusätzlich die vier Wege, die sie von den anderen
-Diensten kennt.
-
-| Weg | Antwort |
+| Route | Answer |
 |---|---|
-| `GET /chats` | alle Kontakte und beigetretenen Gruppen |
-| `GET /messages?jid=c3` | die Nachrichten eines Chats |
-| `GET /send?to=c3&text=...` | senden |
-| `GET /events?since=N` | lange Abfrage, kehrt bei Änderung zurück |
+| `GET /chats` | all contacts and joined groups |
+| `GET /messages?jid=c3` | the messages of one chat |
+| `GET /send?to=c3&text=…` | send |
+| `GET /events?since=N` | long poll, returns on change |
 
-Eine Kennung ist `c<Kontaktnummer>` oder `g<Gruppenkennung>`. Die eigene
-Oberfläche benutzt weiterhin `/messages?contact=` und `POST /send`; beides
-steht nebeneinander.
+An identifier is `c<contact number>` or `g<group id>`. The app's own interface
+keeps using `/messages?contact=` and `POST /send`; both exist side by side.
 
-## Sailfish ohne Sandkasten
+## When the network comes and goes
 
-Die Desktop-Datei setzt `Sandboxing=Disabled` im `[X-Sailjail]`-Abschnitt:
-`Base.permission` erlaubt die Protokollfamilie `unix`, `Internet` fügt
-`inet`, `inet6` und `netlink` hinzu, und **keine** Erlaubnis unter
-`/etc/sailjail/permissions` nennt Bluetooth -- ein roher
-`AF_BLUETOOTH`-Socket scheitert im Sandkasten mit Errno 95. Dazu endet der
-Sandkasten mit dem Fenster, der Dienst soll aber weiterlaufen, damit
-Nachrichten auch bei geschlossener App ankommen. Die Kennungen
-(`OrganizationName`/`ApplicationName`) bleiben stehen, damit die App ihren
-eigenen Platz für Einstellungen behält.
+The listeners no longer give up. The Bluetooth listener used to bail out if it
+could not bind at startup — if Bluetooth happened to be off at that moment, it
+stayed silent for the whole run. Now the Wi-Fi and Bluetooth listeners retry
+every five seconds (and say so only once), and after several failed `accept`
+calls the socket is thrown away and rebound. The Tor control connection is
+checked every minute; if it breaks, the hidden service is republished with the
+same key, so the address does not change.
 
-## Stand
+On top of that a watcher on the **system bus** waits instead of asking:
+ConnMan (Sailfish), ICd2 (Harmattan) and BlueZ report when a network appears or
+disappears. Only then does the daemon look whether its own addresses changed.
+No polling, no waking the device: six messages to a locked, sleeping phone
+arrived with 0 s delay — the incoming connection wakes it by itself.
 
-Läuft und geprüft zwischen Jolla (Sailfish 5.2, aarch64), Nokia N9 und N950
-(Harmattan, armv7):
+## Licence
 
-* Handschlag und Kontaktaustausch über WLAN und über Bluetooth
-* Nachrichten in beide Richtungen, mit Empfangsbestätigung
-* Privatgruppen: anlegen, einladen, beitreten, schreiben -- Beiträge
-  erreichen auch Mitglieder, die untereinander keine Kontakte sind
-* Anhänge bis 32 KB (Bilder werden vorher verkleinert)
-* Sprache: Englisch, im Menü auf Deutsch umschaltbar; die Wahl liegt im
-  Dienst, also gilt sie auf beiden Oberflächen und übersteht den Neustart
-* Tor: ein statisch gebautes Tor 0.4.8.14 liegt im Paket (aarch64 und
-  armv7), der Dienst startet es, veröffentlicht einen versteckten Dienst und
-  erreicht Gegenstellen über ihre Onion-Adresse. Auf dem N9 und N950 ist Tor
-  anfangs aus (rund 30 MB Arbeitsspeicher), auf der Jolla an; Ausschalten
-  beendet Tor wieder.
-
-Der Tor-Weg ist zweimal geprüft: zwischen zwei Diensten auf einem Rechner
-(beide nur über ihre Onion-Adresse) und zwischen Jolla und N950, indem dem
-Kontakt WLAN und Bluetooth weggenommen wurden -- die Nachricht kam über den
-versteckten Dienst an. Die Adressen melden sich seither von selbst: der N950
-kennt die Onion-Adresse der Jolla, ohne dass sie jemand eingetragen hat.
-
-Nicht geprüft: die MeeGo-Oberfläche wurde nur von Hand angesehen (ein
-Bildschirmfoto war nicht zu bekommen, das Gerät schläft), und der Anhang-Weg
-ist auf dem Rechner byteweise geprüft, auf den Geräten nur benutzt.
+See `LICENSE`. Briar itself is a separate project; this port is neither
+affiliated with nor endorsed by it.
