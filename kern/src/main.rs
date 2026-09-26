@@ -131,12 +131,15 @@ fn main() {
     #[cfg(feature = "dbus")]
     {
         let watch_store = Arc::clone(&shared);
+        // Alle Adressen, nicht nur die vorderste: kommt das Tethering dazu,
+        // aendert sich die vorderste vielleicht gar nicht, die Liste aber
+        // schon -- und genau die wollen wir neu melden.
         let letzte = std::sync::Mutex::new((
-            briarkern::net::local_ip(),
+            briarkern::net::local_ips(),
             briarkern::bt::local_address(),
         ));
         briarkern::netwatch::beobachten(move || {
-            let jetzt = (briarkern::net::local_ip(), briarkern::bt::local_address());
+            let jetzt = (briarkern::net::local_ips(), briarkern::bt::local_address());
             let mut gemerkt = letzte.lock().unwrap();
             if *gemerkt == jetzt {
                 // ConnMan meldet auch Dinge, die uns nichts angehen
@@ -146,7 +149,11 @@ fn main() {
             }
             briarkern::net::log(&format!(
                 "the network changed ({} / {}) -- syncing now",
-                jetzt.0.clone().unwrap_or_else(|| "no address".to_string()),
+                if jetzt.0.is_empty() {
+                    "no address".to_string()
+                } else {
+                    jetzt.0.join(", ")
+                },
                 jetzt.1.clone().unwrap_or_else(|| "no Bluetooth".to_string())
             ));
             *gemerkt = jetzt;

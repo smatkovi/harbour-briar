@@ -894,6 +894,22 @@ fn status(store: &Shared) -> Value {
         .iter()
         .map(|g| group_json(&locked, g))
         .collect();
+    // Alle Netze, durch Komma getrennt. Daraus baut die Oberflaeche den
+    // briar://-Link und damit den QR-Code -- stuende hier nur eine Adresse,
+    // waere jede Kopplung wieder an ein einziges Netz genagelt.
+    let lan_port = locked.state.listen_port;
+    let lan_addresses = {
+        let list = crate::net::local_ips()
+            .iter()
+            .map(|ip| format!("{}:{}", ip, lan_port))
+            .collect::<Vec<_>>()
+            .join(",");
+        if list.is_empty() {
+            None
+        } else {
+            Some(list)
+        }
+    };
     json!({
         "identity": identity,
         "link": locked.link(),
@@ -910,8 +926,10 @@ fn status(store: &Shared) -> Value {
                 .filter(|m| !m.outgoing && m.timestamp > c.last_read)
                 .count())
             .sum::<usize>(),
-        "lanAddress": crate::net::local_ip()
-            .map(|ip| format!("{}:{}", ip, locked.state.listen_port)),
+        // Alle Netze, durch Komma getrennt. Daraus baut die Oberflaeche den
+        // briar://-Link und damit den QR-Code -- stuende hier nur eine
+        // Adresse, waere jede Kopplung wieder an ein einziges Netz genagelt.
+        "lanAddress": lan_addresses,
         "tor": locked.state.tor,
         "onion": locked.state.tor_onion,
         "revision": locked.state.revision,

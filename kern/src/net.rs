@@ -173,11 +173,86 @@ fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recogn
     None
 }
 
-/// Our own LAN address, as far as a UDP socket can tell us.
+/// Briars eigene Pruefung (`LanTcpPlugin.isAcceptableAddress`): brauchbar ist
+/// eine IPv4-Adresse aus einem link-lokalen oder standortlokalen Netz. Eine
+/// oeffentliche Adresse -- die des Mobilfunks vor allem -- nuetzt einem
+/// Gegenueber im selben Netz nichts.
+fn reachable_by_a_contact(o: [u8; 4]) -> bool {
+    (o[0] == 169 && o[1] == 254)
+        || o[0] == 10
+        || (o[0] == 172 && (16..32).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+}
+
+/// Jede IPv4-Adresse dieses Geraets, unter der ein Kontakt im selben Netz es
+/// erreichen koennte. Die laengste Netzmaske steht vorne: das engere Netz ist
+/// das wahrscheinlichere. Frueher stand hier eine einzige Adresse, die eine
+/// UDP-Verbindung zum fest eingetragenen 192.168.1.1 verriet -- ausserhalb des
+/// Heimnetzes war das die Mobilfunkadresse, und die Gegenseite stand ohne Weg
+/// da.
+pub fn local_ips() -> Vec<String> {
+    let mut found: Vec<(u32, String)> = Vec::new();
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 {
+            return Vec::new();
+        }
+        let mut cur = list;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null()
+                || ifa.ifa_flags & libc::IFF_UP as u32 == 0
+                || ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0
+                || (*ifa.ifa_addr).sa_family != libc::AF_INET as libc::sa_family_t
+            {
+                continue;
+            }
+            let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+            let octets = addr.sin_addr.s_addr.to_ne_bytes();
+            if !reachable_by_a_contact(octets) {
+                continue;
+            }
+            // Ohne Netzmaske zaehlt die Adresse trotzdem, nur eben zuletzt.
+            let prefix = if ifa.ifa_netmask.is_null() {
+                0
+            } else {
+                let mask = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                mask.sin_addr.s_addr.count_ones()
+            };
+            // Dieselbe Adresse kann mit mehreren Masken eingetragen sein
+            // (Mobilfunk meldet hier /8 und /24). Es zaehlt die engste.
+            let text = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+            match found.iter_mut().find(|(_, a)| *a == text) {
+                Some(seen) => seen.0 = seen.0.max(prefix),
+                None => found.push((prefix, text)),
+            }
+        }
+        libc::freeifaddrs(list);
+    }
+    // Wie bei Briar: nur nach Maskenlaenge, und stabil -- bei gleich engen
+    // Netzen bleibt die Reihenfolge des Kernels. Welches von zwei gleich
+    // engen privaten Netzen das richtige ist, sagt die Adresse nicht; das
+    // entscheidet beim Waehlen der erste, der antwortet.
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, a)| a).collect()
+}
+
+/// Die vorderste unserer Adressen -- fuer die Statusanzeige, die nur eine
+/// zeigen kann.
 pub fn local_ip() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.168.1.1:9").ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
+    local_ips().into_iter().next()
+}
+
+/// Eine gemeldete Liste, wie wir sie aufbewahren: Eintraege beschnitten, leere
+/// weg, Reihenfolge unangetastet -- die Gegenseite hat ihr engstes Netz nach
+/// vorne gestellt.
+fn clean_address_list(list: &str) -> String {
+    list.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn local_properties(
@@ -188,8 +263,16 @@ fn local_properties(
     let mut props = BTreeMap::new();
     let mut lan = BTreeMap::new();
     lan.insert("port".to_string(), port.to_string());
-    if let Some(ip) = local_ip() {
-        lan.insert("ipPorts".to_string(), format!("{}:{}", ip, port));
+    // Alle Netze auf einmal, durch Komma getrennt -- genau das Format, das
+    // Briar selbst meldet. Wer auf einem davon mit uns steht, findet uns.
+    let addresses = local_ips();
+    if !addresses.is_empty() {
+        let list = addresses
+            .iter()
+            .map(|ip| format!("{}:{}", ip, port))
+            .collect::<Vec<_>>()
+            .join(",");
+        lan.insert("ipPorts".to_string(), list);
     }
     props.insert(LAN_TRANSPORT_ID.to_string(), lan);
     if let Some(onion) = onion.filter(|o| !o.is_empty()) {
@@ -253,10 +336,11 @@ fn addresses_from_properties(
     if let Some(lan) = properties.get(LAN_TRANSPORT_ID) {
         let mut address = None;
         if let Some(ip_ports) = lan.get("ipPorts") {
-            if let Some(first) = ip_ports.split(',').next() {
-                if !first.trim().is_empty() {
-                    address = Some(first.trim().to_string());
-                }
+            // Die ganze Liste, nicht nur der erste Eintrag: beim Waehlen wird
+            // jeder der Reihe nach versucht.
+            let list = clean_address_list(ip_ports);
+            if !list.is_empty() {
+                address = Some(list);
             }
         }
         if address.is_none() {
@@ -1185,8 +1269,9 @@ impl Node {
                 let address = match transport.as_str() {
                     t if t == LAN_TRANSPORT_ID => values
                         .get("ipPorts")
-                        .cloned()
-                        .or_else(|| values.get("ipPort").cloned()),
+                        .or_else(|| values.get("ipPort"))
+                        .map(|v| clean_address_list(v))
+                        .filter(|v| !v.is_empty()),
                     t if t == BLUETOOTH_TRANSPORT_ID => values.get("address").cloned(),
                     t if t == TOR_TRANSPORT_ID => values.get("onion3").cloned(),
                     _ => None,
@@ -1509,17 +1594,32 @@ fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         return Ok(Conn::Bluetooth(stream));
     }
-    let addresses: Vec<std::net::SocketAddr> = {
-        use std::net::ToSocketAddrs;
-        address.to_socket_addrs()?.collect()
-    };
-    let first = addresses
-        .first()
-        .ok_or_else(|| bad("cannot resolve address"))?;
-    let socket = TcpStream::connect_timeout(first, CONNECT_TIMEOUT)?;
-    socket.set_read_timeout(Some(IO_TIMEOUT))?;
-    socket.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(Conn::Tcp(socket))
+    // Die Gegenseite meldet jedes Netz, in dem sie steht, das engste zuerst.
+    // Welcher Eintrag antwortet, ist der, in dem wir zusammen stehen -- also
+    // der Reihe nach alle versuchen. Ein Daemon, der nur den ersten nimmt,
+    // erreicht eine Gegenseite mit mehreren Adressen nie wieder.
+    use std::net::ToSocketAddrs;
+    let mut last = bad("cannot resolve address");
+    for entry in address.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let resolved: Vec<std::net::SocketAddr> = match entry.to_socket_addrs() {
+            Ok(addrs) => addrs.collect(),
+            Err(err) => {
+                last = err;
+                continue;
+            }
+        };
+        for candidate in resolved {
+            match TcpStream::connect_timeout(&candidate, CONNECT_TIMEOUT) {
+                Ok(socket) => {
+                    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+                    socket.set_write_timeout(Some(IO_TIMEOUT))?;
+                    return Ok(Conn::Tcp(socket));
+                }
+                Err(err) => last = err,
+            }
+        }
+    }
+    Err(last)
 }
 
 fn bad(msg: &str) -> std::io::Error {
