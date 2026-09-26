@@ -1,0 +1,40 @@
+[package]
+name = "briarkern"
+version = "0.20.0"
+edition = "2021"
+description = "Briar's Bramble protocols for MeeGo/Harmattan and Sailfish OS"
+
+[[bin]]
+name = "briard"
+path = "src/main.rs"
+
+[lib]
+name = "briarkern"
+path = "src/lib.rs"
+
+[features]
+default = ["dbus"]
+# Der Netzwaechter haengt am Systembus und taugt auf beiden Geraeten.
+dbus = ["dep:zbus"]
+# Benachrichtigungen ueber den Sitzungsbus -- nur fuer Sailfish; Harmattan
+# hat org.freedesktop.Notifications gar nicht.
+sfos = ["dbus"]
+
+[dependencies]
+zbus = { version = "4", default-features = false, features = ["blocking", "async-io"], optional = true }
+blake2 = { version = "0.10", default-features = false }
+digest = "0.10"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
+getrandom = "0.2"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

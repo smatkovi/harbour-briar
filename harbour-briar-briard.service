@@ -1,0 +1,21 @@
+[Unit]
+Description=Briar daemon (harbour-briar), optional background service
+# Started after the user session, like the WhatsApp port's daemon: without
+# lipstick there is nobody to show a notification to.
+Requires=lipstick.service
+After=lipstick.service
+StartLimitIntervalSec=600
+StartLimitBurst=30
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p %h/.local/share/harbour-briar
+WorkingDirectory=%h/.local/share/harbour-briar
+ExecStart=/usr/bin/harbour-briar-briard
+# The interface starts the daemon itself when it is missing, so a clean stop
+# must not be undone immediately.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=post-user-session.target

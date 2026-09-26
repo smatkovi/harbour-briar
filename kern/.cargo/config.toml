@@ -1,0 +1,11 @@
+# Both device targets are static musl builds: Harmattan's glibc 2.10 and
+# Sailfish's newer one then stop mattering, and nothing has to be installed
+# beside the binary. rust-lld is used because cargo otherwise picks the host
+# linker and fails with "relocations in generic ELF".
+[target.armv7-unknown-linux-musleabi]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes"]

@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Icon=harbour-briar
+Exec=harbour-briar
+Name=Briar
+Comment=Messages over WLAN, Bluetooth and Tor, with Briar's protocol
+
+[X-Sailjail]
+OrganizationName=harbour-briar
+ApplicationName=harbour-briar
+# Sandboxing=Disabled, not a permission list: Base.permission allows the
+# protocol family unix, Internet adds inet, inet6 and netlink, and no
+# permission in /etc/sailjail/permissions names bluetooth -- a raw
+# AF_BLUETOOTH socket fails with errno 95 inside the sandbox. The daemon also
+# has to outlive the window, and the sandbox ends with its leader. The
+# identity keys stay, so the app keeps its own settings place.
+Sandboxing=Disabled

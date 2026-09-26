@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=Briar
+Icon=harbour-briar
+Exec=harbour-briar
+X-Nemo-Application-Type=silica-qt5
+NoDisplay=true
+X-Share-Methods=briar_share;
+
+[X-Sailjail]
+OrganizationName=harbour-briar
+ApplicationName=harbour-briar
+Sandboxing=Disabled
+
+[X-Share Method briar_share]
+Description=Send with Briar...
+Description[de]=Mit Briar senden...
+Capabilities=text/plain;text/*;image/*;video/*;audio/*;application/*
+SupportsMultipleFiles=no

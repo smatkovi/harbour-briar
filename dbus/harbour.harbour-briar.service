@@ -1,0 +1,4 @@
+[D-BUS Service]
+# So that tapping a notification starts the app when it is not running.
+Name=harbour.harbour-briar
+Exec=/usr/bin/harbour-briar

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Briar
+Comment=Nachrichten über Briars Protokoll
+# No invoker: its booster wants a binary that can be loaded as a library
+# ("cannot dynamically load executable"). Starting directly only costs a
+# little startup time.
+Exec=/opt/briar/bin/briar
+# Full path, not the theme name: with "Icon=briar" the launcher found
+# nothing and drew a red placeholder square.
+Icon=/usr/share/icons/hicolor/80x80/apps/briar.png
+X-Window-Icon=
+X-HildonDesk-ShowInToolbar=true
+X-Osso-Type=application/x-executable

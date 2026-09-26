@@ -1,0 +1,11 @@
+# Was gebaut wird, gehoert nicht ins Repository: die Binaerdateien fuer
+# beide Geraete, das mitgelieferte Tor und die fertigen Pakete. Wie sie
+# entstehen, steht in tools/.
+build/
+kern/target/
+*.deb
+*.rpm
+
+# Der Zwischenstand des Vektor-Werkzeugs (Gradle, entpackte Jars)
+vectors/java/build/
+vectors/java/.gradle/

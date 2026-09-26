@@ -1,0 +1,24 @@
+Package: briar
+Version: @VERSION@
+Section: user/network
+Priority: optional
+Architecture: armel
+Depends: libqt4-declarative, libqt4-script, libqt4-gui, libqt4-network, qt-components
+Maintainer: Sebastian Matkovich <sebastian.matkovich@gmail.com>
+Description: Briar fuer das N9 und N950
+ Briars Protokoll (Bramble), neu geschrieben in Rust: Handschlag,
+ Schluesselableitung, Stromverschluesselung (XSalsa20-Poly1305), das
+ Datenformat BDF, die Kennungen und das Sync-Protokoll. Jede Schicht ist
+ gegen Referenzbytes aus Briars eigenem bramble-core geprueft. Briar selbst
+ ist Java und braucht Java 8 -- auf diesem Geraet laeuft keines.
+ .
+ Statisch gegen musl gebunden, damit die glibc 2.10 dieses Geraets keine
+ Rolle spielt. Der Dienst laeuft weiter, wenn die Oberflaeche zu ist.
+ .
+ Ohne Tor: Kontakte treffen sich im selben WLAN. Eine Seite traegt den
+ briar://-Link und die Adresse der anderen ein, dann laeuft Briars
+ Handschlag und der Kontaktaustausch. Keine Foren, keine Blogs, keine
+ Gruppen.
+Maemo-Display-Name: Briar
+XB-Maemo-Icon-26:
+@ICON@
