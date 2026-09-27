@@ -1,9 +1,10 @@
 //! The transports and the connection logic on top of them.
 //!
 //! Briar reaches a contact it has only a link for through a rendezvous over
-//! Tor. Here all three routes exist, but the meeting place does not: the
-//! peer's ip:port, Bluetooth address or onion address goes in beside the
-//! link, and we dial it.
+//! Tor. That is here too: `run_rendezvous` below, the arithmetic in
+//! `rendezvous.rs`. Beside it a peer's ip:port, Bluetooth address or onion
+//! address can still go in next to the link, and then we dial that straight
+//! away instead of waiting for a meeting.
 //! Everything above the socket -- tags, stream encryption, handshake, contact
 //! exchange, sync -- is Briar's.
 
@@ -392,9 +393,10 @@ fn local_properties(
             if let Some(uuid) = bt_uuid {
                 values.insert("uuid".to_string(), uuid.to_string());
             }
-            // Briar publishes a UUID per device over SDP and looks the
-            // channel up; without SDP the channel is fixed, and this says
-            // which one.
+            // Der feste Kanal wird weiter mitgesagt, aber nur als Rueckfall:
+            // unsere eigenen aelteren Fassungen melden keine UUID und suchen
+            // nicht per SDP, die finden uns sonst nicht mehr. Wer die UUID
+            // liest, schlaegt den Kanal ohnehin nachher per SDP nach.
             values.insert("channel".to_string(), bt::CHANNEL.to_string());
             props.insert(BLUETOOTH_TRANSPORT_ID.to_string(), values);
         }
@@ -629,20 +631,33 @@ impl Node {
     /// Laeuft in einem eigenen Faden und im Minutentakt, wie Briars
     /// RendezvousPoller. Nach zwei Tagen gilt ein schwebender Kontakt als
     /// gescheitert und wird nicht mehr versucht.
+    /// Briars Treffpunkt im Tor-Netz: einen Kontakt anlegen, ohne dass eine
+    /// Seite die Adresse der anderen kennt.
+    ///
+    /// Die Steuerverbindung wird ueber die ganze Laufzeit gehalten, und das
+    /// ist der Kern der Sache: ein Dienst aus ADD_ONION ohne `Flags=Detach`
+    /// lebt genau so lange wie die Verbindung, die ihn angelegt hat. Stand
+    /// `tor::connect()` im Schleifenrumpf, war der Treffpunkt wieder weg,
+    /// bevor die Gegenseite ihn suchen konnte -- und weil er als
+    /// "veroeffentlicht" vermerkt war, wurde er nie wieder angemeldet.
     pub fn run_rendezvous(&self, tor_port: u16) {
-        let mut veroeffentlicht: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut steuerung: Option<tor::Tor> = None;
+        // Schwebender Kontakt -> Kennung des Dienstes, den Tor dafuer angelegt
+        // hat. Gilt nur fuer die gerade gehaltene Verbindung: faellt sie,
+        // fallen alle Dienste, also auch alles, was hier steht.
+        let mut veroeffentlicht: BTreeMap<String, String> = BTreeMap::new();
         loop {
             std::thread::sleep(Duration::from_millis(
                 crate::rendezvous::POLLING_INTERVAL_MS,
             ));
-            let schwebende: Vec<(String, [u8; 32], [u8; 32])> = {
+            // Wer einen Treffpunkt haben soll -- und, davon getrennt, wofuer
+            // sich die Saaten gerade ableiten lassen. Getrennt, damit ein
+            // Aussetzer beim Ableiten keinen Treffpunkt abraeumt, auf den noch
+            // gewartet wird.
+            let (tor_an, soll, arbeit) = {
                 let store = self.store.lock().unwrap();
-                if !store.state.tor {
-                    continue;
-                }
                 let jetzt = crate::util::now_ms();
-                store
+                let soll: std::collections::BTreeSet<String> = store
                     .state
                     .pending
                     .iter()
@@ -653,53 +668,119 @@ impl Node {
                             && jetzt.saturating_sub(p.added)
                                 < crate::rendezvous::TIMEOUT_MS
                     })
-                    .filter_map(|p| {
-                        let (eigene, fremde) =
-                            rendezvous_saaten(&store, &p.public_key)?;
-                        Some((p.public_key.clone(), eigene, fremde))
+                    .map(|p| p.public_key.clone())
+                    .collect();
+                let arbeit: Vec<(String, [u8; 32], [u8; 32])> = soll
+                    .iter()
+                    .filter_map(|schluessel| {
+                        let (eigene, fremde) = rendezvous_saaten(&store, schluessel)?;
+                        Some((schluessel.clone(), eigene, fremde))
                     })
-                    .collect()
+                    .collect();
+                (store.state.tor, soll, arbeit)
             };
-            if schwebende.is_empty() {
+            // Tor abgeschaltet: die Verbindung fallen lassen genuegt, Tor
+            // nimmt jeden Dienst mit, den sie angelegt hat.
+            if !tor_an {
+                if steuerung.take().is_some() {
+                    log("rendezvous: Tor is off -- the meeting points go with the connection");
+                }
+                veroeffentlicht.clear();
                 continue;
             }
-            for (schluessel, eigene, fremde) in schwebende {
-                // Unseren Treffpunkt anmelden -- einmal je schwebendem
-                // Kontakt, danach laeuft er weiter.
-                if !veroeffentlicht.contains(&schluessel) {
-                    if let Some(mut tor) = tor::connect() {
+            // Steht die Verbindung noch? Ist sie weg, sind auch die Dienste
+            // weg: wer das nicht merkt, haelt Treffpunkte fuer angemeldet, die
+            // es nicht gibt, und meldet sie nie wieder an.
+            if !veroeffentlicht.is_empty()
+                && steuerung.as_mut().map_or(false, |tor| !tor.alive())
+            {
+                log("rendezvous: the connection to Tor broke -- announcing again");
+                steuerung = None;
+                veroeffentlicht.clear();
+            }
+            if steuerung.is_none() {
+                if soll.is_empty() {
+                    // Niemand zu treffen: dann auch keine Verbindung halten.
+                    continue;
+                }
+                steuerung = tor::connect();
+                if steuerung.is_none() {
+                    continue;
+                }
+            }
+            let mut kaputt = false;
+            if let Some(tor) = steuerung.as_mut() {
+                // Erst abraeumen. Wer aus `soll` gefallen ist, braucht den
+                // Treffpunkt nicht mehr: der Handschlag ist geglueckt (von
+                // hier oder von drueben -- finish_handshake nimmt den
+                // schwebenden Kontakt in beiden Faellen aus dem Speicher),
+                // der Benutzer hat ihn entfernt, oder die Frist ist um.
+                let ueberzaehlig: Vec<(String, String)> = veroeffentlicht
+                    .iter()
+                    .filter(|(schluessel, _)| !soll.contains(schluessel.as_str()))
+                    .map(|(s, k)| (s.clone(), k.clone()))
+                    .collect();
+                for (schluessel, kennung) in ueberzaehlig {
+                    match tor.unpublish(&kennung) {
+                        Ok(bekannt) => {
+                            veroeffentlicht.remove(&schluessel);
+                            log(if bekannt {
+                                "rendezvous: meeting point taken down"
+                            } else {
+                                "rendezvous: the meeting point was gone already"
+                            });
+                        }
+                        Err(e) => {
+                            log(&format!("rendezvous: cannot take it down: {}", e));
+                            kaputt = true;
+                        }
+                    }
+                }
+                for (schluessel, eigene, fremde) in arbeit {
+                    // Unseren Treffpunkt anmelden -- einmal je schwebendem
+                    // Kontakt, danach laeuft er an dieser Verbindung weiter.
+                    if !veroeffentlicht.contains_key(&schluessel) {
                         let blob = crate::rendezvous::private_key_blob(&eigene);
                         match tor.publish(tor_port, Some(&blob)) {
-                            Ok(_) => {
+                            Ok(dienst) => {
                                 log("rendezvous: own meeting point published");
-                                veroeffentlicht.insert(schluessel.clone());
+                                // Die Kennung kommt von Tor, nicht aus unserer
+                                // eigenen Rechnung: nur sie darf spaeter in
+                                // DEL_ONION stehen.
+                                veroeffentlicht.insert(schluessel.clone(), dienst.onion);
                             }
                             Err(e) => {
                                 log(&format!("rendezvous: cannot publish: {}", e));
+                                kaputt = true;
                                 continue;
                             }
                         }
-                    } else {
-                        continue;
+                    }
+                    // Und die Gegenseite anwaehlen. Sie ist erst da, wenn sie
+                    // ihren Dienst ebenfalls angemeldet hat -- deshalb der Takt.
+                    let ziel = format!("{}.onion", crate::rendezvous::onion(&fremde));
+                    let index = {
+                        let store = self.store.lock().unwrap();
+                        store
+                            .state
+                            .pending
+                            .iter()
+                            .position(|p| p.public_key == schluessel)
+                    };
+                    if let Some(index) = index {
+                        match self.connect_pending_at(index, TOR_TRANSPORT_ID, &ziel) {
+                            Ok(()) => log("rendezvous: met"),
+                            Err(e) => log(&format!("rendezvous: not yet ({})", e)),
+                        }
                     }
                 }
-                // Und die Gegenseite anwaehlen. Sie ist erst da, wenn sie
-                // ihren Dienst ebenfalls angemeldet hat -- deshalb der Takt.
-                let ziel = format!("{}.onion", crate::rendezvous::onion(&fremde));
-                let index = {
-                    let store = self.store.lock().unwrap();
-                    store
-                        .state
-                        .pending
-                        .iter()
-                        .position(|p| p.public_key == schluessel)
-                };
-                if let Some(index) = index {
-                    match self.connect_pending_at(index, TOR_TRANSPORT_ID, &ziel) {
-                        Ok(()) => log("rendezvous: met"),
-                        Err(e) => log(&format!("rendezvous: not yet ({})", e)),
-                    }
-                }
+            }
+            if kaputt {
+                // Etwas ging schief, das nicht am einzelnen Dienst liegt:
+                // Verbindung fallen lassen. Das raeumt alles ab, und die
+                // naechste Runde meldet neu an, was noch gebraucht wird.
+                steuerung = None;
+                veroeffentlicht.clear();
             }
         }
     }

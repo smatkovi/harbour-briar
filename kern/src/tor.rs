@@ -196,6 +196,30 @@ impl Tor {
             Err(_) => false,
         }
     }
+
+    /// Raeumt einen mit `publish` angemeldeten Dienst wieder ab.
+    ///
+    /// `&mut self` ist keine Foermlichkeit: einen nicht abgetrennten
+    /// ADD_ONION-Dienst darf nur die Steuerverbindung loeschen, die ihn
+    /// angelegt hat. Eine andere bekommt "Unknown Onion Service ID" zu
+    /// hoeren, und der Dienst bliebe stehen.
+    ///
+    /// `Ok(false)` heisst: Tor kennt die Kennung nicht mehr -- fuer einen
+    /// Abbau kein Fehler, sondern schon erledigt.
+    pub fn unpublish(&mut self, service_id: &str) -> std::io::Result<bool> {
+        // Tor will den nackten v3-Namen; mit ".onion" kennt es ihn nicht.
+        let id = service_id.trim_end_matches(".onion");
+        let (code, lines) = command(&mut self.control, &format!("DEL_ONION {}\r\n", id))?;
+        match code {
+            250 => Ok(true),
+            // 552 "Unknown Onion Service ID"
+            552 => Ok(false),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Tor kept the hidden service {}: {:?}", id, lines),
+            )),
+        }
+    }
 }
 
 pub struct HiddenService {
