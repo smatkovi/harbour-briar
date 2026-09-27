@@ -31,6 +31,10 @@ use std::time::Duration;
 /// How many stream numbers ahead of the expected one a tag is still
 /// recognised -- Briar's reordering window.
 const WINDOW: u64 = 32;
+/// TransportConstants.java:69 -- "int MAX_CLOCK_DIFFERENCE = 24 * 60 * 60 *
+/// 1000; // 24 hours". So weit darf ein Zeitstempel in der Zukunft liegen und
+/// nicht weiter.
+const MAX_CLOCK_DIFFERENCE: u64 = 24 * 60 * 60 * 1000;
 // Wie in Briars LanTcpPluginFactory. Zusammen mit dem Sieb in dial() faellt
 // der schlimmste Fall von fuenf vollen Wartezeiten auf wenige Sekunden.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1081,7 +1085,20 @@ impl Node {
                 .find(|p| p.public_key == schwebend)
                 .ok_or_else(|| bad("pending contact vanished"))?;
             let zustand = pending.transport_mut(transport_id);
-            let nummer = naechste_stromnummer(zustand, period);
+            // Nicht ueber das Fenster hinaus zaehlen. Eine Gegenstelle mit
+            // einer Fassung bis 0.26.0 hat ihren Fusspunkt fest auf 0 und
+            // erkennt darum nur 0..31; ihr Fenster laeuft nicht mit. Der
+            // Taktgeber waehlt einen Treffpunkt jede Minute an, wir waeren
+            // also nach einer halben Stunde darueber -- und dann ist der
+            // Handschlag mit den eigenen drei Geraeten nicht mehr moeglich,
+            // bis der Abschnitt wechselt. Briars Fenster schiebt mit, dort
+            // darf die Nummer beliebig steigen; nur duerfen wir das nicht
+            // voraussetzen, solange nebenan noch 0.26 laeuft.
+            //
+            // 32 verschiedene Marken je Abschnitt statt einer einzigen sind
+            // der Gewinn; die letzte wird dann wiederholt, und das ist genau
+            // das, was 0.26.0 immer tat.
+            let nummer = naechste_stromnummer(zustand, period).min(WINDOW - 1);
             stromnummer_vormerken(zustand, period, nummer);
             nummer
         };
@@ -1997,6 +2014,26 @@ impl Node {
         timestamp: u64,
         body: &[u8],
     ) -> bool {
+        // Briars erste Pruefung an jeder eintreffenden Nachricht, noch vor dem
+        // Format: liegt ihr Zeitstempel mehr als einen Tag in der Zukunft, wird
+        // sie verworfen (BdfMessageValidator: "Timestamp is too far in the
+        // future", MAX_CLOCK_DIFFERENCE = 24 h).
+        //
+        // Hier ist das mehr als Formtreue. Unsere eigenen Zeitstempel ruecken
+        // seit dieser Fassung hinter fremde: das JOIN hinter die Einladung, der
+        // Beitrag hinter die vorige eigene Nachricht. Ein Gegenueber mit
+        // verstellter Uhr -- oder eines, das es darauf anlegt -- koennte uns
+        // sonst einen Stempel weit in der Zukunft unterschieben, und von da an
+        // traegt jede eigene Nachricht in dieser Gruppe denselben Sprung mit:
+        // ein echtes Briar wirft sie dann alle weg, und unsere Kette kommt nie
+        // wieder herunter.
+        if timestamp.saturating_sub(now_ms()) > MAX_CLOCK_DIFFERENCE {
+            log(&format!(
+                "a message from contact {} is dated more than a day ahead -- discarded",
+                contact_id
+            ));
+            return false;
+        }
         let identity = match store.identity() {
             Some(i) => i.clone(),
             None => return false,
@@ -2306,6 +2343,12 @@ impl Node {
     }
 
     /// Die Kette festhalten, aber nicht erzwingen -- nur ins Protokoll damit.
+    ///
+    /// Erwartet wird die letzte Nachricht, die die GEGENSEITE in dieser Sitzung
+    /// geschickt hat, nicht unsere eigene: Briar schickt seine
+    /// lastLocalMessageId, und der Empfaenger vergleicht sie mit seiner
+    /// lastRemoteMessageId (AbstractProtocolEngine.isValidDependency:99-103).
+    /// Das eine ist aus der anderen Sicht dasselbe.
     fn kette_melden(&self, contact_id: u32, art: &str, genannt: &Option<String>, erwartet: &Option<String>) {
         if genannt != erwartet {
             log(&format!(
@@ -2370,7 +2413,25 @@ impl Node {
             return true;
         }
         let genannt = vorige.map(|v| to_hex(&v));
-        self.kette_melden(contact_id, "JOIN", &genannt, &anker);
+        self.kette_melden(contact_id, "JOIN", &genannt, &letzte_fremde);
+        if zustand == Sitzungszustand::Gegangen {
+            // Er ist gegangen, und das kam vor diesem JOIN an: dann ist das
+            // JOIN ein Nachlaeufer, der sich mit dem LEAVE gekreuzt hat.
+            // Briars Einladender bricht in LEFT ab (onJoinMessage); wir tun
+            // weniger -- wir schreiben es auf und lassen ihn draussen. Ihn
+            // wieder in die Verteilliste zu nehmen waere das Schlimmste:
+            // dann ginge jeder weitere Beitrag an jemanden, der gegangen ist.
+            // Ein echter Wiedereintritt beginnt mit einer neuen Einladung, und
+            // die setzt den Zustand ohnehin auf "eingeladen".
+            log(&format!(
+                "ein JOIN von Kontakt {} kam nach seinem LEAVE -- er bleibt draussen",
+                contact_id
+            ));
+            if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+                s.letzte_fremde = Some(to_hex(id));
+            }
+            return true;
+        }
         if zustand == Sitzungszustand::Beigetreten {
             // Briars Einladender schickt nach der Annahme selbst ein JOIN
             // zurueck. Eines hinnehmen muessen wir also: abbrechen, wie Briars
@@ -2412,6 +2473,21 @@ impl Node {
         // stellt ein Briar-Eingeladener die Gruppe auf SHARED und laesst seine
         // Beitraege heraus. Eine alte Gegenstelle laesst es durch parse_invite
         // fallen, quittiert es und vergisst es -- schaden kann es nicht.
+        //
+        // Nur nicht ohne Anker: fuer eine Gruppe, die dieses Geraet vor 0.27.0
+        // angelegt hat, wurde die Kennung der eigenen Einladung nie
+        // aufgeschrieben, die Kette ist also kopflos. Ein JOIN mit "vorige =
+        // nichts" waere fuer ein echtes Briar ein Abbruch der ganzen Sitzung
+        // (isValidDependency), und gewonnen waere nichts: vor 0.27.0 wurden die
+        // Gruppenklienten nicht angesagt, ein echtes Briar hat diese Gruppe also
+        // ohnehin nie gesehen. Lieber nichts schicken als die Sitzung zerlegen.
+        if anker.is_none() {
+            log(&format!(
+                "die Gruppe {} stammt aus einer Fassung vor 0.27.0 -- kein eigenes JOIN, die Kette hat keinen Kopf",
+                group_hex
+            ));
+            return true;
+        }
         let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
         let zeitstempel = store
             .sitzung(&group_hex, contact_id)
@@ -2478,11 +2554,8 @@ impl Node {
         if letzte_fremde.as_deref() == Some(&to_hex(id)[..]) {
             return true;
         }
-        let anker = store
-            .sitzung(&group_hex, contact_id)
-            .and_then(|s| s.letzte_eigene.clone());
         let genannt = vorige.map(|v| to_hex(&v));
-        self.kette_melden(contact_id, "LEAVE", &genannt, &anker);
+        self.kette_melden(contact_id, "LEAVE", &genannt, &letzte_fremde);
         if vom_ersteller {
             // Der Ersteller geht: die Gruppe ist aufgeloest. Der Verlauf bleibt
             // lesbar, aber es geht nichts mehr hinaus, und eine offene
@@ -2496,6 +2569,11 @@ impl Node {
                     wann: timestamp,
                 });
             }
+            // Auch ihm nichts mehr nachschicken. Briar macht die Gruppe fuer
+            // den Gegangenen unsichtbar, und eine Nachricht in einer
+            // unsichtbaren Gruppe wird dort verworfen UND nicht quittiert --
+            // unser Korb schickte sie also fuer immer wieder hinaus.
+            store.verwerfe_gruppenpost(contact_id, &group_hex);
             log(&format!(
                 "contact {} dissolved the group {}",
                 contact_id, group_hex
@@ -2828,6 +2906,7 @@ pub fn fenster_nachziehen(
     zustand: &mut crate::store::TransportState,
     period: u64,
     gesehen: u64,
+    jetzt: u64,
 ) {
     let abschnitt = period.to_string();
     let alt = *zustand.in_stream.get(&abschnitt).unwrap_or(&0);
@@ -2836,10 +2915,14 @@ pub fn fenster_nachziehen(
     // alte Gegenseite bleibt beliebig oft erkennbar.
     let neu = alt.max(gesehen.saturating_sub(WINDOW / 2 - 1));
     zustand.in_stream.insert(abschnitt, neu);
-    // Die Gegenseite haelt ohnehin nur voriger, jetziger und naechster.
+    // Die Gegenseite haelt ohnehin nur voriger, jetziger und naechster --
+    // gerechnet vom JETZIGEN Abschnitt, nicht von dem, in dem die Marke lag.
+    // Eine Marke aus dem naechsten Abschnitt (die Uhr der Gegenseite geht vor)
+    // wuerde sonst den vorigen wegraeumen, obwohl der noch gilt. Darum kommt
+    // der Bezugsabschnitt von aussen und nicht aus der Uhr: so ist er pruefbar.
     zustand.in_stream.retain(|a, _| {
         a.parse::<u64>()
-            .map(|p| p.max(period) - p.min(period) <= 1)
+            .map(|p| p.max(jetzt) - p.min(jetzt) <= 1)
             .unwrap_or(false)
     });
 }
@@ -2861,7 +2944,12 @@ fn fenster_vermerken(
         .iter_mut()
         .find(|p| p.public_key == schwebend)
     {
-        fenster_nachziehen(pending.transport_mut(transport_id), period, gesehen);
+        fenster_nachziehen(
+            pending.transport_mut(transport_id),
+            period,
+            gesehen,
+            current_time_period(),
+        );
     }
     // Ein missglueckter Schreibversuch darf den Handschlag nicht abbrechen:
     // dann laeuft er mit dem alten Fusspunkt weiter, und der ist nie zu hoch.
@@ -3892,12 +3980,12 @@ mod stromnummer_tests {
         // der Fenstermitte. Ohne das bliebe der Fusspunkt auf null, und ab
         // Nummer 32 waere die Gegenseite in diesem Abschnitt stumm.
         let mut z = TransportState::default();
-        fenster_nachziehen(&mut z, 100, 20);
+        fenster_nachziehen(&mut z, 100, 20, 100);
         assert_eq!(z.in_stream["100"], 5, "20 - (32/2 - 1)");
         let fuss = z.in_stream["100"];
         assert!(20 >= fuss && 20 < fuss + WINDOW, "die gesehene Nummer bleibt drin");
         // Und der Fusspunkt geht nie zurueck.
-        fenster_nachziehen(&mut z, 100, 6);
+        fenster_nachziehen(&mut z, 100, 6, 100);
         assert_eq!(z.in_stream["100"], 5);
     }
 
@@ -3909,7 +3997,7 @@ mod stromnummer_tests {
         // ist genau der Fall, der heute zwischen Jolla, N9 und N950 laeuft.
         let mut z = TransportState::default();
         for _ in 0..50 {
-            fenster_nachziehen(&mut z, 100, 0);
+            fenster_nachziehen(&mut z, 100, 0, 100);
             assert_eq!(z.in_stream["100"], 0);
         }
     }
@@ -3917,7 +4005,8 @@ mod stromnummer_tests {
     #[test]
     fn zaehler_und_fenster_laufen_im_takt() {
         // Der eigentliche Beweis: was die eine Seite vergibt, muss die andere
-        // in ihrem Fenster finden -- 200 Versuche im selben Abschnitt.
+        // in ihrem Fenster finden -- 200 Versuche im selben Abschnitt, bei
+        // einer Gegenseite, deren Fenster mitlaeuft.
         let mut sender = TransportState::default();
         let mut empfaenger = TransportState::default();
         for _ in 0..200 {
@@ -3930,7 +4019,31 @@ mod stromnummer_tests {
                 n,
                 fuss
             );
-            fenster_nachziehen(&mut empfaenger, 100, n);
+            fenster_nachziehen(&mut empfaenger, 100, n, 100);
+        }
+    }
+
+    /// Und derselbe Lauf gegen eine Gegenseite, deren Fenster NICHT mitlaeuft:
+    /// jede Fassung bis 0.26.0 haelt den Fusspunkt fest auf null und erkennt
+    /// darum nur 0..31. Darum ist die vergebene Nummer gedeckelt -- ohne die
+    /// Deckelung waere der Handschlag nach einer halben Stunde nicht mehr
+    /// moeglich, denn der Taktgeber waehlt jede Minute an.
+    #[test]
+    fn gegen_eine_alte_gegenseite_bleibt_die_nummer_im_fenster() {
+        let mut sender = TransportState::default();
+        for runde in 0..200u64 {
+            let n = naechste_stromnummer(&sender, 100).min(WINDOW - 1);
+            stromnummer_vormerken(&mut sender, 100, n);
+            assert!(
+                n < WINDOW,
+                "Runde {}: Nummer {} liegt neben dem starren Fenster 0..31",
+                runde,
+                n
+            );
+            // Bis dahin steigt sie, danach bleibt sie stehen -- und stehen
+            // bleiben heisst: dieselbe Marke wiederholen, genau wie 0.26.0.
+            let erwartet = runde.min(WINDOW - 1);
+            assert_eq!(n, erwartet, "Runde {}", runde);
         }
     }
 

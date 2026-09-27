@@ -73,6 +73,8 @@ var table = {
                         en: "Only whoever created the group can invite." },
     joinFirst:        { de: "Erst beitreten",              en: "Join first" },
     dissolved:        { de: "aufgelöst",                   en: "dissolved" },
+    removeGroupAsk:   { de: "Die Gruppe von diesem Gerät entfernen? Die anderen Mitglieder erfahren, dass du gehst.",
+                        en: "Remove this group from the device? The other members are told that you are leaving." },
     evAccepted:       { de: " hat die Einladung angenommen",
                         en: " accepted the invitation" },
     evDeclined:       { de: " hat die Einladung abgelehnt",

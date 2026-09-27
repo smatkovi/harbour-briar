@@ -645,6 +645,30 @@ impl Store {
         // dem Weg /group/join. Alles andere faengt bei Null an -- eine falsche
         // vorige Nachricht ist schlimmer als keine, denn Briar wartet auf sie.
         if store.state.state_version < 3 {
+            // Haushaltspost, die schon im Korb liegt, als solche kennzeichnen:
+            // Adressmeldung und Versionsansage sollen nicht als "noch nicht
+            // gesendet" am Kontakt stehen. Ohne diesen Schritt bliebe bei jedem
+            // bestehenden Kontakt eine Zahl neben dem Namen, die niemand
+            // wegbekommt, bis die Meldung quittiert ist.
+            let eigene = store
+                .state
+                .identity
+                .as_ref()
+                .map(|i| key_from_hex(&i.author_id));
+            if let Some(eigene) = eigene {
+                for contact in store.state.contacts.iter_mut() {
+                    let ihre = key_from_hex(&contact.author_id);
+                    let haushalt = [
+                        to_hex(&crate::sync::properties_group_id(&eigene, &ihre)),
+                        to_hex(&crate::sync::versioning_group_id(&eigene, &ihre)),
+                    ];
+                    for post in contact.outbox.iter_mut() {
+                        if haushalt.contains(&post.group) {
+                            post.intern = true;
+                        }
+                    }
+                }
+            }
             for group in store.state.groups.iter_mut() {
                 let vorige = group.einladung_previous.take();
                 if let (Some(kontakt), Some(vorige)) = (group.invited_by, vorige) {
@@ -912,6 +936,31 @@ mod gruppen_tests {
 mod wanderung_tests {
     use super::*;
 
+    /// Eine Gruppe von Hand, ohne Datei und ohne Netz.
+    fn leere_gruppe() -> PrivateGroup {
+        PrivateGroup {
+            id: to_hex(&[1u8; 32]),
+            name: "Testgruppe".to_string(),
+            salt: "22".to_string(),
+            creator_name: "wer".to_string(),
+            creator_public: "33".to_string(),
+            creator_author_id: "44".to_string(),
+            joined: true,
+            invited_by: None,
+            invite_timestamp: None,
+            invite_signature: None,
+            member_names: BTreeMap::new(),
+            last_read: 0,
+            messages: Vec::new(),
+            our_previous: None,
+            einladungen: BTreeMap::new(),
+            einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
+            contacts: Vec::new(),
+        }
+    }
+
     fn pfad(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("briar-wanderung-test-{}.json", name));
@@ -963,20 +1012,62 @@ mod wanderung_tests {
     }
 
     /// Zwei Kontakte, zwei Ketten: die beiden LEAVE duerfen nicht dieselbe
-    /// vorige Nachricht nennen. Genau das tat die Fassung bis 0.26.
+    /// vorige Nachricht nennen. Genau das tat die Fassung bis 0.26 -- sie
+    /// fuehrte ein Feld fuer alle, und fuer einen der beiden nannte es eine
+    /// Nachricht, die in seiner Kontaktgruppe nie vorkam.
+    ///
+    /// Geprueft wird der Weg, den /group/remove geht: Kette aus DER Sitzung
+    /// holen, Rumpf daraus bauen.
     #[test]
     fn zwei_sitzungen_zwei_ketten() {
-        let aa = [0xaau8; 32];
-        let bb = [0xbbu8; 32];
-        let gruppe = [1u8; 32];
-        let rumpf_a = crate::groups::einladung_leave_body(&gruppe, Some(&aa));
-        let rumpf_b = crate::groups::einladung_leave_body(&gruppe, Some(&bb));
-        assert_ne!(rumpf_a, rumpf_b);
-        assert_eq!(
-            crate::groups::parse_einladung(&rumpf_a).is_some(),
-            true,
-            "eigener Rumpf muss lesbar sein"
+        let aa = to_hex(&[0xaau8; 32]);
+        let bb = to_hex(&[0xbbu8; 32]);
+        let mut g = leere_gruppe();
+        g.einladungen.insert(
+            7,
+            Einladungssitzung {
+                letzte_eigene: Some(aa.clone()),
+                letzte_fremde: None,
+                eigener_zeitstempel: 100,
+                einladungs_zeitstempel: 100,
+                zustand: Sitzungszustand::Beigetreten,
+            },
         );
+        g.einladungen.insert(
+            9,
+            Einladungssitzung {
+                letzte_eigene: Some(bb.clone()),
+                letzte_fremde: None,
+                eigener_zeitstempel: 200,
+                einladungs_zeitstempel: 100,
+                zustand: Sitzungszustand::Beigetreten,
+            },
+        );
+
+        // Was /group/remove je Kontakt nachschlaegt und in den Rumpf legt.
+        let kette = |kontakt: u32| -> Vec<u8> {
+            let vorige = g
+                .einladungen
+                .get(&kontakt)
+                .and_then(|s| s.letzte_eigene.clone());
+            crate::groups::einladung_leave_body(
+                &key_from_hex(&g.id),
+                vorige.as_deref().and_then(from_hex).as_deref(),
+            )
+        };
+        let rumpf_7 = kette(7);
+        let rumpf_9 = kette(9);
+        assert_ne!(rumpf_7, rumpf_9, "zwei Sitzungen, zwei vorige Nachrichten");
+
+        // Und jeder Rumpf nennt genau die Nachricht SEINER Sitzung.
+        let genannt = |rumpf: &[u8]| match crate::groups::parse_einladung(rumpf) {
+            Some(crate::groups::Einladungsnachricht::Leave { vorige, .. }) => {
+                vorige.map(|v| to_hex(&v))
+            }
+            other => panic!("kein LEAVE: {:?}", other),
+        };
+        assert_eq!(genannt(&rumpf_7), Some(aa));
+        assert_eq!(genannt(&rumpf_9), Some(bb));
     }
 
     /// Steht die Uhr hinter der Einladung, muss der naechste Zeitstempel

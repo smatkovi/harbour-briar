@@ -178,7 +178,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             // Name mit Umlauten ist sonst laenger als er aussieht.
             if name.len() > crate::sync::MAX_AUTHOR_NAME_LEN {
                 return json!({"error": format!(
-                    "Der Name ist zu lang ({} von hoechstens {} Byte). Er steckt                      in der Kennung und laesst sich spaeter nicht mehr aendern.",
+                    "the name is {} bytes long, at most {} are allowed -- it is part of your identifier and cannot be changed later",
                     name.len(), crate::sync::MAX_AUTHOR_NAME_LEN)});
             }
             if name.is_empty() {
@@ -261,7 +261,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             let text = body["text"].as_str().unwrap_or("").to_string();
             if text.len() > crate::sync::MAX_PRIVATE_MESSAGE_TEXT_LEN {
                 return json!({"error": format!(
-                    "Die Nachricht ist zu lang ({} von hoechstens {} Byte).",
+                    "the message is {} bytes long, at most {} are allowed",
                     text.len(), crate::sync::MAX_PRIVATE_MESSAGE_TEXT_LEN)});
             }
             let file = body["file"].as_str().map(|s| s.to_string());
@@ -577,7 +577,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             let name = body["name"].as_str().unwrap_or("").trim().to_string();
             if name.len() > crate::sync::MAX_GROUP_NAME_LEN {
                 return json!({"error": format!(
-                    "Der Gruppenname ist zu lang ({} von hoechstens {} Byte).",
+                    "the group name is {} bytes long, at most {} are allowed",
                     name.len(), crate::sync::MAX_GROUP_NAME_LEN)});
             }
             if name.is_empty() {
@@ -685,6 +685,11 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             }
             if sitzungszustand == Some(crate::store::Sitzungszustand::Eingeladen) {
                 return json!({"error": "an invitation is already on its way"});
+            }
+            if sitzungszustand == Some(crate::store::Sitzungszustand::Fehler) {
+                // In ERROR nimmt Briar nichts mehr an; eine Einladung ginge in
+                // eine Sitzung, die auf beiden Seiten abgebrochen ist.
+                return json!({"error": "the invitation session with this contact has failed"});
             }
             if sitzungszustand == Some(crate::store::Sitzungszustand::Gegangen) {
                 // Seine Beitrittsnachricht steht noch in der Gruppe. Ein
@@ -910,7 +915,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             // behaelt, stolpert danach jede weitere Runde daran.
             if text.len() > crate::sync::MAX_GROUP_POST_TEXT_LEN {
                 return json!({"error": format!(
-                    "der Beitrag ist {} Byte lang, erlaubt sind {}",
+                    "the post is {} bytes long, at most {} are allowed",
                     text.len(), crate::sync::MAX_GROUP_POST_TEXT_LEN)});
             }
             let mut locked = store.lock().unwrap();

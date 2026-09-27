@@ -22,6 +22,13 @@ PageStackWindow {
         return sprachStand, Strings.t(schluessel)
     }
 
+    // Dasselbe fuer das letzte Ereignis einer Gruppe: der Dienst schickt nur
+    // die Art und den Namen, den Satz macht die Oberflaeche -- und er muss
+    // beim Sprachwechsel mitkommen, darum ueber sprachStand.
+    function ereignis(e) {
+        return sprachStand, Strings.ereignis(e)
+    }
+
     function spracheUmschalten() {
         Briar.setLanguage(Strings.language() === "de" ? "en" : "de",
                           function() { fenster.aktualisieren() })

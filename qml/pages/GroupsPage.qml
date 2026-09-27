@@ -74,7 +74,7 @@ Page {
                     truncationMode: TruncationMode.Fade
                     color: Theme.highlightColor
                     font.pixelSize: Theme.fontSizeExtraSmall
-                    text: Strings.ereignis(modelData.event)
+                    text: app.ereignis(modelData.event)
                 }
             }
 

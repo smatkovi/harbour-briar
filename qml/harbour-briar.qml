@@ -24,6 +24,13 @@ ApplicationWindow {
         return languageRevision, Strings.t(key)
     }
 
+    // Dasselbe fuer das letzte Ereignis einer Gruppe: der Dienst schickt nur
+    // die Art und den Namen, den Satz macht die Oberflaeche -- und er muss
+    // beim Sprachwechsel mitkommen, darum ueber languageRevision.
+    function ereignis(e) {
+        return languageRevision, Strings.ereignis(e)
+    }
+
     function toggleLanguage() {
         Briar.setLanguage(Strings.language() === "de" ? "en" : "de", function() {
             app.refresh()

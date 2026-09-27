@@ -17,7 +17,12 @@ Page {
         })
     }
 
-    Component.onCompleted: neuLaden()
+    Component.onCompleted: {
+        neuLaden()
+        // Dasselbe wie an der Jolla: offen heisst gelesen, sonst bleibt der
+        // Zaehler am Kontakt fuer immer stehen.
+        Briar.markRead({ "contact": seite.kontakt }, function() { fenster.aktualisieren() })
+    }
 
     // Briar puts an attachment in one message, so a photo from this camera
     // has to be scaled down first. ImagePrep hands back a copy that fits.

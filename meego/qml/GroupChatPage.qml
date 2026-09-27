@@ -23,7 +23,13 @@ Page {
         })
     }
 
-    Component.onCompleted: neuLaden()
+    Component.onCompleted: {
+        neuLaden()
+        // Melden, dass die Gruppe offen war: das raeumt den Ungelesen-Zaehler
+        // und den Hinweis auf die letzte Antwort der Gegenseite weg. Am N9
+        // wurde das bisher nie gemeldet, also blieb beides stehen.
+        Briar.markRead({ "group": seite.gruppe }, function() { fenster.aktualisieren() })
+    }
 
     Timer {
         interval: 3000

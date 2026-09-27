@@ -39,6 +39,38 @@ Page {
         }
     }
 
+    // Lange auf eine Gruppe tippen fragt hier nach. Bisher liess sich am N9
+    // eine Gruppe gar nicht entfernen -- und eine aufgeloeste Gruppe waere so
+    // fuer immer in der Liste geblieben.
+    property string gewaehlt: ""
+    property string gewaehltName: ""
+    property bool gewaehltErsteller: false
+
+    Menu {
+        id: gruppenMenue
+        MenuLayout {
+            MenuItem {
+                text: fenster.tr("invite")
+                visible: seite.gewaehltErsteller
+                onClicked: pageStack.push(Qt.resolvedUrl("InvitePage.qml"),
+                                          { gruppe: seite.gewaehlt, name: seite.gewaehltName })
+            }
+            MenuItem {
+                text: fenster.tr("remove")
+                onClicked: gruppeEntfernen.open()
+            }
+        }
+    }
+
+    QueryDialog {
+        id: gruppeEntfernen
+        titleText: fenster.tr("remove")
+        message: fenster.tr("removeGroupAsk")
+        acceptButtonText: fenster.tr("remove")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.removeGroup(seite.gewaehlt, function() { seite.neuLaden() })
+    }
+
     Sheet {
         id: neueGruppe
         acceptButtonText: fenster.tr("create")
@@ -124,7 +156,7 @@ Page {
                     elide: Text.ElideRight
                     font.pixelSize: 18
                     color: "#95d220"
-                    text: Strings.ereignis(modelData.event)
+                    text: fenster.ereignis(modelData.event)
                 }
             }
 
@@ -146,9 +178,10 @@ Page {
                     }
                 }
                 onPressAndHold: {
-                    if (modelData.isCreator)
-                        pageStack.push(Qt.resolvedUrl("InvitePage.qml"),
-                                       { gruppe: modelData.id, name: modelData.name })
+                    seite.gewaehlt = modelData.id
+                    seite.gewaehltName = modelData.name
+                    seite.gewaehltErsteller = modelData.isCreator ? true : false
+                    gruppenMenue.open()
                 }
             }
 
