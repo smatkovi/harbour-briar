@@ -573,6 +573,63 @@ pub struct Node {
     pub store: Shared,
 }
 
+/// Legt die Versionsansage in den Ausgangskorb, wenn die zuletzt eingereihte
+/// nicht mehr zur jetzigen Klientenliste passt, und gibt die Gruppe zurueck, in
+/// der sie liegt.
+///
+/// Eigene Funktion und nicht in run_sync, damit ohne Steckdose pruefbar ist,
+/// was hier zaehlt: dass eine unquittierte Ansage liegen bleibt und in der
+/// naechsten Runde von selbst wieder hinausgeht.
+fn versionsansage_einreihen(contact: &mut crate::store::Contact, our_author: &SecretKey) -> String {
+    let gruppe = sync::versioning_group_id(our_author, &contact.author_id_bytes());
+    let gruppe_hex = to_hex(&gruppe);
+    // Der Rumpf mit Nummer 0 dient nur als Fingerabdruck der Klientenliste --
+    // die Nummer selbst darf nicht eingehen, sonst waere jede Ansage neu.
+    //
+    // Die Marke heisst "vers2" und nicht "vers": mit der alten passte der
+    // Fingerabdruck bei jedem heutigen Kontakt weiter, es wuerde nichts
+    // eingereiht, und ein Kontakt, dessen Ansage unterwegs verloren ging,
+    // bliebe fuer immer still. So bekommt jeder bestehende Kontakt genau eine
+    // frische Ansage, diesmal quittungsgefuehrt -- Briar nimmt sie an, weil
+    // ihre Nummer hoeher ist, und zieht daraus keine Folgen, weil die
+    // Zustaende dieselben sind.
+    let fingerabdruck = to_hex(&crate::crypto::hash(
+        "vers2",
+        &[&sync::versioning_update_body(0)],
+    ));
+    if contact.versioning_sent == fingerabdruck {
+        return gruppe_hex;
+    }
+    // Eine aeltere, noch unquittierte Ansage ist ueberholt -- die Adressmeldung
+    // raeumt an derselben Stelle genauso auf.
+    contact.outbox.retain(|m| m.group != gruppe_hex);
+    // Briar laesst die hoehere Nummer gewinnen und verwirft die kleinere
+    // (ClientVersioningManagerImpl.incomingMessage), also steigt sie mit jedem
+    // neuen Rumpf. Sie steht IM Rumpf, muss also beim Einreihen feststehen --
+    // sie darf nicht erst mit der Quittung entstehen, sonst passte sie nicht zu
+    // den Bytes, die im Korb liegen.
+    let nummer = contact.versioning_version + 1;
+    let rumpf = sync::versioning_update_body(nummer as i64);
+    let zeit = now_ms();
+    let hex = to_hex(&crate::ids::message_id(&gruppe, zeit, &rumpf));
+    if !contact.outbox.iter().any(|m| m.id == hex) {
+        contact.outbox.push(OutMessage {
+            id: hex,
+            group: gruppe_hex.clone(),
+            timestamp: zeit,
+            body: to_hex(&rumpf),
+            acked: false,
+            intern: true,
+        });
+    }
+    // Eingereiht ist die Zusage: ab hier haelt der Korb die Ansage fest, bis
+    // die Quittung da ist. Frueher wurde hier nichts vermerkt und nach der
+    // Runde blind vermerkt -- genau das war der Fehler.
+    contact.versioning_sent = fingerabdruck;
+    contact.versioning_version = nummer;
+    gruppe_hex
+}
+
 impl Node {
     pub fn new(store: Shared) -> Node {
         Node { store }
@@ -1435,7 +1492,6 @@ impl Node {
                 versioning_sent: String::new(),
                 versioning_version: 0,
                 last_seen: now_ms(),
-                sent_versioning_update: false,
                 sent_properties: None,
                 last_read: 0,
             });
@@ -1584,16 +1640,7 @@ impl Node {
     ) -> std::io::Result<()> {
         conn.set_timeouts()?;
         let period = current_time_period();
-        let (
-            out_keys,
-            out_stream,
-            to_send,
-            to_ack,
-            to_request,
-            versioning_pending,
-            versioning_fp,
-            versioning_nummer,
-        ) = {
+        let (out_keys, out_stream, to_send, to_ack, to_request) = {
             let mut store = self.store.lock().unwrap();
             let contact = store
                 .contact(contact_id)
@@ -1606,6 +1653,12 @@ impl Node {
                 contact.alice,
             );
             let their_author = contact.author_id_bytes();
+            // Einmal geholt, zweimal gebraucht: Adressmeldung und
+            // Versionsansage haengen beide an der eigenen Autorenkennung.
+            let our_author = store
+                .identity()
+                .map(|i| key_from_hex(&i.author_id))
+                .ok_or_else(|| bad("no identity"))?;
             // Our own addresses. They go through the outbox like any other
             // message, so they are repeated until the peer acknowledges them
             // -- a peer that was still running an older version when we first
@@ -1642,10 +1695,6 @@ impl Node {
                 .map(|c| c.sent_properties.as_deref() != Some(fingerprint.as_str()))
                 .unwrap_or(false);
             if noch_nicht_gemeldet {
-                let our_author = store
-                    .identity()
-                    .map(|i| key_from_hex(&i.author_id))
-                    .ok_or_else(|| bad("no identity"))?;
                 let properties_group = sync::properties_group_id(&our_author, &their_author);
                 let group_hex = to_hex(&properties_group);
                 // An older, still unacknowledged announcement is superseded.
@@ -1664,6 +1713,7 @@ impl Node {
                             timestamp,
                             body: to_hex(&body),
                             acked: false,
+                            intern: true,
                         },
                     );
                 }
@@ -1671,25 +1721,46 @@ impl Node {
                     c.sent_properties = Some(fingerprint.clone());
                 }
             }
+            // Die Versionsansage geht denselben Weg wie die Adressmeldung:
+            // durch den Ausgangskorb, also wiederholt, bis quittiert ist.
+            //
+            // Vorher wurde sie einmal in den Strom geschrieben und danach als
+            // angesagt vermerkt -- vermerkt allein deshalb, weil die
+            // Leseschleife zu Ende lief. Die laeuft aber auch zu Ende, wenn die
+            // Gegenseite ihren Strom noch geschickt, unseren aber nie
+            // verarbeitet hat. Dann galt die Ansage als erledigt, ohne je
+            // angekommen zu sein, und das war endgueltig. Fuer echtes Briar
+            // heisst das Stillstand: ohne Ansage bleibt die Nachrichtengruppe
+            // unsichtbar (MessagingManagerImpl ueber getClientVisibility), und
+            // eine Nachricht in einer unsichtbaren Gruppe wird verworfen UND
+            // nicht quittiert (DatabaseComponentImpl.receiveMessage) -- der
+            // Korb haette fuer immer gegen eine Wand geschickt. Briar selbst
+            // legt die Ansage als gewoehnliche Nachricht ab (storeUpdate ->
+            // addLocalMessage, shared=true) und laesst die Sync-Schicht
+            // wiederholen; ein "einmal schreiben" gibt es dort nicht.
+            let versioning_group_hex = match store.contact_mut(contact_id) {
+                Some(c) => versionsansage_einreihen(c, &our_author),
+                None => return Err(bad("no contact")),
+            };
             let contact = store.contact(contact_id).ok_or_else(|| bad("no contact"))?;
-            let to_send: Vec<OutMessage> = contact
+            let mut to_send: Vec<OutMessage> = contact
                 .outbox
                 .iter()
                 .filter(|m| !m.acked)
                 .cloned()
                 .collect();
+            // Die Ansage geht voran, wie bisher auch: sie stand vor dem
+            // Nachrichtenteil im Strom. Keine Zusage, dass damit alles in einer
+            // Runde ankommt -- Briar prueft nebenher, auf dem Datenbankfaden --
+            // aber hinter den Nachrichten stehend haette sie gar keine
+            // Aussicht. sort_by_key ist stabil, der Rest behaelt die Folge.
+            to_send.sort_by_key(|m| m.group != versioning_group_hex);
             let to_ack: Vec<SecretKey> = contact.to_ack.iter().map(|id| key_from_hex(id)).collect();
             // Was die Gegenseite in einer frueheren Runde angeboten hat. Ohne
             // diesen Satz schickt Briar ueber Duplex-Transporte gar nichts:
             // es sendet nur, was angefordert wurde.
             let to_request: Vec<SecretKey> =
                 contact.to_request.iter().map(|id| key_from_hex(id)).collect();
-            // Neu ansagen, sobald sich die Liste aendert -- nicht nur einmal
-            // im Leben des Kontakts.
-            let versioning_body = sync::versioning_update_body(0);
-            let versioning_fp = to_hex(&crate::crypto::hash("vers", &[&versioning_body]));
-            let versioning_pending = contact.versioning_sent != versioning_fp;
-            let versioning_nummer = contact.versioning_version + 1;
             let out_stream = contact
                 .transport(transport_id)
                 .map(|t| naechste_stromnummer(t, period))
@@ -1698,37 +1769,12 @@ impl Node {
                 stromnummer_vormerken(c.transport_mut(transport_id), period, out_stream);
             }
             store.save()?;
-            (
-                keys,
-                out_stream,
-                to_send,
-                to_ack,
-                to_request,
-                versioning_pending,
-                versioning_fp,
-                versioning_nummer,
-            )
+            (keys, out_stream, to_send, to_ack, to_request)
         };
 
         let mut writer = StreamWriter::new(conn.try_clone()?, &out_keys, out_stream);
         sync::write_versions(&mut writer)?;
         sync::write_priority(&mut writer, &crate::util::random(16))?;
-        if versioning_pending {
-            // Tell the peer which clients we speak, the way Briar's
-            // versioning client does -- without it the real Briar would never
-            // make the messaging group visible.
-            let versioning_group = {
-                let store = self.store.lock().unwrap();
-                let identity = store.identity().ok_or_else(|| bad("no identity"))?;
-                let contact = store.contact(contact_id).ok_or_else(|| bad("no contact"))?;
-                sync::versioning_group_id(
-                    &key_from_hex(&identity.author_id),
-                    &contact.author_id_bytes(),
-                )
-            };
-            let body = sync::versioning_update_body(versioning_nummer as i64);
-            sync::write_message(&mut writer, &versioning_group, now_ms(), &body)?;
-        }
         sync::write_ack(&mut writer, &to_ack)?;
         sync::write_request(&mut writer, &to_request)?;
         for message in &to_send {
@@ -1853,11 +1899,6 @@ impl Node {
                     .transport_mut(transport_id)
                     .in_stream
                     .insert(in_period.to_string(), in_stream_number + 1);
-                if versioning_pending {
-                    contact.sent_versioning_update = true;
-                    contact.versioning_sent = versioning_fp.clone();
-                    contact.versioning_version = versioning_nummer;
-                }
                 if transport_id == LAN_TRANSPORT_ID {
                     let state = contact.transport_mut(LAN_TRANSPORT_ID);
                     // Der Port kommt aus dem, was die Gegenseite gemeldet hat,
@@ -2393,6 +2434,7 @@ impl Node {
                 timestamp: zeitstempel,
                 body: to_hex(&rumpf),
                 acked: false,
+                intern: false,
             },
         );
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
@@ -2556,6 +2598,7 @@ impl Node {
                 timestamp: zeitstempel,
                 body: to_hex(&rumpf),
                 acked: false,
+                intern: false,
             },
         );
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
@@ -2659,6 +2702,7 @@ impl Node {
                     timestamp,
                     body: to_hex(body),
                     acked: false,
+                    intern: false,
                 },
             );
         }
@@ -3247,6 +3291,7 @@ pub fn new_outgoing_message(group_id: &SecretKey, text: &str) -> (Message, OutMe
             timestamp,
             body: to_hex(&body),
             acked: false,
+            intern: false,
         },
     )
 }
@@ -3375,6 +3420,87 @@ mod ipv6_tests {
 }
 
 #[cfg(test)]
+mod versionsansage_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn kontakt() -> crate::store::Contact {
+        crate::store::Contact {
+            id: 1,
+            name: "Probe".to_string(),
+            author_id: to_hex(&[7u8; 32]),
+            signature_public: to_hex(&[8u8; 32]),
+            handshake_public: None,
+            master_key: to_hex(&[9u8; 32]),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            last_read: 0,
+        }
+    }
+
+    #[test]
+    fn unquittierte_ansage_bleibt_liegen_und_geht_wieder_hinaus() {
+        let eigen: SecretKey = [1u8; 32];
+        let mut c = kontakt();
+
+        // Erste Runde: eingereiht, Nummer 1 -- wie Briars storeFirstUpdate.
+        let gruppe = versionsansage_einreihen(&mut c, &eigen);
+        assert_eq!(c.outbox.len(), 1);
+        assert_eq!(c.outbox[0].group, gruppe);
+        assert!(c.outbox[0].intern, "Haushaltskram, kein Text des Benutzers");
+        assert_eq!(c.versioning_version, 1);
+        let erste = c.outbox[0].id.clone();
+
+        // Zweite Runde ohne Quittung: nichts kommt dazu, und die Ansage liegt
+        // unveraendert im Korb -- run_sync schickt sie damit von selbst erneut.
+        // Das ist die Stelle, die vorher fehlte.
+        versionsansage_einreihen(&mut c, &eigen);
+        assert_eq!(c.outbox.len(), 1, "keine zweite Ansage");
+        assert_eq!(c.outbox[0].id, erste, "dieselben Bytes, dieselbe Kennung");
+
+        // Quittung: der Korb raeumt sie weg, danach wird nicht neu angesagt.
+        c.outbox[0].acked = true;
+        c.outbox.retain(|m| !m.acked);
+        versionsansage_einreihen(&mut c, &eigen);
+        assert!(
+            c.outbox.is_empty(),
+            "eine quittierte Ansage wird nicht wiederholt"
+        );
+
+        // Aendert sich die Klientenliste -- hier nachgestellt durch einen
+        // geloeschten Fingerabdruck --, geht eine neue mit hoeherer Nummer
+        // hinaus; Briar verwirft die kleinere.
+        c.versioning_sent.clear();
+        versionsansage_einreihen(&mut c, &eigen);
+        assert_eq!(c.outbox.len(), 1);
+        assert_eq!(c.versioning_version, 2);
+    }
+
+    /// Die Nummer steht IM Rumpf, und die Kennung ist ein Hash darueber. Wer
+    /// sie erst bei der Quittung setzt, erzeugt jede Runde neue Bytes.
+    #[test]
+    fn die_nummer_steht_im_rumpf() {
+        let eigen: SecretKey = [1u8; 32];
+        let mut c = kontakt();
+        versionsansage_einreihen(&mut c, &eigen);
+        let rumpf = from_hex(&c.outbox[0].body).unwrap();
+        let liste = crate::bdf::from_bytes(&rumpf).unwrap();
+        let teile = liste.as_list().unwrap();
+        assert_eq!(teile.len(), 2, "Klientenliste und Nummer");
+        assert_eq!(teile[1].as_int(), Some(1));
+    }
+}
+
+#[cfg(test)]
 mod einladungsantwort_tests {
     use super::*;
     use crate::store::{Ereignisart, GroupPost, PrivateGroup, Sitzungszustand};
@@ -3413,7 +3539,6 @@ mod einladungsantwort_tests {
             to_ack: Vec::new(),
             to_request: Vec::new(),
             last_seen: 0,
-            sent_versioning_update: false,
             versioning_sent: String::new(),
             versioning_version: 0,
             sent_properties: None,
@@ -3596,6 +3721,7 @@ mod einladungsantwort_tests {
                 timestamp: 1,
                 body: String::new(),
                 acked: false,
+                intern: false,
             },
         );
         store.queue(
@@ -3606,6 +3732,7 @@ mod einladungsantwort_tests {
                 timestamp: 1,
                 body: String::new(),
                 acked: false,
+                intern: false,
             },
         );
         let n = knoten();

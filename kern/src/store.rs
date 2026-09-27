@@ -134,6 +134,12 @@ pub struct OutMessage {
     pub timestamp: u64,
     pub body: String,
     pub acked: bool,
+    /// Haushaltskram: Adressmeldung und Versionsansage. Sie liegen im selben
+    /// Korb wie eine Privatnachricht, sind aber nichts, was der Benutzer
+    /// geschrieben hat -- der Zaehler in der Kontaktliste darf sie nicht als
+    /// "noch nicht gesendet" ausweisen.
+    #[serde(default)]
+    pub intern: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,14 +166,11 @@ pub struct Contact {
     #[serde(default)]
     pub to_request: Vec<String>,
     pub last_seen: u64,
-    /// Nur noch fuer alte Dateien: bis 0.24.0 ein einmaliges Ja/Nein. Damit
-    /// haette ein bestehender Kontakt eine geaenderte Klientenliste nie
-    /// erfahren.
-    #[serde(default)]
-    pub sent_versioning_update: bool,
-    /// Fingerabdruck der zuletzt angesagten Klientenliste. Aendert sie sich,
-    /// wird neu angesagt -- Briars Klient tut dasselbe, nur mit einer
-    /// Datenbank dahinter.
+    /// Fingerabdruck der zuletzt IN DEN KORB GELEGTEN Klientenliste -- nicht
+    /// der zuletzt angekommenen. Was angekommen ist, sagt allein der Korb:
+    /// solange die Ansage dort unquittiert liegt, geht sie jede Runde wieder
+    /// hinaus. Aendert sich die Liste, wird die alte Ansage verworfen und eine
+    /// neue mit hoeherer Nummer eingereiht.
     #[serde(default)]
     pub versioning_sent: String,
     /// Die Nummer der Ansage. Briar laesst die hoehere gewinnen und verwirft

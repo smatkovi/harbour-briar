@@ -312,6 +312,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             timestamp,
                             body: to_hex(&attachment_body),
                             acked: false,
+                            intern: false,
                         },
                     );
                     attachments.push((attachment_id, content_type));
@@ -343,6 +344,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         timestamp,
                         body: to_hex(&message_body),
                         acked: false,
+                        intern: false,
                     },
                 );
                 if let Err(e) = locked.save() {
@@ -713,6 +715,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     timestamp,
                     body: to_hex(&invite),
                     acked: false,
+                    intern: false,
                 },
             );
             // Die Kennung DIESER INVITE ist der erste Anker der Kette zu
@@ -738,6 +741,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         timestamp: m.timestamp,
                         body: m.body.clone(),
                         acked: false,
+                        intern: false,
                     })
                     .collect(),
                 None => Vec::new(),
@@ -835,6 +839,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         timestamp,
                         body: to_hex(&join),
                         acked: false,
+                        intern: false,
                     },
                 );
             }
@@ -869,6 +874,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             timestamp,
                             body: to_hex(&rumpf),
                             acked: false,
+                            intern: false,
                         },
                     );
                     // Fortschreiben in DER Sitzung, aus der die Kette kommt --
@@ -977,6 +983,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         timestamp,
                         body: to_hex(&post),
                         acked: false,
+                        intern: false,
                     },
                 );
             }
@@ -1077,6 +1084,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             timestamp,
                             body: to_hex(&rumpf),
                             acked: false,
+                            intern: false,
                         },
                     );
                 }
@@ -1167,7 +1175,10 @@ fn status(store: &Shared) -> Value {
                     .count(),
                 "lastSeen": c.last_seen,
                 "messages": c.messages.len(),
-                "unsent": c.outbox.iter().filter(|m| !m.acked).count(),
+                // Haushaltskram zaehlt nicht mit: Adressmeldung und
+                // Versionsansage liegen im selben Korb, sind aber nichts, was
+                // der Benutzer geschrieben hat.
+                "unsent": c.outbox.iter().filter(|m| !m.acked && !m.intern).count(),
                 "lastText": c.messages.last().map(|m| m.text.clone()),
             })
         })
