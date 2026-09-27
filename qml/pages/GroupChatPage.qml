@@ -10,6 +10,7 @@ Page {
     property string groupId: ""
     property string groupName: ""
     property bool isCreator: false
+    property bool dissolved: false
     property var messages: []
     property var members: []
 
@@ -18,6 +19,7 @@ Page {
             if (!answer.error) {
                 page.messages = answer.messages
                 page.members = answer.members
+                page.dissolved = !!answer.dissolved
             }
         })
     }
@@ -43,7 +45,8 @@ Page {
 
         header: PageHeader {
             title: page.groupName
-            description: page.members.length + " " + app.tr("members")
+            description: page.dissolved ? app.tr("dissolved")
+                                        : page.members.length + " " + app.tr("members")
         }
 
         PullDownMenu {
@@ -115,6 +118,9 @@ Page {
 
     Row {
         id: input
+        // In eine aufgelöste Gruppe geht nichts mehr hinaus. Die Zeile bleibt
+        // stehen, nur unsichtbar: der Verlauf ist darüber verankert.
+        visible: !page.dissolved
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
         height: field.height
 

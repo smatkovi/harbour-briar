@@ -90,7 +90,9 @@ Page {
 
         delegate: Item {
             width: liste.width
-            height: 96
+            // Drei Zeilen brauchen mehr: QtQuick 1.1 gibt die Hoehe einer
+            // Column nicht nach oben durch, die dritte fehlte sonst einfach.
+            height: 120
 
             Column {
                 anchors { left: parent.left; leftMargin: 16; verticalCenter: parent.verticalCenter }
@@ -106,18 +108,32 @@ Page {
                     elide: Text.ElideRight
                     font.pixelSize: 20
                     color: modelData.joined ? "#a0a0a0" : "#95d220"
-                    text: modelData.joined
-                          ? (modelData.members + " " + fenster.tr("members")
-                             + (modelData.lastText ? " · " + modelData.lastText : ""))
-                          : fenster.tr("invitation") + " · " + fenster.tr("invitedBy")
-                            + modelData.creator
+                    text: modelData.dissolved
+                          ? fenster.tr("dissolved")
+                          : modelData.joined
+                            ? (modelData.members + " " + fenster.tr("members")
+                               + (modelData.lastText ? " · " + modelData.lastText : ""))
+                            : fenster.tr("invitation") + " · " + fenster.tr("invitedBy")
+                              + modelData.creator
+                }
+                // Die Antwort der Gegenseite. Eigene Zeile, weil der Platz in
+                // der Zeile darueber schon vergeben ist.
+                Label {
+                    width: parent.width
+                    visible: modelData.event ? true : false
+                    elide: Text.ElideRight
+                    font.pixelSize: 18
+                    color: "#95d220"
+                    text: Strings.ereignis(modelData.event)
                 }
             }
 
             MouseArea {
                 anchors.fill: parent
                 onClicked: {
-                    if (modelData.joined) {
+                    // Eine aufgeloeste Gruppe laesst sich lesen und entfernen,
+                    // aber nicht mehr beitreten.
+                    if (modelData.joined || modelData.dissolved) {
                         pageStack.push(Qt.resolvedUrl("GroupChatPage.qml"),
                                        { gruppe: modelData.id, name: modelData.name,
                                          ersteller: modelData.isCreator })

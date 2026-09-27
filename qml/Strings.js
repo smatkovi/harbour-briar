@@ -72,6 +72,15 @@ var table = {
     onlyCreator:      { de: "Nur wer die Gruppe angelegt hat, kann einladen.",
                         en: "Only whoever created the group can invite." },
     joinFirst:        { de: "Erst beitreten",              en: "Join first" },
+    dissolved:        { de: "aufgelöst",                   en: "dissolved" },
+    evAccepted:       { de: " hat die Einladung angenommen",
+                        en: " accepted the invitation" },
+    evDeclined:       { de: " hat die Einladung abgelehnt",
+                        en: " declined the invitation" },
+    evLeft:           { de: " hat die Gruppe verlassen",   en: " left the group" },
+    evDissolved:      { de: " hat die Gruppe aufgelöst",   en: " dissolved the group" },
+    evAborted:        { de: " — die Einladung ist gescheitert",
+                        en: " — the invitation failed" },
     attach:           { de: "Anhang",                      en: "Attachment" },
     pickFile:         { de: "Datei wählen",                en: "Choose a file" },
     tooBig:           { de: "Zu groß für eine Nachricht (max. 32 KB). Bilder "
@@ -191,6 +200,16 @@ var table = {
 // text is recomputed when the language changes.
 function tr(key, revision) {
     return t(key)
+}
+
+/** Das letzte Ereignis einer Gruppe als Satz. Der Dienst schickt nur die Art
+    und den Namen, damit die Sprachumschaltung auch hier greift. */
+function ereignis(event) {
+    if (!event)
+        return ""
+    var key = { accepted: "evAccepted", declined: "evDeclined", left: "evLeft",
+                dissolved: "evDissolved", aborted: "evAborted" }[event.kind]
+    return key ? event.who + t(key) : ""
 }
 
 function t(key) {

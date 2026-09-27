@@ -9,6 +9,7 @@ Page {
     property string gruppe: ""
     property string name: ""
     property bool ersteller: false
+    property bool aufgeloest: false
     property variant nachrichten: []
     property variant mitglieder: []
 
@@ -17,6 +18,7 @@ Page {
             if (!antwort.error) {
                 seite.nachrichten = antwort.messages
                 seite.mitglieder = antwort.members
+                seite.aufgeloest = antwort.dissolved ? true : false
             }
         })
     }
@@ -36,7 +38,9 @@ Page {
             onClicked: pageStack.pop()
         }
         Label {
-            text: seite.name + " (" + seite.mitglieder.length + ")"
+            text: seite.aufgeloest
+                  ? seite.name + " (" + fenster.tr("dissolved") + ")"
+                  : seite.name + " (" + seite.mitglieder.length + ")"
             color: "white"
             font.pixelSize: 24
             anchors.verticalCenter: parent.verticalCenter
@@ -118,6 +122,8 @@ Page {
 
     Row {
         id: eingabe
+        // In eine aufgeloeste Gruppe geht nichts mehr hinaus.
+        visible: !seite.aufgeloest
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
         spacing: 8
 

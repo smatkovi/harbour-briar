@@ -55,16 +55,33 @@ Page {
                     truncationMode: TruncationMode.Fade
                     color: Theme.secondaryColor
                     font.pixelSize: Theme.fontSizeExtraSmall
-                    text: modelData.joined
-                          ? (modelData.members + " " + app.tr("members")
-                             + (modelData.lastText ? " · " + modelData.lastText : ""))
-                          : app.tr("invitation") + " · "
-                            + app.tr("invitedBy") + modelData.creator
+                    // "aufgelöst" steht vor allem anderen: es sagt, dass hier
+                    // nichts mehr hinausgeht.
+                    text: modelData.dissolved
+                          ? app.tr("dissolved")
+                          : modelData.joined
+                            ? (modelData.members + " " + app.tr("members")
+                               + (modelData.lastText ? " · " + modelData.lastText : ""))
+                            : app.tr("invitation") + " · "
+                              + app.tr("invitedBy") + modelData.creator
+                }
+                // Die Antwort der Gegenseite gehört hierher: Briar zeigt sie
+                // als Zeile im Gespräch, wir haben dort keine Zeile. Sie
+                // verschwindet, sobald die Gruppe einmal offen war (/read).
+                Label {
+                    width: parent.width
+                    visible: !!modelData.event
+                    truncationMode: TruncationMode.Fade
+                    color: Theme.highlightColor
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    text: Strings.ereignis(modelData.event)
                 }
             }
 
             onClicked: {
-                if (modelData.joined) {
+                // Eine aufgelöste Gruppe soll sich öffnen lassen -- Verlauf
+                // lesen und entfernen --, nur nicht mehr per Tipp beitreten.
+                if (modelData.joined || modelData.dissolved) {
                     pageStack.push(Qt.resolvedUrl("GroupChatPage.qml"),
                                    { groupId: modelData.id, groupName: modelData.name,
                                      isCreator: modelData.isCreator })
@@ -79,7 +96,7 @@ Page {
 
             menu: ContextMenu {
                 MenuItem {
-                    visible: !modelData.joined
+                    visible: !modelData.joined && !modelData.dissolved
                     text: app.tr("join")
                     onClicked: Briar.joinGroup(modelData.id, function() { page.reload() })
                 }

@@ -223,6 +223,51 @@ pub struct GroupPost {
     pub join: bool,
 }
 
+/// Der Zustand der Einladungssitzung mit EINEM Kontakt, eingekocht auf die
+/// Zustaende, die hier wirklich gelesen werden. Briars CreatorState und
+/// InviteeState unterscheiden mehr, weil dort die Sichtbarkeit der Gruppe am
+/// Zustand haengt; wir teilen die Gruppe schon beim Einladen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum Sitzungszustand {
+    /// Nichts offen. Briars CreatorState.START -- auch der Zustand nach einer
+    /// Ablehnung, danach ist neu einladen erlaubt. Ebenso der Zustand einer
+    /// noch unbeantworteten Einladung an uns: dass sie offen ist, sagt schon
+    /// `joined == false` mit `invited_by`.
+    #[default]
+    Start,
+    /// Wir haben eingeladen und warten (CreatorState.INVITED). Gelesen von
+    /// /group/invite: ein zweites Mal einladen ist ein Zustandsfehler.
+    Eingeladen,
+    /// Beide sind drin (CreatorState.JOINED).
+    Beigetreten,
+    /// Der Kontakt ist gegangen, wir sind noch drin (CreatorState.LEFT). Neu
+    /// einladen waere falsch: seine Beitrittsnachricht steht noch in der
+    /// Gruppe, eine zweite wuerde seine Kette gabeln.
+    Gegangen,
+    /// Ein ABORT ist geflogen. Wir antworten genau einmal darauf -- ohne
+    /// diesen Zustand schicken sich zwei Geraete endlos ABORTs zu.
+    Fehler,
+}
+
+/// Was zuletzt in der Einladungsgruppe geschah. Nur die Art und der Name --
+/// die Worte macht die Oberflaeche, sonst stuende deutsche Schrift im Dienst
+/// und die Sprachumschaltung griffe hier nicht.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Ereignis {
+    pub art: Ereignisart,
+    pub wer: String,
+    pub wann: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Ereignisart {
+    Angenommen,
+    Abgelehnt,
+    Gegangen,
+    Aufgeloest,
+    Abgebrochen,
+}
+
 /// Eine Einladungssitzung, so wie Briar sie fuehrt: eine je KONTAKT und
 /// Gruppe. GroupInvitationManagerImpl sucht sie mit
 /// getSession(Kontaktgruppe, sessionId = Gruppenkennung) -- deshalb reicht ein
@@ -248,6 +293,10 @@ pub struct Einladungssitzung {
     pub eigener_zeitstempel: u64,
     #[serde(default)]
     pub einladungs_zeitstempel: u64,
+    /// Wie weit die Sitzung ist. Dasselbe JOIN heisst "hat angenommen" oder
+    /// "kommt zurueck", je nachdem, was vorher war.
+    #[serde(default)]
+    pub zustand: Sitzungszustand,
 }
 
 impl Einladungssitzung {
@@ -296,6 +345,16 @@ pub struct PrivateGroup {
     /// `einladungen` (Speicherfassung 3) und wird nicht mehr geschrieben.
     #[serde(default, skip_serializing)]
     pub einladung_previous: Option<String>,
+    /// Der Ersteller ist gegangen -- Briars markGroupDissolved. Die Gruppe
+    /// bleibt lesbar und entfernbar, aber es geht nichts mehr hinaus, und eine
+    /// offene Einladung ist nicht mehr annehmbar.
+    #[serde(default)]
+    pub aufgeloest: bool,
+    /// Die letzte Antwort der Gegenseite, fuer die Oberflaeche. Briar zeigt so
+    /// etwas als Zeile im Gespraech; wir haben dort keine Zeile und sagen es an
+    /// der Gruppe. Wird beim Oeffnen der Gruppe geleert (/read).
+    #[serde(default)]
+    pub letztes_ereignis: Option<Ereignis>,
     /// Contacts this group is synced with
     #[serde(default)]
     pub contacts: Vec<u32>,
@@ -587,10 +646,16 @@ impl Store {
                 let vorige = group.einladung_previous.take();
                 if let (Some(kontakt), Some(vorige)) = (group.invited_by, vorige) {
                     let stempel = group.invite_timestamp.unwrap_or(0);
+                    let beigetreten = group.joined;
                     let sitzung = group.einladungen.entry(kontakt).or_default();
                     sitzung.letzte_eigene = Some(vorige);
                     sitzung.einladungs_zeitstempel = stempel;
                     sitzung.eigener_zeitstempel = stempel;
+                    sitzung.zustand = if beigetreten {
+                        Sitzungszustand::Beigetreten
+                    } else {
+                        Sitzungszustand::Start
+                    };
                 }
             }
         }
@@ -691,6 +756,18 @@ impl Store {
     ) -> Option<&mut Einladungssitzung> {
         self.group_mut(group)
             .map(|g| g.einladungen.entry(contact_id).or_default())
+    }
+
+    /// Nimmt einem Kontakt alles wieder aus der Warteschlange, was zu DIESER
+    /// Gruppe gehoert. Briar macht die Gruppe fuer ihn unsichtbar, dann geht
+    /// nichts mehr hinaus; bei uns ist die Warteschlange der einzige Ort, an
+    /// dem Ausstehendes liegt. `group_hex` ist die Kennung der Gruppe selbst,
+    /// nicht die der Einladungsgruppe -- sonst flogen unser eigenes LEAVE und
+    /// ABORT mit hinaus, bevor sie abgeschickt sind.
+    pub fn verwerfe_gruppenpost(&mut self, contact_id: u32, group_hex: &str) {
+        if let Some(contact) = self.contact_mut(contact_id) {
+            contact.outbox.retain(|m| m.group != group_hex);
+        }
     }
 
     pub fn add_message(&mut self, contact_id: u32, message: Message) -> bool {
@@ -801,6 +878,8 @@ mod gruppen_tests {
             our_previous: vorher.map(|v| v.to_string()),
             einladungen: BTreeMap::new(),
             einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
             contacts: Vec::new(),
         }
     }
@@ -906,6 +985,7 @@ mod wanderung_tests {
             letzte_fremde: None,
             eigener_zeitstempel: 0,
             einladungs_zeitstempel: u64::MAX / 2,
+            zustand: Sitzungszustand::Start,
         };
         assert!(s.naechster_zeitstempel() > s.einladungs_zeitstempel);
         // Und ohne alles gilt die Uhr.

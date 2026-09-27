@@ -512,6 +512,10 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 let group = group.to_string();
                 if let Some(entry) = locked.group_mut(&group) {
                     entry.last_read = now;
+                    // Die Antwort der Gegenseite ist gesehen, sobald die Gruppe
+                    // offen war. Sonst stuende "hat abgelehnt" fuer immer in der
+                    // Liste und verdeckte den letzten Beitrag.
+                    entry.letztes_ereignis = None;
                 }
                 let _ = locked.save();
                 drop(locked);
@@ -605,6 +609,8 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 our_previous: None,
                 einladungen: BTreeMap::new(),
                 einladung_previous: None,
+                aufgeloest: false,
+                letztes_ereignis: None,
                 contacts: Vec::new(),
             };
             // The creator's own join message starts its chain.
@@ -656,15 +662,33 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 Some(c) => c.author_id_bytes(),
                 None => return json!({"error": "no such contact"}),
             };
-            // Briar wirft hier ProtocolStateException: im Zustand INVITED ist
-            // eine zweite Einladung nicht erlaubt
-            // (CreatorProtocolEngine.onInviteAction). Sonst entsteht eine
-            // zweite Kette zum selben Kontakt, und er bekommt die ganze
-            // Gruppengeschichte noch einmal in die Warteschlange gelegt.
-            if let Some(s) = locked.sitzung(&group_hex, contact_id) {
-                if s.letzte_eigene.is_some() && s.letzte_fremde.is_none() {
-                    return json!({"error": "Die Einladung an diesen Kontakt ist noch offen."});
-                }
+            // Zweimal einladen ist in Briar ein Zustandsfehler (onInviteAction
+            // wirft in INVITED, JOINED und LEFT). Hier kostet es mehr als dort:
+            // die zweite Einladung traegt eine andere Kennung, die Gegenseite
+            // hat die Gruppe schon und wirft sie weg -- der Benutzer sieht
+            // nichts und tippt weiter. Das ist auch der Grund, warum wir eine
+            // doppelte Einladung beim Empfaenger NICHT abbrechen: hier ist der
+            // Ort, wo sie gar nicht entsteht.
+            let (schon_drin, sitzungszustand) = match locked.group(&group_hex) {
+                Some(g) => (
+                    g.messages
+                        .iter()
+                        .any(|m| m.join && m.author_id == to_hex(&their_author_id)),
+                    g.einladungen.get(&contact_id).map(|s| s.zustand),
+                ),
+                None => (false, None),
+            };
+            if schon_drin || sitzungszustand == Some(crate::store::Sitzungszustand::Beigetreten) {
+                return json!({"error": "the contact is already in this group"});
+            }
+            if sitzungszustand == Some(crate::store::Sitzungszustand::Eingeladen) {
+                return json!({"error": "an invitation is already on its way"});
+            }
+            if sitzungszustand == Some(crate::store::Sitzungszustand::Gegangen) {
+                // Seine Beitrittsnachricht steht noch in der Gruppe. Ein
+                // zweiter Beitritt wuerde seine Kette gabeln, und die Gruppe
+                // prueft genau die.
+                return json!({"error": "the contact has left this group"});
             }
             // Echt spaeter als alles, was in dieser Sitzung schon lief.
             let timestamp = locked
@@ -700,6 +724,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 s.letzte_eigene = Some(to_hex(&invite_id));
                 s.eigener_zeitstempel = timestamp;
                 s.einladungs_zeitstempel = timestamp;
+                s.zustand = crate::store::Sitzungszustand::Eingeladen;
             }
             // The invited contact also needs every message the group already
             // holds, once it joins.
@@ -754,6 +779,24 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             };
             if already {
                 return json!({"error": "already joined"});
+            }
+            // Eine Einladung, die nicht mehr gilt: der Ersteller ist gegangen
+            // (Briars onRemoteLeaveWhenNotSubscribed macht sie unbeantwortbar)
+            // oder die Sitzung ist zerrissen. Beitreten wuerde eine Gruppe
+            // anlegen, die niemand mehr haelt, und ein JOIN an jemanden
+            // schicken, der uns nicht mehr zuhoert.
+            let hinfaellig = match locked.group(&group_hex) {
+                Some(g) => {
+                    g.aufgeloest
+                        || g.invited_by
+                            .and_then(|c| g.einladungen.get(&c))
+                            .map(|s| s.zustand == crate::store::Sitzungszustand::Fehler)
+                            .unwrap_or(false)
+                }
+                None => false,
+            };
+            if hinfaellig {
+                return json!({"error": "this invitation is no longer valid"});
             }
             // Das JOIN muss echt hinter der Einladung liegen. Sonst erklaert
             // Briars GroupMessageValidator es fuer ungueltig, und die Sitzung
@@ -834,6 +877,12 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     if let Some(s) = locked.sitzung_mut(&group_hex, einladender) {
                         s.letzte_eigene = Some(kennung);
                         s.eigener_zeitstempel = timestamp;
+                        // Gleich Beigetreten, nicht ein Wartezustand: unser
+                        // Beitritt in der Gruppe geht im selben Aufruf hinaus,
+                        // wir teilen also sofort. Briars Eingeladener geht nach
+                        // ACCEPTED und wartet auf das JOIN des Erstellers, aber
+                        // nur, weil dort die Sichtbarkeit daran haengt.
+                        s.zustand = crate::store::Sitzungszustand::Beigetreten;
                     }
                 }
             }
@@ -863,18 +912,27 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 Some(v) => v,
                 None => return json!({"error": "create an identity first"}),
             };
-            let (group_id, previous, vorher, contacts, joined) = match locked.group(&group_hex) {
-                Some(g) => (
-                    key_from_hex(&g.id),
-                    g.our_previous.clone(),
-                    g.vorgaenger_zeit(),
-                    g.contacts.clone(),
-                    g.joined,
-                ),
-                None => return json!({"error": "no such group"}),
-            };
+            let (group_id, previous, vorher, contacts, joined, aufgeloest) =
+                match locked.group(&group_hex) {
+                    Some(g) => (
+                        key_from_hex(&g.id),
+                        g.our_previous.clone(),
+                        g.vorgaenger_zeit(),
+                        g.contacts.clone(),
+                        g.joined,
+                        g.aufgeloest,
+                    ),
+                    None => return json!({"error": "no such group"}),
+                };
             if !joined {
                 return json!({"error": "join the group first"});
+            }
+            // In eine aufgeloeste Gruppe laesst Briar nichts mehr schreiben
+            // (isDissolved). Der Verlauf bleibt lesbar und Entfernen bleibt
+            // moeglich -- nur hinaus geht nichts mehr, denn der Ersteller, an
+            // dem die Gruppe haengt, ist weg.
+            if aufgeloest {
+                return json!({"error": "this group has been dissolved"});
             }
             let previous = match previous {
                 Some(p) => key_from_hex(&p),
@@ -942,6 +1000,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     "group": group.id,
                     "name": group.name,
                     "joined": group.joined,
+                    "dissolved": group.aufgeloest,
                     "messages": group.messages.iter().filter(|m| !m.join).map(|m| json!({
                         "id": m.id,
                         "timestamp": m.timestamp,
@@ -1066,6 +1125,21 @@ fn group_json(store: &Store, group: &PrivateGroup) -> Value {
         "messages": group.messages.iter().filter(|m| !m.join).count(),
         "lastText": group.messages.iter().filter(|m| !m.join).last().map(|m| m.text.clone()),
         "contacts": group.contacts,
+        "dissolved": group.aufgeloest,
+        // Nur die Art und der Name, nicht der Satz: die Worte macht die
+        // Oberflaeche, sonst stuende deutsche Schrift im Dienst und die
+        // Sprachumschaltung griffe hier nicht.
+        "event": group.letztes_ereignis.as_ref().map(|e| json!({
+            "kind": match e.art {
+                crate::store::Ereignisart::Angenommen => "accepted",
+                crate::store::Ereignisart::Abgelehnt => "declined",
+                crate::store::Ereignisart::Gegangen => "left",
+                crate::store::Ereignisart::Aufgeloest => "dissolved",
+                crate::store::Ereignisart::Abgebrochen => "aborted",
+            },
+            "who": e.wer,
+            "at": e.wann,
+        })),
     })
 }
 

@@ -2125,21 +2125,13 @@ impl Node {
                 self.receive_invite(store, contact_id, id, timestamp, invite)
             }
             Some(groups::Einladungsnachricht::Join { gruppe, vorige }) => {
-                self.receive_einladung_join(store, contact_id, id, &gruppe, vorige)
+                self.receive_einladung_join(store, contact_id, id, timestamp, &gruppe, vorige)
             }
             Some(groups::Einladungsnachricht::Leave { gruppe, vorige }) => {
-                self.receive_einladung_leave(store, contact_id, id, &gruppe, vorige)
+                self.receive_einladung_leave(store, contact_id, id, timestamp, &gruppe, vorige)
             }
             Some(groups::Einladungsnachricht::Abort { gruppe }) => {
-                log(&format!(
-                    "contact {} aborted the invitation for group {}",
-                    contact_id,
-                    to_hex(&gruppe)
-                ));
-                if let Some(s) = store.sitzung_mut(&to_hex(&gruppe), contact_id) {
-                    s.letzte_fremde = Some(to_hex(id));
-                }
-                true
+                self.receive_einladung_abort(store, contact_id, id, &gruppe)
             }
             None => false,
         }
@@ -2200,6 +2192,9 @@ impl Node {
                 letzte_fremde: Some(to_hex(id)),
                 eigener_zeitstempel: 0,
                 einladungs_zeitstempel: timestamp,
+                // `Start`, weil `joined == false` mit `invited_by` schon sagt,
+                // dass die Einladung offen ist.
+                zustand: crate::store::Sitzungszustand::Start,
             },
         );
         store.state.groups.push(crate::store::PrivateGroup {
@@ -2219,6 +2214,8 @@ impl Node {
             our_previous: None,
             einladungen,
             einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
             contacts: vec![contact_id],
         });
         log(&format!(
@@ -2226,6 +2223,55 @@ impl Node {
             invite.group_name, contact_id
         ));
         true
+    }
+
+    /// JOIN, LEAVE und ABORT aus der Einladungsgruppe. Briar hat dafuer drei
+    /// Rollen mit eigenen Zustandsmaschinen (CreatorProtocolEngine,
+    /// InviteeProtocolEngine, PeerProtocolEngine); hier steht eine Sitzung je
+    /// Kontakt, und wer der Absender ist, sagt, was eine Nachricht bedeutet:
+    /// ein LEAVE des Erstellers loest die Gruppe auf, das eines Mitglieds nimmt
+    /// nur ihn selbst heraus.
+    ///
+    /// Was wir von Briar bewusst NICHT uebernehmen: den Abbruch bei einer
+    /// zerrissenen Kette. Keine Fassung bis 0.26.0 fuehrte in der
+    /// Einladungsgruppe des Erstellers eine Kette -- sein LEAVE traegt Null, wo
+    /// wir die Einladung erwarten wuerden. Wer hier streng prueft, macht aus
+    /// "alter Ersteller entfernt die Gruppe" einen Fehlerfall.
+    fn einladungslage(
+        &self,
+        store: &Store,
+        contact_id: u32,
+        group_hex: &str,
+    ) -> Option<(bool, bool, crate::store::Sitzungszustand, Option<String>, String)> {
+        let g = store.group(group_hex)?;
+        let ihre_hex = store.contact(contact_id).map(|c| to_hex(&c.author_id_bytes()))?;
+        let sitzung = g.einladungen.get(&contact_id);
+        Some((
+            g.creator_author_id == ihre_hex,
+            // War er schon einmal Mitglied? Seine Beitrittsnachricht steht in
+            // der Gruppe selbst. Daran haengt, ob ein LEAVE eine Ablehnung oder
+            // ein Austritt ist -- und das gilt auch fuer Gruppen, die vor
+            // dieser Fassung eingeladen wurden und gar keine Sitzung haben.
+            g.messages.iter().any(|m| m.join && m.author_id == ihre_hex),
+            sitzung
+                .map(|s| s.zustand)
+                .unwrap_or(crate::store::Sitzungszustand::Start),
+            sitzung.and_then(|s| s.letzte_fremde.clone()),
+            store
+                .contact(contact_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// Die Kette festhalten, aber nicht erzwingen -- nur ins Protokoll damit.
+    fn kette_melden(&self, contact_id: u32, art: &str, genannt: &Option<String>, erwartet: &Option<String>) {
+        if genannt != erwartet {
+            log(&format!(
+                "{} von Kontakt {}: Kette zeigt auf {:?}, erwartet war {:?} -- wird trotzdem angenommen",
+                art, contact_id, genannt, erwartet
+            ));
+        }
     }
 
     /// Die Eingeladene hat zugesagt. Sind wir die Erstellerin, schickt Briar
@@ -2238,9 +2284,11 @@ impl Node {
         store: &mut Store,
         contact_id: u32,
         id: &SecretKey,
+        timestamp: u64,
         gruppe: &SecretKey,
         vorige: Option<SecretKey>,
     ) -> bool {
+        use crate::store::{Ereignis, Ereignisart, Sitzungszustand};
         let group_hex = to_hex(gruppe);
         let unsere = match store.identity() {
             Some(i) => key_from_hex(&i.author_id),
@@ -2250,43 +2298,79 @@ impl Node {
             Some(c) => c.author_id_bytes(),
             None => return false,
         };
-        let (sind_wir_erstellerin, anker, schon_gesehen) = match store.group(&group_hex) {
-            Some(g) => {
-                let s = g.einladungen.get(&contact_id);
-                (
-                    g.creator_author_id == to_hex(&unsere),
-                    s.and_then(|s| s.letzte_eigene.clone()),
-                    s.and_then(|s| s.letzte_fremde.clone()) == Some(to_hex(id)),
-                )
-            }
-            None => return false,
-        };
+        let (_vom_ersteller, _war_mitglied, zustand, letzte_fremde, name) =
+            match self.einladungslage(store, contact_id, &group_hex) {
+                Some(v) => v,
+                None => {
+                    log(&format!(
+                        "ein JOIN von Kontakt {} betrifft eine unbekannte Gruppe",
+                        contact_id
+                    ));
+                    return false;
+                }
+            };
+        let sind_wir_erstellerin = store
+            .group(&group_hex)
+            .map(|g| g.creator_author_id == to_hex(&unsere))
+            .unwrap_or(false);
+        let anker = store
+            .sitzung(&group_hex, contact_id)
+            .and_then(|s| s.letzte_eigene.clone());
+        // In ERROR ignoriert Briar jede weitere Nachricht. Ohne diesen Riegel
+        // schicken sich zwei Geraete endlos ABORTs zu.
+        if zustand == Sitzungszustand::Fehler {
+            return false;
+        }
         // Briar bekommt das Entdoppeln von der Datenbank geschenkt: eine schon
         // gespeicherte Nachricht wird nie zweimal ausgeliefert. Hier gibt es
         // diese Schicht nicht -- geht eine Quittung verloren, kommt dasselbe
         // JOIN wieder, und wir wuerden ein zweites eigenes JOIN schicken.
-        if schon_gesehen {
+        if letzte_fremde.as_deref() == Some(&to_hex(id)[..]) {
             return true;
         }
         let genannt = vorige.map(|v| to_hex(&v));
-        if genannt != anker {
-            // Nur melden, nicht abbrechen. Briar schickt hier ABORT, aber die
-            // Fassungen, die schon im Feld laufen, fuehren die Kette je Gruppe
-            // und nennen darum manchmal eine fremde vorige Nachricht. Ein
-            // Abbruch wuerde laufende Gruppen zerschlagen.
-            log(&format!(
-                "the JOIN from contact {} names {:?} as previous, expected {:?}",
-                contact_id, genannt, anker
-            ));
+        self.kette_melden(contact_id, "JOIN", &genannt, &anker);
+        if zustand == Sitzungszustand::Beigetreten {
+            // Briars Einladender schickt nach der Annahme selbst ein JOIN
+            // zurueck. Eines hinnehmen muessen wir also: abbrechen, wie Briars
+            // Eingeladener es in JOINED taete, wuerde eine laufende Gruppe
+            // zerlegen.
+            if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+                s.letzte_fremde = Some(to_hex(id));
+            }
+            return true;
+        }
+        // Start, Eingeladen oder Gegangen: er ist (wieder) dabei. Briars
+        // Einladender bricht in START ab; das duerfen wir nicht -- jede Gruppe,
+        // die vor dieser Fassung eingeladen wurde, hat keine Sitzung und landet
+        // genau dort.
+        if let Some(g) = store.group_mut(&group_hex) {
+            if !g.contacts.contains(&contact_id) {
+                g.contacts.push(contact_id);
+            }
+            g.letztes_ereignis = Some(Ereignis {
+                art: Ereignisart::Angenommen,
+                wer: name,
+                wann: timestamp,
+            });
         }
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
             s.letzte_fremde = Some(to_hex(id));
+            s.zustand = Sitzungszustand::Beigetreten;
         }
+        log(&format!(
+            "contact {} accepted the invitation to group {}",
+            contact_id, group_hex
+        ));
         if !sind_wir_erstellerin {
             // Als Eingeladene ist das JOIN der Erstellerin nur die Nachricht,
             // dass sie die Gruppe jetzt mit uns teilt. Nichts zu tun.
             return true;
         }
+        // Und unser eigenes JOIN zurueck, wie Briars onRemoteAccept: erst damit
+        // stellt ein Briar-Eingeladener die Gruppe auf SHARED und laesst seine
+        // Beitraege heraus. Eine alte Gegenstelle laesst es durch parse_invite
+        // fallen, quittiert es und vergisst es -- schaden kann es nicht.
         let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
         let zeitstempel = store
             .sitzung(&group_hex, contact_id)
@@ -2315,57 +2399,175 @@ impl Node {
             s.letzte_eigene = Some(kennung);
             s.eigener_zeitstempel = zeitstempel;
         }
-        if let Some(g) = store.group_mut(&group_hex) {
-            if !g.contacts.contains(&contact_id) {
-                g.contacts.push(contact_id);
-            }
-        }
-        log(&format!(
-            "contact {} accepted the invitation to group {}",
-            contact_id, group_hex
-        ));
         true
     }
 
     /// Die Gegenseite verlaesst die Gruppe. Bisher blieb sie fuer uns Mitglied,
     /// und wir schickten weiter Beitraege an jemanden, der nicht mehr zuhoert
     /// -- genau das, was unser eigenes LEAVE der Gegenseite ersparen soll.
+    ///
+    /// Vom Ersteller heisst dasselbe LEAVE etwas anderes: dann ist die Gruppe
+    /// aufgeloest (Briars markGroupDissolved).
     fn receive_einladung_leave(
         &self,
         store: &mut Store,
         contact_id: u32,
         id: &SecretKey,
+        timestamp: u64,
         gruppe: &SecretKey,
         vorige: Option<SecretKey>,
     ) -> bool {
+        use crate::store::{Ereignis, Ereignisart, Sitzungszustand};
         let group_hex = to_hex(gruppe);
-        let (anker, schon_gesehen) = match store.group(&group_hex) {
-            Some(g) => {
-                let s = g.einladungen.get(&contact_id);
-                (
-                    s.and_then(|s| s.letzte_eigene.clone()),
-                    s.and_then(|s| s.letzte_fremde.clone()) == Some(to_hex(id)),
-                )
-            }
-            None => return false,
-        };
-        if schon_gesehen {
+        let (vom_ersteller, war_mitglied, zustand, letzte_fremde, name) =
+            match self.einladungslage(store, contact_id, &group_hex) {
+                Some(v) => v,
+                None => {
+                    log(&format!(
+                        "ein LEAVE von Kontakt {} betrifft eine unbekannte Gruppe",
+                        contact_id
+                    ));
+                    return false;
+                }
+            };
+        if zustand == Sitzungszustand::Fehler {
+            return false;
+        }
+        if letzte_fremde.as_deref() == Some(&to_hex(id)[..]) {
             return true;
         }
+        let anker = store
+            .sitzung(&group_hex, contact_id)
+            .and_then(|s| s.letzte_eigene.clone());
         let genannt = vorige.map(|v| to_hex(&v));
-        if genannt != anker {
+        self.kette_melden(contact_id, "LEAVE", &genannt, &anker);
+        if vom_ersteller {
+            // Der Ersteller geht: die Gruppe ist aufgeloest. Der Verlauf bleibt
+            // lesbar, aber es geht nichts mehr hinaus, und eine offene
+            // Einladung ist nicht mehr annehmbar.
+            if let Some(g) = store.group_mut(&group_hex) {
+                g.aufgeloest = true;
+                g.contacts.retain(|c| *c != contact_id);
+                g.letztes_ereignis = Some(Ereignis {
+                    art: Ereignisart::Aufgeloest,
+                    wer: name,
+                    wann: timestamp,
+                });
+            }
             log(&format!(
-                "the LEAVE from contact {} names {:?} as previous, expected {:?}",
-                contact_id, genannt, anker
+                "contact {} dissolved the group {}",
+                contact_id, group_hex
+            ));
+        } else {
+            // Nur er geht. Briar macht die Gruppe fuer ihn unsichtbar; bei uns
+            // heisst das: aus der Verteilliste und die Warteschlange leer. Ohne
+            // das schicken wir jeden weiteren Beitrag an jemanden, der gerade
+            // abgesagt hat.
+            if let Some(g) = store.group_mut(&group_hex) {
+                g.contacts.retain(|c| *c != contact_id);
+                g.letztes_ereignis = Some(Ereignis {
+                    art: if war_mitglied {
+                        Ereignisart::Gegangen
+                    } else {
+                        Ereignisart::Abgelehnt
+                    },
+                    wer: name,
+                    wann: timestamp,
+                });
+            }
+            store.verwerfe_gruppenpost(contact_id, &group_hex);
+            log(&format!(
+                "contact {} is out of the group {} ({})",
+                contact_id,
+                group_hex,
+                if war_mitglied { "left" } else { "declined" }
             ));
         }
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
             s.letzte_fremde = Some(to_hex(id));
+            // Nach einer Ablehnung wieder Start: Briar laesst dann neu einladen
+            // (onRemoteDecline -> START). War er Mitglied, bleibt Gegangen --
+            // seine Beitrittsnachricht steht noch in der Gruppe, eine zweite
+            // wuerde seine Kette gabeln.
+            s.zustand = if war_mitglied || vom_ersteller {
+                Sitzungszustand::Gegangen
+            } else {
+                Sitzungszustand::Start
+            };
         }
+        true
+    }
+
+    /// Ein ABORT. Briar antwortet darauf mit einem ABORT und geht nach ERROR;
+    /// der Riegel auf `Fehler` sorgt dafuer, dass das genau einmal geschieht --
+    /// sonst schicken sich zwei Geraete endlos ABORTs zu.
+    fn receive_einladung_abort(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        id: &SecretKey,
+        gruppe: &SecretKey,
+    ) -> bool {
+        use crate::store::{Ereignis, Ereignisart, Sitzungszustand};
+        let group_hex = to_hex(gruppe);
+        let (_vom_ersteller, _war_mitglied, zustand, _letzte_fremde, name) =
+            match self.einladungslage(store, contact_id, &group_hex) {
+                Some(v) => v,
+                None => return false,
+            };
+        if zustand == Sitzungszustand::Fehler {
+            return false;
+        }
+        let unsere = match store.identity() {
+            Some(i) => key_from_hex(&i.author_id),
+            None => return false,
+        };
+        let ihre = match store.contact(contact_id) {
+            Some(c) => c.author_id_bytes(),
+            None => return false,
+        };
         if let Some(g) = store.group_mut(&group_hex) {
             g.contacts.retain(|c| *c != contact_id);
+            g.letztes_ereignis = Some(Ereignis {
+                art: Ereignisart::Abgebrochen,
+                wer: name,
+                wann: now_ms(),
+            });
         }
-        log(&format!("contact {} left the group {}", contact_id, group_hex));
+        // Erst aufraeumen, dann einreihen: sonst wirft das Aufraeumen die
+        // eigene Antwort gleich wieder mit hinaus.
+        store.verwerfe_gruppenpost(contact_id, &group_hex);
+        let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
+        let rumpf = groups::einladung_abort_body(gruppe);
+        let zeitstempel = store
+            .sitzung(&group_hex, contact_id)
+            .map(|s| s.naechster_zeitstempel())
+            .unwrap_or_else(now_ms);
+        let kennung = to_hex(&crate::ids::message_id(
+            &einladungsgruppe,
+            zeitstempel,
+            &rumpf,
+        ));
+        store.queue(
+            contact_id,
+            OutMessage {
+                id: kennung.clone(),
+                group: to_hex(&einladungsgruppe),
+                timestamp: zeitstempel,
+                body: to_hex(&rumpf),
+                acked: false,
+            },
+        );
+        if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+            s.letzte_fremde = Some(to_hex(id));
+            s.letzte_eigene = Some(kennung);
+            s.eigener_zeitstempel = zeitstempel;
+            s.zustand = Sitzungszustand::Fehler;
+        }
+        log(&format!(
+            "contact {} aborted the invitation session for {}; ABORT sent back",
+            contact_id, group_hex
+        ));
         true
     }
 
@@ -2427,7 +2629,16 @@ impl Node {
                     true,
                 );
             }
-            if !group_entry.contacts.contains(&contact_id) {
+            // Wer gegangen ist, kommt nicht durch einen Nachlaeufer zurueck.
+            // Ohne diese Bedingung hebt der naechste Beitrag, der noch
+            // unterwegs war, das gerade gelesene LEAVE wieder auf -- und wir
+            // schicken weiter an jemanden, der abgesagt hat.
+            let abgemeldet = matches!(
+                group_entry.einladungen.get(&contact_id).map(|s| s.zustand),
+                Some(crate::store::Sitzungszustand::Gegangen)
+                    | Some(crate::store::Sitzungszustand::Fehler)
+            ) || group_entry.aufgeloest;
+            if !abgemeldet && !group_entry.contacts.contains(&contact_id) {
                 group_entry.contacts.push(contact_id);
             }
             others = group_entry
@@ -3160,6 +3371,347 @@ mod ipv6_tests {
         let a = ipv6_hex(&"fe80::1".parse().unwrap());
         let b = ipv6_hex(&"2001:db8::1".parse().unwrap());
         assert_eq!(clean_ipv6_list(&format!("{},murks,{}", a, b)), a);
+    }
+}
+
+#[cfg(test)]
+mod einladungsantwort_tests {
+    use super::*;
+    use crate::store::{Ereignisart, GroupPost, PrivateGroup, Sitzungszustand};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    const UNSER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const IHR: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const GRUPPE: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn speicher(name: &str) -> Store {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-einladung-test-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.state.identity = Some(crate::store::Identity {
+            name: "ich".to_string(),
+            signature_seed: UNSER.to_string(),
+            signature_public: UNSER.to_string(),
+            author_id: UNSER.to_string(),
+            handshake_private: UNSER.to_string(),
+            handshake_public: UNSER.to_string(),
+        });
+        store.state.contacts.push(crate::store::Contact {
+            id: 1,
+            name: "Gegenueber".to_string(),
+            author_id: IHR.to_string(),
+            signature_public: IHR.to_string(),
+            handshake_public: Some(IHR.to_string()),
+            master_key: IHR.to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            sent_versioning_update: false,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            last_read: 0,
+        });
+        store
+    }
+
+    /// `ersteller` sagt, wessen Kennung als Erstellerin in der Gruppe steht --
+    /// daran haengt, ob ein LEAVE die Gruppe aufloest.
+    fn gruppe(store: &mut Store, ersteller: &str, zustand: Option<Sitzungszustand>, ihr_beitritt: bool) {
+        let mut einladungen = BTreeMap::new();
+        if let Some(z) = zustand {
+            einladungen.insert(
+                1u32,
+                crate::store::Einladungssitzung {
+                    letzte_eigene: Some("aa".to_string()),
+                    letzte_fremde: None,
+                    eigener_zeitstempel: 100,
+                    einladungs_zeitstempel: 100,
+                    zustand: z,
+                },
+            );
+        }
+        let mut messages = Vec::new();
+        if ihr_beitritt {
+            messages.push(GroupPost {
+                id: "b1".to_string(),
+                author_id: IHR.to_string(),
+                author_name: "Gegenueber".to_string(),
+                timestamp: 200,
+                text: String::new(),
+                body: String::new(),
+                join: true,
+            });
+        }
+        store.state.groups.push(PrivateGroup {
+            id: GRUPPE.to_string(),
+            name: "Testgruppe".to_string(),
+            salt: "44".to_string(),
+            creator_name: "wer".to_string(),
+            creator_public: ersteller.to_string(),
+            creator_author_id: ersteller.to_string(),
+            joined: true,
+            invited_by: None,
+            invite_timestamp: None,
+            invite_signature: None,
+            member_names: BTreeMap::new(),
+            last_read: 0,
+            messages,
+            our_previous: None,
+            einladungen,
+            einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
+            contacts: vec![1],
+        });
+    }
+
+    fn knoten() -> Node {
+        let mut p = std::env::temp_dir();
+        p.push("briar-einladung-test-knoten.json");
+        let _ = std::fs::remove_file(&p);
+        Node::new(Arc::new(Mutex::new(Store::open(&p, 7327).unwrap())))
+    }
+
+    fn kennung(n: u8) -> SecretKey {
+        [n; 32]
+    }
+
+    #[test]
+    fn zusage_macht_beigetreten() {
+        let mut store = speicher("zusage");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Eingeladen), false);
+        let n = knoten();
+        assert!(n.receive_einladung_join(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            Some([0xaa; 32]),
+        ));
+        let g = store.group(GRUPPE).unwrap();
+        assert_eq!(
+            g.einladungen.get(&1).map(|s| s.zustand),
+            Some(Sitzungszustand::Beigetreten)
+        );
+        assert!(g.contacts.contains(&1));
+        assert_eq!(
+            g.letztes_ereignis.as_ref().map(|e| e.art),
+            Some(Ereignisart::Angenommen)
+        );
+        // Als Erstellerin schicken wir unser eigenes JOIN zurueck -- erst damit
+        // stellt ein Briar-Eingeladener die Gruppe auf SHARED.
+        assert_eq!(store.contact(1).unwrap().outbox.len(), 1);
+    }
+
+    /// Der Aufstiegsfall: eine Gruppe, zu der vor dieser Fassung eingeladen
+    /// wurde, hat gar keine Sitzung. Briars Einladender bricht dort ab -- wir
+    /// duerfen das nicht.
+    #[test]
+    fn zusage_ohne_sitzung_wird_angenommen() {
+        let mut store = speicher("ohne-sitzung");
+        gruppe(&mut store, UNSER, None, false);
+        let n = knoten();
+        assert!(n.receive_einladung_join(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            None,
+        ));
+        assert_eq!(
+            store
+                .group(GRUPPE)
+                .unwrap()
+                .einladungen
+                .get(&1)
+                .map(|s| s.zustand),
+            Some(Sitzungszustand::Beigetreten)
+        );
+    }
+
+    #[test]
+    fn zweite_zusage_aendert_nichts() {
+        let mut store = speicher("zweite-zusage");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Beigetreten), true);
+        let n = knoten();
+        assert!(n.receive_einladung_join(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            None,
+        ));
+        let g = store.group(GRUPPE).unwrap();
+        assert_eq!(
+            g.einladungen.get(&1).map(|s| s.zustand),
+            Some(Sitzungszustand::Beigetreten)
+        );
+        assert!(store.contact(1).unwrap().outbox.is_empty(), "kein zweites JOIN");
+    }
+
+    #[test]
+    fn leave_des_erstellers_loest_auf() {
+        let mut store = speicher("aufloesung");
+        // Diesmal ist das Gegenueber die Erstellerin.
+        gruppe(&mut store, IHR, Some(Sitzungszustand::Beigetreten), true);
+        let n = knoten();
+        assert!(n.receive_einladung_leave(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            None,
+        ));
+        let g = store.group(GRUPPE).unwrap();
+        assert!(g.aufgeloest, "die Gruppe muss aufgeloest sein");
+        assert!(!g.contacts.contains(&1));
+        assert_eq!(
+            g.letztes_ereignis.as_ref().map(|e| e.art),
+            Some(Ereignisart::Aufgeloest)
+        );
+    }
+
+    #[test]
+    fn leave_eines_mitglieds_nimmt_nur_ihn_heraus() {
+        let mut store = speicher("austritt");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Beigetreten), true);
+        // Wartepost zur Gruppe und eine zur Einladungsgruppe.
+        store.queue(
+            1,
+            OutMessage {
+                id: "m1".to_string(),
+                group: GRUPPE.to_string(),
+                timestamp: 1,
+                body: String::new(),
+                acked: false,
+            },
+        );
+        store.queue(
+            1,
+            OutMessage {
+                id: "m2".to_string(),
+                group: "ffff".to_string(),
+                timestamp: 1,
+                body: String::new(),
+                acked: false,
+            },
+        );
+        let n = knoten();
+        assert!(n.receive_einladung_leave(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            None,
+        ));
+        let g = store.group(GRUPPE).unwrap();
+        assert!(!g.aufgeloest);
+        assert!(!g.contacts.contains(&1));
+        assert_eq!(
+            g.einladungen.get(&1).map(|s| s.zustand),
+            Some(Sitzungszustand::Gegangen)
+        );
+        assert_eq!(
+            g.letztes_ereignis.as_ref().map(|e| e.art),
+            Some(Ereignisart::Gegangen)
+        );
+        let kasten = &store.contact(1).unwrap().outbox;
+        assert!(kasten.iter().all(|m| m.group != GRUPPE), "Gruppenpost ist weg");
+        assert!(kasten.iter().any(|m| m.group == "ffff"), "die uebrige bleibt");
+    }
+
+    /// Ohne Beitrittsnachricht ist ein LEAVE eine Ablehnung -- danach darf neu
+    /// eingeladen werden (Briars onRemoteDecline -> START).
+    #[test]
+    fn ablehnung_laesst_neu_einladen() {
+        let mut store = speicher("ablehnung");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Eingeladen), false);
+        let n = knoten();
+        assert!(n.receive_einladung_leave(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            None,
+        ));
+        let g = store.group(GRUPPE).unwrap();
+        assert_eq!(
+            g.einladungen.get(&1).map(|s| s.zustand),
+            Some(Sitzungszustand::Start)
+        );
+        assert_eq!(
+            g.letztes_ereignis.as_ref().map(|e| e.art),
+            Some(Ereignisart::Abgelehnt)
+        );
+    }
+
+    #[test]
+    fn abort_wird_genau_einmal_beantwortet() {
+        let mut store = speicher("abort");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Beigetreten), true);
+        let n = knoten();
+        assert!(n.receive_einladung_abort(&mut store, 1, &kennung(9), &key_from_hex(GRUPPE)));
+        let g = store.group(GRUPPE).unwrap();
+        assert_eq!(
+            g.einladungen.get(&1).map(|s| s.zustand),
+            Some(Sitzungszustand::Fehler)
+        );
+        assert_eq!(store.contact(1).unwrap().outbox.len(), 1, "genau ein ABORT zurueck");
+        // Ein zweites ABORT legt nichts mehr hinein -- sonst laufen zwei
+        // Geraete endlos gegeneinander.
+        assert!(!n.receive_einladung_abort(&mut store, 1, &kennung(8), &key_from_hex(GRUPPE)));
+        assert_eq!(store.contact(1).unwrap().outbox.len(), 1);
+    }
+
+    /// Ein Nachlaeufer darf das gerade gelesene LEAVE nicht aufheben.
+    #[test]
+    fn nachlaeufer_holt_den_gegangenen_nicht_zurueck() {
+        let mut store = speicher("nachlaeufer");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Gegangen), true);
+        if let Some(g) = store.group_mut(GRUPPE) {
+            g.contacts.clear();
+        }
+        let n = knoten();
+        // Ein Beitrag, der noch unterwegs war.
+        let autor = crate::groups::Author {
+            name: "Gegenueber".to_string(),
+            public_key: key_from_hex(IHR).to_vec(),
+        };
+        let rumpf = crate::groups::post_body(
+            &key_from_hex(GRUPPE),
+            400,
+            &autor,
+            &key_from_hex(IHR),
+            None,
+            &[1u8; 32],
+            "spaet",
+        );
+        let _ = n.receive_group_message(
+            &mut store,
+            1,
+            &kennung(7),
+            &key_from_hex(GRUPPE),
+            400,
+            &rumpf,
+        );
+        assert!(
+            !store.group(GRUPPE).unwrap().contacts.contains(&1),
+            "wer gegangen ist, bleibt draussen"
+        );
     }
 }
 
