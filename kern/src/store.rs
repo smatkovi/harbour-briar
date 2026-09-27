@@ -307,16 +307,16 @@ pub fn tor_default() -> bool {
 pub struct Store {
     pub path: PathBuf,
     pub state: State,
-    /// Der Speicherschluessel. Zufaellig erzeugt, aendert sich nie wieder --
-    /// das Passwort verpackt nur ihn. Genau so macht es Briar
-    /// (AccountManagerImpl.changePassword: den Schluessel mit dem alten
-    /// Passwort auspacken, mit dem neuen wieder einpacken), und deshalb
-    /// kostet ein Passwortwechsel 32 Byte statt den ganzen Speicher.
-    speicherschluessel: [u8; 32],
-    /// Das Passwort, solange der Dienst laeuft. Es steht nie auf der Platte --
-    /// aus ihm wird beim Speichern jedes Mal frisch mit scrypt der Schluessel
-    /// abgeleitet. Ist es None, liegt der Speicher wie frueher im Klartext.
-    passwort: Option<String>,
+    /// Das Siegel: der ausgepackte Speicherschluessel und seine Verpackung.
+    /// Ist es None, liegt der Speicher wie frueher im Klartext.
+    ///
+    /// Hier lag frueher das Passwort, und `save()` leitete daraus bei jedem
+    /// Aufruf mit scrypt neu ab -- 16 MB und ein bis drei Sekunden, je
+    /// Abgleichsrunde und je Nachricht, und das alles unter dem Schloss des
+    /// Speichers. Briar leitet zweimal ab (Konto oeffnen, Passwort wechseln)
+    /// und haelt danach den Schluessel. Genau das tut das Siegel; das
+    /// Passwort selbst wird gar nicht mehr aufbewahrt.
+    siegel: Option<crate::tresor::Siegel>,
 }
 
 impl Store {
@@ -329,9 +329,11 @@ impl Store {
     /// es an derselben Stelle, indem es den Speicherschluessel mit dem alten
     /// Passwort auspackt.
     pub fn passwort_setzen(&mut self, alt: Option<&str>, neu: &str) -> std::io::Result<()> {
-        if self.passwort.is_some() {
-            let stimmt = alt.map(|a| Some(a) == self.passwort.as_deref())
-                .unwrap_or(false);
+        // Geprueft wird jetzt am Paket und nicht an einer gemerkten
+        // Zeichenkette: das Passwort steht nirgends mehr, und der Vergleich
+        // kostet einen scrypt-Lauf -- hier ist er richtig aufgehoben.
+        if let Some(siegel) = &self.siegel {
+            let stimmt = alt.map(|a| siegel.stimmt(a)).unwrap_or(false);
             if !stimmt {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -339,17 +341,23 @@ impl Store {
                 ));
             }
         }
-        self.passwort = if neu.is_empty() {
+        let fehler = |e: String| std::io::Error::new(std::io::ErrorKind::Other, e);
+        self.siegel = if neu.is_empty() {
             None
         } else {
-            Some(neu.to_string())
+            // Beim Wechsel wandert der Speicherschluessel mit, sonst waere
+            // jede alte Sicherung unlesbar; ohne Siegel wird einer geboren.
+            Some(match &self.siegel {
+                Some(altes) => altes.neu_verpacken(neu).map_err(fehler)?,
+                None => crate::tresor::Siegel::frisch(neu).map_err(fehler)?,
+            })
         };
         self.save()
     }
 
     /// Liegt der Speicher gerade verschluesselt vor?
     pub fn verschluesselt(&self) -> bool {
-        self.passwort.is_some()
+        self.siegel.is_some()
     }
 }
 
@@ -394,10 +402,9 @@ impl Store {
         default_port: u16,
         passwort: Option<String>,
     ) -> std::io::Result<Store> {
-        // Der Speicherschluessel aus der Datei, falls sie verschluesselt war.
-        // Er aendert sich nie wieder -- ein Passwortwechsel packt nur ihn neu
-        // ein, wie bei Briar.
-        let mut gefundener_schluessel: Option<[u8; 32]> = None;
+        // Das Siegel aus der Datei, falls sie verschluesselt war: hier laeuft
+        // der eine scrypt-Lauf, den es braucht.
+        let mut gefundenes_siegel: Option<crate::tresor::Siegel> = None;
         let state = if path.exists() {
             let rohdaten = std::fs::read(path)?;
             let text = if crate::tresor::ist_verschluesselt(&rohdaten) {
@@ -407,10 +414,10 @@ impl Store {
                         "der Speicher ist verschluesselt, es fehlt das Passwort",
                     )
                 })?;
-                let (klartext, schluessel) = crate::tresor::entschluesseln(&rohdaten, pw)
+                let (klartext, siegel) = crate::tresor::Siegel::oeffnen(&rohdaten, pw)
                     .map_err(|e| std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied, e))?;
-                gefundener_schluessel = Some(schluessel);
+                gefundenes_siegel = Some(siegel);
                 String::from_utf8(klartext).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -449,9 +456,18 @@ impl Store {
         let mut store = Store {
             path: path.to_path_buf(),
             state,
-            passwort,
-            speicherschluessel: gefundener_schluessel
-                .unwrap_or_else(crate::tresor::neuer_speicherschluessel),
+            // Ein Passwort ohne verschluesselte Datei heisst: der Speicher
+            // wird beim naechsten Schreiben umgestellt -- dafuer ein frisches
+            // Siegel, das ist der eine erlaubte zweite scrypt-Lauf.
+            siegel: match (gefundenes_siegel, passwort.as_deref()) {
+                (Some(siegel), _) => Some(siegel),
+                (None, Some(pw)) if !pw.is_empty() => Some(
+                    crate::tresor::Siegel::frisch(pw).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, e)
+                    })?,
+                ),
+                _ => None,
+            },
         };
         // Einmal wuerfeln und behalten -- eine neue UUID waere fuer die
         // Kontakte ein neues Geraet.
@@ -495,10 +511,8 @@ impl Store {
         // Mit Passwort verschluesselt, ohne wie bisher als Klartext. Die
         // Umstellung passiert damit beim ersten Speichern nach dem Setzen
         // eines Passworts, ohne eigenen Wanderungsschritt.
-        let inhalt: Vec<u8> = match &self.passwort {
-            Some(pw) => crate::tresor::verschluesseln(
-                text.as_bytes(), pw, &self.speicherschluessel)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        let inhalt: Vec<u8> = match &self.siegel {
+            Some(siegel) => siegel.verschluesseln(text.as_bytes()),
             None => text.into_bytes(),
         };
         let tmp = self.path.with_extension("tmp");
