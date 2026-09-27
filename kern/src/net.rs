@@ -743,7 +743,13 @@ impl Node {
                         let blob = crate::rendezvous::private_key_blob(&eigene);
                         match tor.publish(tor_port, Some(&blob)) {
                             Ok(dienst) => {
-                                log("rendezvous: own meeting point published");
+                                // Mit Adresse: ohne sie laesst sich nicht
+                                // nachsehen, ob beide Seiten dieselben beiden
+                                // Treffpunkte meinen.
+                                log(&format!(
+                                    "rendezvous: own meeting point published ({}.onion)",
+                                    dienst.onion
+                                ));
                                 // Die Kennung kommt von Tor, nicht aus unserer
                                 // eigenen Rechnung: nur sie darf spaeter in
                                 // DEL_ONION stehen.
@@ -769,8 +775,8 @@ impl Node {
                     };
                     if let Some(index) = index {
                         match self.connect_pending_at(index, TOR_TRANSPORT_ID, &ziel) {
-                            Ok(()) => log("rendezvous: met"),
-                            Err(e) => log(&format!("rendezvous: not yet ({})", e)),
+                            Ok(()) => log(&format!("rendezvous: met at {}", ziel)),
+                            Err(e) => log(&format!("rendezvous: not yet at {} ({})", ziel, e)),
                         }
                     }
                 }
