@@ -76,11 +76,22 @@ fn main() {
         i += 1;
     }
 
-    let mut store = match Store::open(&state_path, DEFAULT_PORT) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot open {}: {}", state_path.display(), e);
-            std::process::exit(1);
+    // Ist der Speicher verschluesselt, kann hier noch nichts geschehen: es
+    // gibt weder Kontakte noch Schluessel. Statt abzubrechen lauscht der
+    // Dienst auf dem gewohnten Port und beantwortet nur "gesperrt" und
+    // "hier ist das Passwort", bis er eines bekommt. Danach faehrt der Rest
+    // hoch wie immer.
+    let mut store = if Store::ist_verschluesselt(&state_path) {
+        briarkern::entsperren::warten(&state_path, api_port, DEFAULT_PORT)
+    } else {
+        match Store::open(&state_path, DEFAULT_PORT) {
+            Ok(s) => s,
+            Err(e) => {
+                // Nicht mehr still auf einen leeren Zustand zurueckfallen:
+                // lieber gar nicht starten als die Datei ueberschreiben.
+                eprintln!("cannot open {}: {}", state_path.display(), e);
+                std::process::exit(1);
+            }
         }
     };
     if let Some(port) = lan_port {

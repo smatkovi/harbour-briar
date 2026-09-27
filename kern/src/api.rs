@@ -474,6 +474,18 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             status(&store)
         }
 
+        // Passwort setzen, aendern oder entfernen. Ein leeres Passwort hebt
+        // die Verschluesselung auf -- das soll gehen, sonst waere ein
+        // vergessenes Passwort bei noch laufendem Dienst eine Sackgasse.
+        ("POST", "/password") => {
+            let passwort = body["password"].as_str().unwrap_or("");
+            let mut locked = store.lock().unwrap();
+            match locked.passwort_setzen(passwort) {
+                Ok(()) => json!({"ok": true, "encrypted": locked.verschluesselt()}),
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
+
         ("POST", "/language") => {
             let language = body["language"].as_str().unwrap_or("en");
             let mut locked = store.lock().unwrap();
@@ -939,6 +951,8 @@ fn status(store: &Shared) -> Value {
         // briar://-Link und damit den QR-Code -- stuende hier nur eine
         // Adresse, waere jede Kopplung wieder an ein einziges Netz genagelt.
         "lanAddress": lan_addresses,
+        "locked": false,
+        "encrypted": locked.verschluesselt(),
         "tor": locked.state.tor,
         "onion": locked.state.tor_onion,
         "revision": locked.state.revision,
