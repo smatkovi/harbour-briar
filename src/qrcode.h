@@ -13,6 +13,7 @@
 
 #include <QCryptographicHash>
 #include <QDir>
+#include <QFile>
 #include <QImage>
 #include <QObject>
 #include <QPainter>
@@ -65,6 +66,10 @@ public:
                              + QLatin1String(".png");
         if (!image.save(path, "PNG"))
             return QString();
+        // Nur der Eigentuemer. Die Dateien standen auf 0666, also auch
+        // schreibbar fuer jeden -- ein ausgetauschtes Bild waere ein
+        // ausgetauschter Kontakt.
+        QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner);
         return path;
     }
 
@@ -125,6 +130,8 @@ private:
         const QString dir = QDir::homePath()
                 + QLatin1String("/.local/share/harbour-briar/qr");
         QDir().mkpath(dir);
+        QFile::setPermissions(dir, QFile::ReadOwner | QFile::WriteOwner
+                                   | QFile::ExeOwner);
         return dir;
     }
 

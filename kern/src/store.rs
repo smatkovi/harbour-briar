@@ -262,6 +262,28 @@ pub fn tor_default() -> bool {
 pub struct Store {
     pub path: PathBuf,
     pub state: State,
+    /// Das Passwort, solange der Dienst laeuft. Es steht nie auf der Platte --
+    /// aus ihm wird beim Speichern jedes Mal frisch mit scrypt der Schluessel
+    /// abgeleitet. Ist es None, liegt der Speicher wie frueher im Klartext.
+    passwort: Option<String>,
+}
+
+impl Store {
+    /// Ein Passwort setzen oder aendern. Der naechste Speichervorgang stellt
+    /// die Datei um; ein leeres Passwort hebt die Verschluesselung auf.
+    pub fn passwort_setzen(&mut self, passwort: &str) -> std::io::Result<()> {
+        self.passwort = if passwort.is_empty() {
+            None
+        } else {
+            Some(passwort.to_string())
+        };
+        self.save()
+    }
+
+    /// Liegt der Speicher gerade verschluesselt vor?
+    pub fn verschluesselt(&self) -> bool {
+        self.passwort.is_some()
+    }
 }
 
 pub fn key_from_hex(s: &str) -> SecretKey {
@@ -275,10 +297,73 @@ pub fn key_from_hex(s: &str) -> SecretKey {
 }
 
 impl Store {
+    /// Oeffnet den Speicher. Ist er verschluesselt, braucht es das Passwort --
+    /// dann `open_mit_passwort`.
     pub fn open(path: &Path, default_port: u16) -> std::io::Result<Store> {
+        Self::open_intern(path, default_port, None)
+    }
+
+    /// Wie `open`, mit Passwort fuer einen verschluesselten Speicher. Ist die
+    /// Datei noch Klartext, wird sie beim naechsten Speichern umgestellt.
+    pub fn open_mit_passwort(
+        path: &Path,
+        default_port: u16,
+        passwort: &str,
+    ) -> std::io::Result<Store> {
+        Self::open_intern(path, default_port, Some(passwort.to_string()))
+    }
+
+    /// Ist die Datei an diesem Ort verschluesselt? Der Dienst fragt das beim
+    /// Start, um zu wissen, ob er auf ein Passwort warten muss.
+    pub fn ist_verschluesselt(path: &Path) -> bool {
+        match std::fs::read(path) {
+            Ok(rohdaten) => crate::tresor::ist_verschluesselt(&rohdaten),
+            Err(_) => false,
+        }
+    }
+
+    fn open_intern(
+        path: &Path,
+        default_port: u16,
+        passwort: Option<String>,
+    ) -> std::io::Result<Store> {
         let state = if path.exists() {
-            let text = std::fs::read_to_string(path)?;
-            serde_json::from_str(&text).unwrap_or_default()
+            let rohdaten = std::fs::read(path)?;
+            let text = if crate::tresor::ist_verschluesselt(&rohdaten) {
+                let pw = passwort.as_deref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "der Speicher ist verschluesselt, es fehlt das Passwort",
+                    )
+                })?;
+                let klartext = crate::tresor::entschluesseln(&rohdaten, pw)
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied, e))?;
+                String::from_utf8(klartext).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "entschluesselter Speicher ist kein Text",
+                    )
+                })?
+            } else {
+                String::from_utf8(rohdaten).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Speicher ist weder Text noch verschluesselt",
+                    )
+                })?
+            };
+            // Nicht mehr unwrap_or_default(): eine beschaedigte Datei fiel
+            // damit still auf einen leeren Zustand zurueck, und der naechste
+            // save() schrieb ihn darueber. Ein Lesefehler kostete alles --
+            // Kontakte, Schluessel, Nachrichten. Jetzt bricht das Oeffnen ab
+            // und die Datei bleibt, wie sie ist.
+            serde_json::from_str(&text).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Speicher nicht lesbar ({}) -- Datei bleibt unangetastet", e),
+                )
+            })?
         } else {
             State {
                 listen_port: default_port,
@@ -292,6 +377,7 @@ impl Store {
         let mut store = Store {
             path: path.to_path_buf(),
             state,
+            passwort,
         };
         if store.state.listen_port == 0 {
             store.state.listen_port = default_port;
@@ -324,10 +410,26 @@ impl Store {
         self.state.revision += 1;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
+            set_mode(dir, 0o700);
         }
         let text = serde_json::to_string_pretty(&self.state)?;
+        // Mit Passwort verschluesselt, ohne wie bisher als Klartext. Die
+        // Umstellung passiert damit beim ersten Speichern nach dem Setzen
+        // eines Passworts, ohne eigenen Wanderungsschritt.
+        let inhalt: Vec<u8> = match &self.passwort {
+            Some(pw) => crate::tresor::verschluesseln(text.as_bytes(), pw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+            None => text.into_bytes(),
+        };
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, text)?;
+        std::fs::write(&tmp, inhalt)?;
+        // Nur der Eigentuemer. In dieser Datei stehen der private
+        // Handschlagschluessel, der Signatursamen, je Kontakt der
+        // gemeinsame Hauptschluessel, der Onion-Schluessel und alle
+        // Nachrichten -- sie stand bisher auf 0644, also fuer jeden lesbar.
+        // Gesetzt wird es an der temporaeren Datei, bevor sie an ihren Platz
+        // rueckt: sonst gibt es einen Augenblick, in dem sie offen liegt.
+        set_mode(&tmp, 0o600);
         std::fs::rename(&tmp, &self.path)
     }
 
@@ -446,5 +548,92 @@ impl Store {
             }
             contact.outbox.push(out);
         }
+    }
+}
+
+/// Rechte setzen, ohne dass ein Fehlschlag das Speichern verhindert -- auf
+/// einem Dateisystem ohne Unix-Rechte ist es eben nicht zu haben.
+fn set_mode(pfad: &std::path::Path, modus: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(pfad, std::fs::Permissions::from_mode(modus));
+}
+
+#[cfg(test)]
+mod tresor_tests {
+    use super::*;
+
+    fn pfad(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-tresor-test-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn klartext_wird_beim_passwortsetzen_umgestellt() {
+        let p = pfad("umstellen");
+        {
+            let mut s = Store::open(&p, 7327).unwrap();
+            s.state.listen_port = 4242;
+            s.save().unwrap();
+        }
+        // Vorher lesbar.
+        let roh = std::fs::read(&p).unwrap();
+        assert!(!crate::tresor::ist_verschluesselt(&roh));
+        assert!(String::from_utf8_lossy(&roh).contains("4242"));
+
+        {
+            let mut s = Store::open(&p, 7327).unwrap();
+            s.passwort_setzen("geheim").unwrap();
+        }
+        // Nachher nicht mehr -- und die Portnummer steht nirgends im Klartext.
+        let roh = std::fs::read(&p).unwrap();
+        assert!(crate::tresor::ist_verschluesselt(&roh));
+        assert!(!String::from_utf8_lossy(&roh).contains("4242"));
+
+        // Ohne Passwort kein Zutritt, mit Passwort alles wieder da.
+        assert!(Store::open(&p, 7327).is_err());
+        let s = Store::open_mit_passwort(&p, 7327, "geheim").unwrap();
+        assert_eq!(s.state.listen_port, 4242);
+        assert!(s.verschluesselt());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn falsches_passwort_oeffnet_nicht() {
+        let p = pfad("falsch");
+        {
+            let mut s = Store::open(&p, 7327).unwrap();
+            s.passwort_setzen("richtig").unwrap();
+        }
+        assert!(Store::open_mit_passwort(&p, 7327, "falsch").is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn beschaedigte_datei_wird_nicht_stillschweigend_geleert() {
+        // Das war der gefaehrlichste Fehler: unwrap_or_default() lieferte bei
+        // einem Lesefehler einen leeren Zustand, und der naechste save()
+        // schrieb ihn ueber Kontakte, Schluessel und Nachrichten.
+        let p = pfad("beschaedigt");
+        std::fs::write(&p, b"{ das ist kein JSON").unwrap();
+        let ergebnis = Store::open(&p, 7327);
+        assert!(ergebnis.is_err(), "beschaedigte Datei muss auffallen");
+        // Und die Datei liegt unangetastet da.
+        assert_eq!(std::fs::read(&p).unwrap(), b"{ das ist kein JSON");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rechte_sind_eng() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = pfad("rechte");
+        {
+            let mut s = Store::open(&p, 7327).unwrap();
+            s.save().unwrap();
+        }
+        let modus = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modus, 0o600, "Speicher stand auf {:o}", modus);
+        let _ = std::fs::remove_file(&p);
     }
 }

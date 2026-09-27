@@ -20,6 +20,7 @@ pub mod netwatch;
 #[cfg(feature = "sfos")]
 pub mod notify;
 pub mod record;
+pub mod tresor;
 pub mod store;
 pub mod stream;
 pub mod sync;
