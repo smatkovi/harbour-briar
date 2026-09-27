@@ -257,6 +257,23 @@ pub struct PrivateGroup {
     pub contacts: Vec<u32>,
 }
 
+impl PrivateGroup {
+    /// Der Zeitstempel unserer letzten eigenen Nachricht -- der, auf den
+    /// `our_previous` zeigt. Der naechste Beitrag muss echt darueber liegen,
+    /// sonst wirft Briar ihn beim Zustellen weg.
+    ///
+    /// Fehlt der Eintrag, nehmen wir den spaetesten Zeitstempel der Gruppe:
+    /// zu weit vorgeruecken schadet nichts, zu wenig kostet die Nachricht.
+    pub fn vorgaenger_zeit(&self) -> u64 {
+        if let Some(id) = &self.our_previous {
+            if let Some(m) = self.messages.iter().find(|m| &m.id == id) {
+                return m.timestamp;
+            }
+        }
+        self.messages.iter().map(|m| m.timestamp).max().unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct State {
     pub identity: Option<Identity>,
@@ -672,6 +689,64 @@ impl Store {
 fn set_mode(pfad: &std::path::Path, modus: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(pfad, std::fs::Permissions::from_mode(modus));
+}
+
+#[cfg(test)]
+mod gruppen_tests {
+    use super::*;
+
+    fn beitrag(id: &str, zeit: u64) -> GroupPost {
+        GroupPost {
+            id: id.to_string(),
+            author_id: "aa".to_string(),
+            author_name: "ich".to_string(),
+            timestamp: zeit,
+            text: "hallo".to_string(),
+            body: String::new(),
+            join: false,
+        }
+    }
+
+    fn gruppe(vorher: Option<&str>, posts: Vec<GroupPost>) -> PrivateGroup {
+        PrivateGroup {
+            id: "11".to_string(),
+            name: "Testgruppe".to_string(),
+            salt: "22".to_string(),
+            creator_name: "wer".to_string(),
+            creator_public: "33".to_string(),
+            creator_author_id: "44".to_string(),
+            joined: true,
+            invited_by: None,
+            invite_timestamp: None,
+            invite_signature: None,
+            member_names: BTreeMap::new(),
+            last_read: 0,
+            messages: posts,
+            our_previous: vorher.map(|v| v.to_string()),
+            einladung_previous: None,
+            contacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn vorgaenger_zeit_nimmt_die_eigene_letzte() {
+        let g = gruppe(Some("b"), vec![beitrag("a", 500), beitrag("b", 900)]);
+        assert_eq!(g.vorgaenger_zeit(), 900);
+    }
+
+    #[test]
+    fn fehlt_der_eintrag_gilt_der_spaeteste() {
+        // Kann nicht vorkommen, solange beides zusammen gesetzt wird -- aber
+        // zu weit vorruecken schadet nichts, zu wenig kostet die Nachricht.
+        let g = gruppe(Some("weg"), vec![beitrag("a", 500), beitrag("b", 900)]);
+        assert_eq!(g.vorgaenger_zeit(), 900);
+    }
+
+    #[test]
+    fn ohne_nachrichten_null() {
+        let g = gruppe(None, Vec::new());
+        assert_eq!(g.vorgaenger_zeit(), 0);
+    }
 }
 
 #[cfg(test)]

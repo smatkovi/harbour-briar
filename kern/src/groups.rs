@@ -146,6 +146,25 @@ pub fn post_body(
     ]))
 }
 
+/// Rueckt einen Zeitstempel vor, wenn die Uhr nicht weit genug ist: Briars
+/// max(jetzt, vorher + 1) aus AbstractProtocolEngine. Zwei Regeln brauchen das,
+/// und beide kosten uns sonst die Nachricht:
+///
+///   * Ein JOIN muss echt hinter der Einladung liegen, auf die es sich beruft.
+///     GroupMessageValidator.validateJoin (Zeile 104-107) erklaert es sonst
+///     fuer ungueltig, und in der Einladungsgruppe bricht die Sitzung des
+///     Einladenden ab statt die Gruppe zu teilen
+///     (CreatorProtocolEngine.onRemoteAccept, Zeile 190-191).
+///   * Ein Beitrag muss echt hinter unserer vorigen eigenen Nachricht in
+///     derselben Gruppe liegen. PrivateGroupManagerImpl.handleGroupMessage
+///     (Zeile 588) wirft ihn sonst beim Zustellen weg -- endgueltig und ohne
+///     ein Wort an den Absender.
+///
+/// `jetzt` kommt von aussen, damit die Regel ohne Uhr zu pruefen ist.
+pub fn vorgerueckt(jetzt: u64, vorher: u64) -> u64 {
+    jetzt.max(vorher.saturating_add(1))
+}
+
 #[derive(Clone, Debug)]
 pub enum GroupMessage {
     Join {
@@ -432,5 +451,34 @@ mod einladung_tests {
         let teile = liste.as_list().unwrap();
         assert_eq!(teile.len(), 2, "ABORT traegt keine vorige Nachricht");
         assert_eq!(teile[0].as_int(), Some(3));
+    }
+
+    #[test]
+    fn zeitstempel_rueckt_vor() {
+        // Geht die Uhr weit genug, gilt die Uhr.
+        assert_eq!(vorgerueckt(1_000, 500), 1_000);
+        // Gleichstand oder Uhr zurueck: eine Millisekunde hinter dem
+        // Vorgaenger, wie Briars max(jetzt, vorher + 1).
+        assert_eq!(vorgerueckt(1_000, 1_000), 1_001);
+        assert_eq!(vorgerueckt(900, 1_000), 1_001);
+        // Ohne Vorgaenger -- eigene Gruppe, erste Nachricht -- bleibt die Uhr.
+        assert_eq!(vorgerueckt(1_000, 0), 1_000);
+        // Und eine Einladung aus der Zukunft zieht das JOIN mit: genau der
+        // Fall, in dem die Uhr des N9 der Jolla nachgeht.
+        let einladung = 1_700_000_060_000u64;
+        assert!(vorgerueckt(1_700_000_000_000, einladung) > einladung);
+    }
+
+    /// Die beiden Regeln verkettet -- der Fall, der heute selbst mit richtig
+    /// gestellter Uhr bricht: das vorgerueckte JOIN liegt vor der Uhr, und ein
+    /// Beitrag mit blankem now_ms() waere kleiner als das JOIN.
+    #[test]
+    fn beitrag_bleibt_hinter_dem_vorgeruecktem_join() {
+        let jetzt = 1_700_000_000_000u64;
+        let einladung = jetzt + 60_000;
+        let join = vorgerueckt(jetzt, einladung);
+        let beitrag = vorgerueckt(jetzt, join);
+        assert!(join > einladung, "JOIN muss hinter der Einladung liegen");
+        assert!(beitrag > join, "Beitrag muss hinter dem JOIN liegen");
     }
 }

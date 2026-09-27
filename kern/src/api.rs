@@ -730,7 +730,15 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             if already {
                 return json!({"error": "already joined"});
             }
-            let timestamp = now_ms();
+            // Das JOIN muss echt hinter der Einladung liegen. Sonst erklaert
+            // Briars GroupMessageValidator es fuer ungueltig, und die Sitzung
+            // des Einladenden bricht bei unserer Antwort in der
+            // Einladungsgruppe ab, statt die Gruppe zu teilen -- wir waeren
+            // formal beigetreten und bekaemen doch nie einen Beitrag. Die Uhr
+            // des N9 geht gern nach, dann liegt eine Einladung von der Jolla
+            // in unserer Zukunft.
+            let einladung_zeit = invite.as_ref().map(|(t, _)| *t).unwrap_or(0);
+            let timestamp = groups::vorgerueckt(now_ms(), einladung_zeit);
             let join = groups::join_body(&group_id, timestamp, &author, &seed, invite);
             let join_id = to_hex(&crate::ids::message_id(&group_id, timestamp, &join));
             let author_id = to_hex(&author.id());
@@ -826,10 +834,11 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 Some(v) => v,
                 None => return json!({"error": "create an identity first"}),
             };
-            let (group_id, previous, contacts, joined) = match locked.group(&group_hex) {
+            let (group_id, previous, vorher, contacts, joined) = match locked.group(&group_hex) {
                 Some(g) => (
                     key_from_hex(&g.id),
                     g.our_previous.clone(),
+                    g.vorgaenger_zeit(),
                     g.contacts.clone(),
                     g.joined,
                 ),
@@ -842,7 +851,13 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 Some(p) => key_from_hex(&p),
                 None => return json!({"error": "no join message yet"}),
             };
-            let timestamp = now_ms();
+            // Zwei Beitraege in derselben Millisekunde, oder eine
+            // zurueckgestellte Uhr, und Briar wirft den zweiten beim Zustellen
+            // weg: er muss echt hinter unserer vorigen eigenen Nachricht
+            // liegen (PrivateGroupManagerImpl.handleGroupMessage, Zeile 588).
+            // Nach einem vorgeruecktem JOIN ist das sogar der Normalfall --
+            // dessen Zeitstempel kann vor der Uhr liegen.
+            let timestamp = groups::vorgerueckt(now_ms(), vorher);
             let post = groups::post_body(
                 &group_id,
                 timestamp,
@@ -926,7 +941,18 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 None => (key_from_hex(&group_hex), Vec::new(), None),
             };
             if let Some(unsere) = eigene {
-                let timestamp = crate::util::now_ms();
+                // Auch das LEAVE muss hinter der Einladung liegen, sonst
+                // bricht die Sitzung der Gegenseite ab statt unser Gehen zu
+                // verbuchen (CreatorProtocolEngine.onRemoteDecline,
+                // Zeile 219-220) -- und wir gelten dort weiter als Mitglied,
+                // genau das, was der Kommentar oben verhindern will.
+                // Eine selbst angelegte Gruppe hat keine Einladung, dann
+                // bleibt es bei der Uhr.
+                let einladung_zeit = locked
+                    .group(&group_hex)
+                    .and_then(|g| g.invite_timestamp)
+                    .unwrap_or(0);
+                let timestamp = groups::vorgerueckt(crate::util::now_ms(), einladung_zeit);
                 for kontakt in &kontakte {
                     let ihre = match locked.contact(*kontakt) {
                         Some(c) => c.author_id_bytes(),
