@@ -34,6 +34,19 @@ pub const PROPERTIES_CLIENT_ID: &str = "org.briarproject.bramble.properties";
 pub const PROPERTIES_MAJOR_VERSION: u32 = 0;
 /// TransportPropertyManager.java:28 -- "int MINOR_VERSION = 0;"
 pub const PROPERTIES_MINOR_VERSION: u32 = 0;
+/// PrivateGroupManager.java:33 -- "int MINOR_VERSION = 0;". Es gibt dort keine
+/// zweite Fassung, also ist die Ansage eindeutig.
+pub const GROUP_MINOR_VERSION: u32 = 0;
+/// Absichtlich 0 und nicht 1, aus demselben Grund wie messaging 2 statt 3.
+///
+/// GroupInvitationManager.java:37 sagt 1 an, und 1 heisst: ich beachte den
+/// Loeschzeitgeber. Briar fragt vor jedem Senden die angesagte Nebenversion
+/// ab (AbstractProtocolEngine.contactSupportsAutoDeletion ->
+/// getClientMinorVersion) und haengt nur dann ein siebtes Glied an die
+/// Einladung bzw. ein viertes an JOIN und LEAVE. Unser Leser sieht dieses
+/// Glied nicht an -- eine Zusage, die wir brechen wuerden. Mit 0 schickt Briar
+/// genau die Form, die wir schreiben und lesen.
+pub const INVITE_MINOR_VERSION: u32 = 0;
 
 const PRIVATE_MESSAGE: i64 = 0;
 const ATTACHMENT: i64 = 1;
@@ -333,12 +346,19 @@ pub fn versioning_update_body(update_version: i64) -> Vec<u8> {
     // INVISIBLE)"). Bis 0.24.0 stand hier nur messaging; damit war das ganze
     // Adressgedaechtnis gegen echtes Briar wirkungslos, in beide Richtungen.
     //
-    // Die Gruppenklienten fehlen weiter mit Absicht: JOIN und LEAVE gehen
-    // inzwischen hinaus (api.rs), ABORT ist geschrieben (groups.rs), hat aber
-    // keinen Aufrufer. Etwas anzusagen, das man nicht zu Ende kann, ist
-    // schlimmer als es wegzulassen. Solange das so bleibt, kann eine Gruppe
-    // mit einem echten Briar nicht gehen -- so steht es auch in der README
-    // unter "What this port does differently".
+    // Seit 0.27.0 stehen auch die beiden Gruppenklienten hier. Vorher fehlten
+    // sie mit Absicht, weil die Einladungssitzung nur halb gebaut war: die
+    // Kette lief je Gruppe statt je Kontakt, eine Zusage wurde gelesen und
+    // weggeworfen, ein LEAVE gar nicht gelesen, und ABORT hatte keinen
+    // Aufrufer. Etwas anzusagen, das man nicht zu Ende kann, ist schlimmer als
+    // es wegzulassen.
+    //
+    // Das ist jetzt gebaut (Kette je (Kontakt, Gruppe), Zustand je Sitzung,
+    // JOIN/LEAVE/ABORT gelesen und beantwortet, Zeitstempel ruecken vor), und
+    // darum darf es angesagt werden. Was weiterhin fehlt, steht in der README:
+    // die PEER-Rolle zwischen zwei Mitgliedern, die keine Kontakte sind
+    // (Briars revealRelationship), und das Ablehnen einer Einladung als
+    // eigener Griff in der Oberflaeche.
     let eintrag = |id: &str, haupt: u32, neben: u32| {
         Bdf::List(vec![
             Bdf::Str(id.to_string()),
@@ -357,6 +377,16 @@ pub fn versioning_update_body(update_version: i64) -> Vec<u8> {
             PROPERTIES_CLIENT_ID,
             PROPERTIES_MAJOR_VERSION,
             PROPERTIES_MINOR_VERSION,
+        ),
+        eintrag(
+            crate::groups::CLIENT_ID,
+            crate::groups::MAJOR_VERSION,
+            GROUP_MINOR_VERSION,
+        ),
+        eintrag(
+            crate::groups::INVITE_CLIENT_ID,
+            crate::groups::INVITE_MAJOR_VERSION,
+            INVITE_MINOR_VERSION,
         ),
     ]);
     crate::bdf::to_bytes(&Bdf::List(vec![states, Bdf::Int(update_version)]))
@@ -434,6 +464,59 @@ pub fn versioning_group_id(author_a: &SecretKey, author_b: &SecretKey) -> Secret
 #[cfg(test)]
 mod laengen_tests {
     use super::*;
+
+    /// Die Ansage entscheidet, was die Gegenseite von uns ueberhaupt sieht:
+    /// was nicht darin steht, bleibt unsichtbar, und in einer unsichtbaren
+    /// Gruppe wird jede Nachricht verworfen UND nicht quittiert. Darum steht
+    /// hier Klient fuer Klient, was angesagt wird -- samt der Form, die Briars
+    /// ClientVersioningValidator verlangt (Liste, Nummer; je Klient vier
+    /// Glieder, beide Fassungsnummern nicht negativ).
+    #[test]
+    fn die_ansage_nennt_alle_vier_klienten() {
+        let rumpf = versioning_update_body(7);
+        let liste = crate::bdf::from_bytes(&rumpf).unwrap();
+        let teile = liste.as_list().unwrap();
+        assert_eq!(teile.len(), 2, "Klientenliste und Nummer");
+        assert_eq!(teile[1].as_int(), Some(7));
+        let klienten = teile[0].as_list().unwrap();
+        let gefunden: Vec<(String, i64, i64, bool)> = klienten
+            .iter()
+            .map(|k| {
+                let g = k.as_list().expect("Klientenzustand ist eine Liste");
+                assert_eq!(g.len(), 4, "Kennung, Haupt-, Nebenfassung, aktiv");
+                (
+                    g[0].as_str().unwrap().to_string(),
+                    g[1].as_int().unwrap(),
+                    g[2].as_int().unwrap(),
+                    matches!(g[3], crate::bdf::Bdf::Bool(true)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            gefunden,
+            vec![
+                ("org.briarproject.briar.messaging".to_string(), 0, 2, true),
+                ("org.briarproject.bramble.properties".to_string(), 0, 0, true),
+                ("org.briarproject.briar.privategroup".to_string(), 0, 0, true),
+                (
+                    "org.briarproject.briar.privategroup.invitation".to_string(),
+                    0,
+                    0,
+                    true
+                ),
+            ]
+        );
+    }
+
+    /// Zwei Nebenfassungen sind absichtlich kleiner als Briars eigene: beide
+    /// hoeheren Nummern versprechen verschwindende Nachrichten, und dieser Port
+    /// sieht das Glied mit der Zuenddauer nicht an. Briar fragt vor dem Senden
+    /// nach (getClientMinorVersion) und schickt dann die alte Form.
+    #[test]
+    fn keine_zusage_die_wir_brechen() {
+        assert_eq!(MESSAGING_MINOR_VERSION, 2, "Briar sagt 3 an");
+        assert_eq!(INVITE_MINOR_VERSION, 0, "Briar sagt 1 an");
+    }
 
     #[test]
     fn briars_grenzen_stimmen() {

@@ -6,10 +6,12 @@
 //! member's previous one, so nobody can quietly drop a message from the
 //! middle of someone's history.
 //!
-//! The wire formats here are Briar's. What this port does differently is how
-//! an invitation reaches the other side: Briar runs a whole invitation
-//! protocol with its own session state, this sends the single INVITE message
-//! Briar's encoder produces and lets the user accept or decline it.
+//! The wire formats here are Briar's, and so is the invitation session: one
+//! per (contact, group), each message naming the previous one, with JOIN, LEAVE
+//! and ABORT read and answered (`net.rs`). What is still missing from Briar's
+//! protocol is the PEER role between two members who are not contacts of each
+//! other, and declining an invitation as its own step -- here one leaves the
+//! group instead.
 
 use crate::bdf::Bdf;
 use crate::crypto::{self, SecretKey};

@@ -89,14 +89,17 @@ Every row below is verified against reference bytes from `bramble-core` 1.5.20
 
 What this port does **differently**, and why:
 
-- **The private-group clients are not announced.** The versioning update lists
-  the messaging and the properties client and nothing else
-  (`kern/src/sync.rs`). JOIN and LEAVE go out by now, ABORT is written but
-  never sent, and announcing a client we cannot carry through is worse than
-  leaving it out. A real Briar keeps a group it has not been told about
-  invisible — it drops such messages and does not even acknowledge them — so a
-  group shared with Briar on Android cannot work. Groups between devices
-  running this port are unaffected.
+- **The invitation protocol has two rooms missing.** Since 0.27.0 all four
+  clients are announced — messaging, properties, the private group and its
+  invitation client (`kern/src/sync.rs`) — so a real Briar no longer keeps our
+  groups invisible. What is built: one invitation session per (contact, group),
+  as Briar keeps it, with the chain of previous messages, rising timestamps, and
+  JOIN, LEAVE and ABORT both read and answered. What is not: the PEER role
+  between two members who are not contacts of each other (Briar's
+  `revealRelationship`), and declining an invitation as its own action — you can
+  only leave the group afterwards. The invitation client is announced as minor
+  version 0, not Briar's 1: minor 1 promises to honour the disappearing-message
+  timer, and this port ignores that field.
 - **No SDP record on Harmattan.** The Jolla publishes one through BlueZ 5's
   `ProfileManager1`; BlueZ 4 on the N9 and N950 offers a different interface
   (`org.bluez.Service.AddRecord`) and that is not written yet. Those two
