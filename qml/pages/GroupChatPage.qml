@@ -45,8 +45,15 @@ Page {
 
         header: PageHeader {
             title: page.groupName
-            description: page.dissolved ? app.tr("dissolved")
-                                        : page.members.length + " " + app.tr("members")
+            // Die Namen, nicht bloss die Zahl: die Hilfe sagt "die
+            // Mitgliederliste steht in der Gruppe", und der Dienst liefert sie
+            // laengst mit. Nur die Zahl zu zeigen war ein gebrochenes
+            // Versprechen.
+            description: page.dissolved
+                         ? app.tr("dissolved")
+                         : page.members.length + " " + app.tr("members")
+                           + (page.members.length > 0
+                              ? ": " + page.members.join(", ") : "")
         }
 
         PullDownMenu {

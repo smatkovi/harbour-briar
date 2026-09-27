@@ -77,6 +77,23 @@ Page {
     // wenn niemand mehr kommt.
     property string streichSchluessel: ""
 
+    // Einen Kontakt entfernen -- am N9 gab es das bisher gar nicht, obwohl der
+    // Dienst die Route laengst hat. Mit Rueckfrage, wie beim Wartenden.
+    property int entferneId: 0
+    property string entferneName: ""
+
+    QueryDialog {
+        id: kontaktEntfernen
+        titleText: fenster.tr("remove")
+        message: fenster.tr("removeContactAsk")
+        acceptButtonText: fenster.tr("remove")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.removeContact(seite.entferneId, function(antwort) {
+            if (!antwort.error)
+                fenster.zustand = antwort
+        })
+    }
+
     QueryDialog {
         id: streichen
         titleText: fenster.tr("removeWaiting")
@@ -154,9 +171,14 @@ Page {
                 width: parent.width - 32
 
                 Label {
-                    text: modelData.name
+                    // Ungelesenes gehoert an den Namen: der Dienst rechnet es
+                    // je Kontakt, angezeigt hat es bisher keine der beiden
+                    // Oberflaechen.
+                    text: modelData.unread > 0
+                          ? modelData.name + "  (" + modelData.unread + ")"
+                          : modelData.name
                     font.pixelSize: 26
-                    color: "white"
+                    color: modelData.unread > 0 ? "#95d220" : "white"
                 }
                 Label {
                     text: modelData.lastText
@@ -175,6 +197,11 @@ Page {
                 anchors.fill: parent
                 onClicked: pageStack.push(Qt.resolvedUrl("ChatPage.qml"),
                                           { kontakt: modelData.id, name: modelData.name })
+                onPressAndHold: {
+                    seite.entferneId = modelData.id
+                    seite.entferneName = modelData.name
+                    kontaktEntfernen.open()
+                }
             }
 
             Rectangle {

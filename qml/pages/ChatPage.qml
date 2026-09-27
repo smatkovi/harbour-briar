@@ -53,7 +53,7 @@ Page {
             allowedOrientations: Orientation.All
             Column {
                 width: parent.width
-                PageHeader { title: app.tr("attach") }
+                PageHeader { title: app.tr("attachAction") }
                 ListItem {
                     Label {
                         x: Theme.horizontalPageMargin

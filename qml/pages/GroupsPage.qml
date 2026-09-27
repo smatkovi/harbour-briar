@@ -109,7 +109,11 @@ Page {
                 }
                 MenuItem {
                     text: app.tr("remove")
-                    onClicked: Briar.removeGroup(modelData.id, function() { page.reload() })
+                    // Mit Bedenkzeit: das schickt den anderen Mitgliedern ein
+                    // LEAVE, und bei einer Einladung ist es die Ablehnung.
+                    onClicked: remorseAction(app.tr("remove"), function() {
+                        Briar.removeGroup(modelData.id, function() { page.reload() })
+                    })
                 }
             }
         }

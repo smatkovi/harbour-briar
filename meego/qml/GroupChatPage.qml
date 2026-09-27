@@ -43,13 +43,25 @@ Page {
             platformIconId: "toolbar-back"
             onClicked: pageStack.pop()
         }
-        Label {
-            text: seite.aufgeloest
-                  ? seite.name + " (" + fenster.tr("dissolved") + ")"
-                  : seite.name + " (" + seite.mitglieder.length + ")"
-            color: "white"
-            font.pixelSize: 24
+        Column {
             anchors.verticalCenter: parent.verticalCenter
+            Label {
+                text: seite.aufgeloest
+                      ? seite.name + " (" + fenster.tr("dissolved") + ")"
+                      : seite.name + " (" + seite.mitglieder.length + ")"
+                color: "white"
+                font.pixelSize: 24
+            }
+            // Die Namen, nicht bloss die Zahl -- die Hilfe verspricht sie, und
+            // der Dienst liefert sie mit.
+            Label {
+                visible: !seite.aufgeloest && seite.mitglieder.length > 0
+                text: seite.mitglieder.join(", ")
+                color: "#a0a0a0"
+                font.pixelSize: 16
+                width: 300
+                elide: Text.ElideRight
+            }
         }
         ToolIcon {
             platformIconId: "toolbar-add"

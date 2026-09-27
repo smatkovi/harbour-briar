@@ -153,7 +153,13 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
 
                 Label {
-                    text: modelData.name
+                    // Ungelesenes gehoert an den Namen. Der Dienst rechnet es
+                    // je Kontakt (api.rs), angezeigt hat es bisher niemand.
+                    text: modelData.unread > 0
+                          ? modelData.name + "  (" + modelData.unread + ")"
+                          : modelData.name
+                    color: modelData.unread > 0 ? Theme.highlightColor
+                                                : Theme.primaryColor
                     truncationMode: TruncationMode.Fade
                     width: parent.width
                 }
@@ -193,9 +199,14 @@ Page {
                 }
                 MenuItem {
                     text: app.tr("remove")
-                    onClicked: Briar.removeContact(modelData.id, function(answer) {
-                        if (!answer.error)
-                            app.status = answer
+                    // Mit Bedenkzeit: Verlauf und Schluessel gehen mit, und
+                    // danach muessten sich beide neu hinzufuegen. Am N9 fragt
+                    // ein Dialog nach, hier tut es die Remorse-Leiste.
+                    onClicked: remorseAction(app.tr("remove"), function() {
+                        Briar.removeContact(modelData.id, function(answer) {
+                            if (!answer.error)
+                                app.status = answer
+                        })
                     })
                 }
             }
