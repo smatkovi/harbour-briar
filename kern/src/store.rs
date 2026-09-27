@@ -25,7 +25,20 @@ pub struct Identity {
 pub struct TransportState {
     /// ip:port for the LAN, the Bluetooth address for Bluetooth
     pub address: Option<String>,
+    /// Nur noch fuer alte Dateien da: bis 0.24.0 stand hier EIN Zaehler,
+    /// der ewig wuchs. Beim Laden wandert er in `out_streams` unter den
+    /// gerade laufenden Zeitabschnitt, damit in diesem Abschnitt keine
+    /// Stromnummer zweimal vergeben wird.
+    #[serde(default)]
     pub out_stream: u64,
+    /// Die ausgehende Stromnummer **je Zeitabschnitt**, wie bei Briar: dort
+    /// erzeugt jede Schluesseldrehung neue OutgoingKeys ueber den
+    /// Vierargumenten-Erbauer, und der setzt streamCounter auf 0
+    /// (OutgoingKeys.java:20-23). Ein ewig wachsender Zaehler laeuft nach
+    /// dem ersten Abschnittswechsel aus dem Fenster der Gegenseite heraus --
+    /// und zwar dauerhaft, weil er nur steigt.
+    #[serde(default)]
+    pub out_streams: BTreeMap<String, u64>,
     /// Next expected incoming stream number, per time period
     pub in_stream: BTreeMap<String, u64>,
     /// Der Lauschport, den die Gegenseite gemeldet hat. Briar wuerfelt ihn

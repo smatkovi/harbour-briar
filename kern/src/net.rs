@@ -1268,10 +1268,10 @@ impl Node {
             let versioning_pending = !contact.sent_versioning_update;
             let out_stream = contact
                 .transport(transport_id)
-                .map(|t| t.out_stream)
+                .map(|t| naechste_stromnummer(t, period))
                 .unwrap_or(0);
             if let Some(c) = store.contact_mut(contact_id) {
-                c.transport_mut(transport_id).out_stream = out_stream + 1;
+                stromnummer_vormerken(c.transport_mut(transport_id), period, out_stream);
             }
             store.save()?;
             (keys, out_stream, to_send, to_ack, versioning_pending)
@@ -1809,6 +1809,43 @@ impl Node {
         }
         erreicht
     }
+}
+
+/// Die naechste ausgehende Stromnummer fuer diesen Zeitabschnitt.
+///
+/// Sie faengt in **jedem** Abschnitt bei null an -- genau wie bei Briar, wo
+/// jede Schluesseldrehung neue `OutgoingKeys` ueber den
+/// Vierargumenten-Erbauer erzeugt und der `streamCounter` auf 0 setzt
+/// (OutgoingKeys.java:20-23). Ein ewig wachsender Zaehler laeuft nach dem
+/// ersten Abschnittswechsel aus dem Fenster der Gegenseite heraus, und zwar
+/// dauerhaft, weil er nur steigt.
+pub fn naechste_stromnummer(zustand: &crate::store::TransportState, period: u64) -> u64 {
+    if let Some(n) = zustand.out_streams.get(&period.to_string()) {
+        return *n;
+    }
+    // Eine Datei aus einer Fassung bis 0.24.0 kennt nur den einen alten
+    // Zaehler. Der gilt im laufenden Abschnitt weiter -- sonst bekaeme eine
+    // Stromnummer darin zweimal dieselbe Marke.
+    if zustand.out_streams.is_empty() && zustand.out_stream > 0 {
+        return zustand.out_stream;
+    }
+    0
+}
+
+/// Die vergebene Nummer festhalten und alte Abschnitte wegraeumen: die
+/// Gegenseite haelt ohnehin nur den vorigen, den jetzigen und den naechsten.
+pub fn stromnummer_vormerken(
+    zustand: &mut crate::store::TransportState,
+    period: u64,
+    vergeben: u64,
+) {
+    zustand.out_streams.insert(period.to_string(), vergeben + 1);
+    zustand.out_streams.retain(|a, _| {
+        a.parse::<u64>()
+            .map(|p| p.max(period) - p.min(period) <= 1)
+            .unwrap_or(false)
+    });
+    zustand.out_stream = 0;
 }
 
 fn short_transport(transport_id: &str) -> &str {
@@ -2354,5 +2391,50 @@ mod ipv6_tests {
         let a = ipv6_hex(&"fe80::1".parse().unwrap());
         let b = ipv6_hex(&"2001:db8::1".parse().unwrap());
         assert_eq!(clean_ipv6_list(&format!("{},murks,{}", a, b)), a);
+    }
+}
+
+#[cfg(test)]
+mod stromnummer_tests {
+    use super::*;
+    use crate::store::TransportState;
+
+    #[test]
+    fn jeder_abschnitt_faengt_bei_null_an() {
+        // Das ist Briars Verhalten: bei jeder Drehung entstehen neue
+        // OutgoingKeys mit streamCounter 0.
+        let mut z = TransportState::default();
+        for n in 0..5u64 {
+            assert_eq!(naechste_stromnummer(&z, 100), n);
+            stromnummer_vormerken(&mut z, 100, n);
+        }
+        // Neuer Abschnitt -> wieder bei null.
+        assert_eq!(naechste_stromnummer(&z, 101), 0);
+    }
+
+    #[test]
+    fn alter_zaehler_gilt_im_laufenden_abschnitt_weiter() {
+        // Sonst bekaeme eine Stromnummer in diesem Abschnitt zweimal
+        // dieselbe Marke, und die Gegenseite verwuerfe sie als Wiederholung.
+        let mut z = TransportState::default();
+        z.out_stream = 17;
+        assert_eq!(naechste_stromnummer(&z, 100), 17);
+        stromnummer_vormerken(&mut z, 100, 17);
+        assert_eq!(naechste_stromnummer(&z, 100), 18);
+        // Im naechsten Abschnitt zaehlt der alte nicht mehr.
+        assert_eq!(naechste_stromnummer(&z, 101), 0);
+        assert_eq!(z.out_stream, 0, "der alte Zaehler wird nicht weitergefuehrt");
+    }
+
+    #[test]
+    fn weit_zurueckliegende_abschnitte_werden_weggeraeumt() {
+        let mut z = TransportState::default();
+        stromnummer_vormerken(&mut z, 100, 0);
+        stromnummer_vormerken(&mut z, 101, 0);
+        stromnummer_vormerken(&mut z, 102, 0);
+        // Die Gegenseite haelt nur voriger, jetziger und naechster.
+        assert!(!z.out_streams.contains_key("100"));
+        assert!(z.out_streams.contains_key("101"));
+        assert!(z.out_streams.contains_key("102"));
     }
 }
