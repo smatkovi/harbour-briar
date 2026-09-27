@@ -32,6 +32,8 @@ pub const VERSIONING_CLIENT_ID: &str = "org.briarproject.bramble.versioning";
 pub const VERSIONING_MAJOR_VERSION: u32 = 0;
 pub const PROPERTIES_CLIENT_ID: &str = "org.briarproject.bramble.properties";
 pub const PROPERTIES_MAJOR_VERSION: u32 = 0;
+/// TransportPropertyManager.java:28 -- "int MINOR_VERSION = 0;"
+pub const PROPERTIES_MINOR_VERSION: u32 = 0;
 
 const PRIVATE_MESSAGE: i64 = 0;
 const ATTACHMENT: i64 = 1;
@@ -222,6 +224,29 @@ pub fn write_priority(out: &mut impl Write, nonce: &[u8]) -> std::io::Result<()>
     )
 }
 
+/// Angebotene Nachrichten anfordern.
+///
+/// Das ist nicht kosmetisch: ueber Duplex-Transporte schickt Briar **nur
+/// Angefordertes**. Seine Sitzung bietet erst an ("The session offers
+/// messages before sending them"), sendet dann `generateRequestedBatch`, und
+/// das liest allein Nachrichten mit `requested = TRUE` -- gesetzt wird das
+/// Kennzeichen ausschliesslich durch einen REQUEST-Satz. Ohne ihn kommt von
+/// einem Briar-Kontakt gar nichts an: keine Nachricht, keine Adresse, nicht
+/// einmal seine Klientenliste.
+///
+/// Das Format ist dasselbe wie bei ACK: aneinandergereihte 32-Byte-Kennungen
+/// (SyncRecordWriterImpl.writeRequest).
+pub fn write_request(out: &mut impl Write, ids: &[SecretKey]) -> std::io::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut payload = Vec::with_capacity(ids.len() * 32);
+    for id in ids {
+        payload.extend_from_slice(id);
+    }
+    write_record(out, &Record::new(PROTOCOL_VERSION, REQUEST, payload))
+}
+
 pub fn write_ack(out: &mut impl Write, ids: &[SecretKey]) -> std::io::Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -261,12 +286,36 @@ pub fn parse_ids(payload: &[u8]) -> Vec<SecretKey> {
 /// such an update, so a port that wants to talk to the real Briar has to send
 /// one.
 pub fn versioning_update_body(update_version: i64) -> Vec<u8> {
-    let states = Bdf::List(vec![Bdf::List(vec![
-        Bdf::Str(MESSAGING_CLIENT_ID.to_string()),
-        Bdf::Int(MESSAGING_MAJOR_VERSION as i64),
-        Bdf::Int(MESSAGING_MINOR_VERSION as i64),
-        Bdf::Bool(true),
-    ])]);
+    // Hier muss **jeder** Klient stehen, den wir wirklich fahren. Was nicht
+    // angesagt ist, ist fuer die Gegenseite unsichtbar -- und in einer
+    // unsichtbaren Gruppe wird verworfen UND nicht quittiert
+    // (ClientVersioningManagerImpl: "if (remote == null) visibilities.put(key,
+    // INVISIBLE)"). Bis 0.24.0 stand hier nur messaging; damit war das ganze
+    // Adressgedaechtnis gegen echtes Briar wirkungslos, in beide Richtungen.
+    //
+    // Die Gruppenklienten fehlen noch mit Absicht: sie kommen erst dazu,
+    // wenn JOIN, LEAVE und ABORT gebaut sind. Etwas anzusagen, das man nicht
+    // zu Ende kann, ist schlimmer als es wegzulassen.
+    let eintrag = |id: &str, haupt: u32, neben: u32| {
+        Bdf::List(vec![
+            Bdf::Str(id.to_string()),
+            Bdf::Int(haupt as i64),
+            Bdf::Int(neben as i64),
+            Bdf::Bool(true),
+        ])
+    };
+    let states = Bdf::List(vec![
+        eintrag(
+            MESSAGING_CLIENT_ID,
+            MESSAGING_MAJOR_VERSION,
+            MESSAGING_MINOR_VERSION,
+        ),
+        eintrag(
+            PROPERTIES_CLIENT_ID,
+            PROPERTIES_MAJOR_VERSION,
+            PROPERTIES_MINOR_VERSION,
+        ),
+    ]);
     crate::bdf::to_bytes(&Bdf::List(vec![states, Bdf::Int(update_version)]))
 }
 

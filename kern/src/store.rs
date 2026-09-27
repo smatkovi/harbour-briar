@@ -128,9 +128,26 @@ pub struct Contact {
     /// Identifiers we have received and still owe an acknowledgement for
     #[serde(default)]
     pub to_ack: Vec<String>,
+    /// Kennungen, die die Gegenseite angeboten hat und die wir noch nicht
+    /// haben. Sie gehen zu Beginn der naechsten Runde als REQUEST hinaus.
+    #[serde(default)]
+    pub to_request: Vec<String>,
     pub last_seen: u64,
+    /// Nur noch fuer alte Dateien: bis 0.24.0 ein einmaliges Ja/Nein. Damit
+    /// haette ein bestehender Kontakt eine geaenderte Klientenliste nie
+    /// erfahren.
     #[serde(default)]
     pub sent_versioning_update: bool,
+    /// Fingerabdruck der zuletzt angesagten Klientenliste. Aendert sie sich,
+    /// wird neu angesagt -- Briars Klient tut dasselbe, nur mit einer
+    /// Datenbank dahinter.
+    #[serde(default)]
+    pub versioning_sent: String,
+    /// Die Nummer der Ansage. Briar laesst die hoehere gewinnen und verwirft
+    /// eine mit kleinerer (ClientVersioningManagerImpl), also muss sie
+    /// steigen.
+    #[serde(default)]
+    pub versioning_version: u64,
     /// The addresses last announced to this contact. When ours change -- Tor
     /// switched on, a new WLAN -- the announcement goes out again.
     #[serde(default)]

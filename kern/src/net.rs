@@ -1057,6 +1057,9 @@ impl Node {
                 messages: Vec::new(),
                 outbox: Vec::new(),
                 to_ack: Vec::new(),
+                to_request: Vec::new(),
+                versioning_sent: String::new(),
+                versioning_version: 0,
                 last_seen: now_ms(),
                 sent_versioning_update: false,
                 sent_properties: None,
@@ -1180,7 +1183,16 @@ impl Node {
     ) -> std::io::Result<()> {
         conn.set_timeouts()?;
         let period = current_time_period();
-        let (out_keys, out_stream, to_send, to_ack, versioning_pending) = {
+        let (
+            out_keys,
+            out_stream,
+            to_send,
+            to_ack,
+            to_request,
+            versioning_pending,
+            versioning_fp,
+            versioning_nummer,
+        ) = {
             let mut store = self.store.lock().unwrap();
             let contact = store
                 .contact(contact_id)
@@ -1265,7 +1277,17 @@ impl Node {
                 .cloned()
                 .collect();
             let to_ack: Vec<SecretKey> = contact.to_ack.iter().map(|id| key_from_hex(id)).collect();
-            let versioning_pending = !contact.sent_versioning_update;
+            // Was die Gegenseite in einer frueheren Runde angeboten hat. Ohne
+            // diesen Satz schickt Briar ueber Duplex-Transporte gar nichts:
+            // es sendet nur, was angefordert wurde.
+            let to_request: Vec<SecretKey> =
+                contact.to_request.iter().map(|id| key_from_hex(id)).collect();
+            // Neu ansagen, sobald sich die Liste aendert -- nicht nur einmal
+            // im Leben des Kontakts.
+            let versioning_body = sync::versioning_update_body(0);
+            let versioning_fp = to_hex(&crate::crypto::hash("vers", &[&versioning_body]));
+            let versioning_pending = contact.versioning_sent != versioning_fp;
+            let versioning_nummer = contact.versioning_version + 1;
             let out_stream = contact
                 .transport(transport_id)
                 .map(|t| naechste_stromnummer(t, period))
@@ -1274,7 +1296,16 @@ impl Node {
                 stromnummer_vormerken(c.transport_mut(transport_id), period, out_stream);
             }
             store.save()?;
-            (keys, out_stream, to_send, to_ack, versioning_pending)
+            (
+                keys,
+                out_stream,
+                to_send,
+                to_ack,
+                to_request,
+                versioning_pending,
+                versioning_fp,
+                versioning_nummer,
+            )
         };
 
         let mut writer = StreamWriter::new(conn.try_clone()?, &out_keys, out_stream);
@@ -1293,10 +1324,11 @@ impl Node {
                     &contact.author_id_bytes(),
                 )
             };
-            let body = sync::versioning_update_body(1);
+            let body = sync::versioning_update_body(versioning_nummer as i64);
             sync::write_message(&mut writer, &versioning_group, now_ms(), &body)?;
         }
         sync::write_ack(&mut writer, &to_ack)?;
+        sync::write_request(&mut writer, &to_request)?;
         for message in &to_send {
             let group = key_from_hex(&message.group);
             let body = from_hex(&message.body).unwrap_or_default();
@@ -1326,6 +1358,7 @@ impl Node {
         let mut reader = StreamReader::new(raw_reader, in_header_key, in_stream_number);
 
         let mut acked_ids: Vec<SecretKey> = Vec::new();
+        let mut offered_ids: Vec<SecretKey> = Vec::new();
         let mut received: Vec<(SecretKey, SecretKey, u64, Vec<u8>)> = Vec::new();
         loop {
             match read_record(&mut reader) {
@@ -1335,6 +1368,9 @@ impl Node {
                     }
                     match record.record_type {
                         sync::ACK => acked_ids.extend(sync::parse_ids(&record.payload)),
+                        // Ein Angebot: die Gegenseite haelt diese Nachrichten
+                        // bereit und schickt sie erst, wenn wir sie anfordern.
+                        sync::OFFER => offered_ids.extend(sync::parse_ids(&record.payload)),
                         sync::MESSAGE => {
                             if let Some((group, timestamp, body)) =
                                 ids::parse_raw_message(&record.payload)
@@ -1362,6 +1398,23 @@ impl Node {
         {
             let mut store = self.store.lock().unwrap();
             if let Some(contact) = store.contact_mut(contact_id) {
+                // Angefordert ist angefordert: die Liste gilt als erledigt,
+                // sobald der Satz draussen ist. Kommt die Nachricht nicht,
+                // bietet die Gegenseite sie in der naechsten Runde erneut an.
+                contact.to_request.clear();
+                // Was neu angeboten wurde, kommt in die naechste Runde --
+                // ausser wir haben es schon.
+                let bekannt: std::collections::BTreeSet<String> = contact
+                    .messages
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect();
+                for id in &offered_ids {
+                    let hex = to_hex(id);
+                    if !bekannt.contains(&hex) && !contact.to_request.contains(&hex) {
+                        contact.to_request.push(hex);
+                    }
+                }
                 let peer_acked: Vec<String> = acked_ids.iter().map(|id| to_hex(id)).collect();
                 for message in contact.outbox.iter_mut() {
                     if peer_acked.contains(&message.id) {
@@ -1393,6 +1446,8 @@ impl Node {
                     .insert(in_period.to_string(), in_stream_number + 1);
                 if versioning_pending {
                     contact.sent_versioning_update = true;
+                    contact.versioning_sent = versioning_fp.clone();
+                    contact.versioning_version = versioning_nummer;
                 }
                 if transport_id == LAN_TRANSPORT_ID {
                     let state = contact.transport_mut(LAN_TRANSPORT_ID);
