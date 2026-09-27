@@ -567,6 +567,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 last_read: 0,
                 messages: Vec::new(),
                 our_previous: None,
+                einladung_previous: None,
                 contacts: Vec::new(),
             };
             // The creator's own join message starts its chain.
@@ -725,6 +726,44 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     },
                 );
             }
+            // Und die Antwort an den Einladenden, in SEINE Einladungsgruppe.
+            // Ohne sie teilt er die Gruppe nie: seine Sitzung wartet auf
+            // genau diese Nachricht und bliebe sonst ewig im Zustand
+            // INVITED -- wir bekaemen die Beitraege der anderen Mitglieder
+            // nicht, obwohl wir formal beigetreten sind.
+            if let Some(einladender) = locked.group(&group_hex).and_then(|g| g.invited_by) {
+                let ihre_kennung = locked
+                    .contact(einladender)
+                    .map(|c| c.author_id_bytes());
+                let vorige = locked
+                    .group(&group_hex)
+                    .and_then(|g| g.einladung_previous.clone());
+                if let Some(ihre) = ihre_kennung {
+                    let einladungsgruppe = groups::invite_group_id(&author.id(), &ihre);
+                    let rumpf = groups::einladung_join_body(
+                        &group_id,
+                        vorige.as_deref().and_then(|v| from_hex(v)).as_deref(),
+                    );
+                    let kennung = to_hex(&crate::ids::message_id(
+                        &einladungsgruppe,
+                        timestamp,
+                        &rumpf,
+                    ));
+                    locked.queue(
+                        einladender,
+                        OutMessage {
+                            id: kennung.clone(),
+                            group: to_hex(&einladungsgruppe),
+                            timestamp,
+                            body: to_hex(&rumpf),
+                            acked: false,
+                        },
+                    );
+                    if let Some(g) = locked.group_mut(&group_hex) {
+                        g.einladung_previous = Some(kennung);
+                    }
+                }
+            }
             let _ = locked.save();
             drop(locked);
             spawn_poll(&store);
@@ -830,8 +869,53 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
         ("POST", "/group/remove") => {
             let group_hex = body["group"].as_str().unwrap_or("").to_string();
             let mut locked = store.lock().unwrap();
+            // Erst den Mitgliedern sagen, dass wir gehen, dann gehen. Ohne
+            // LEAVE haelt die Gegenseite uns fuer immer fuer ein Mitglied und
+            // schickt weiter Beitraege an jemanden, der nicht mehr zuhoert.
+            let (gruppen_id, kontakte, eigene) = match locked.group(&group_hex) {
+                Some(g) => (
+                    key_from_hex(&g.id),
+                    g.contacts.clone(),
+                    locked.identity().map(|i| key_from_hex(&i.author_id)),
+                ),
+                None => (key_from_hex(&group_hex), Vec::new(), None),
+            };
+            if let Some(unsere) = eigene {
+                let timestamp = crate::util::now_ms();
+                for kontakt in &kontakte {
+                    let ihre = match locked.contact(*kontakt) {
+                        Some(c) => c.author_id_bytes(),
+                        None => continue,
+                    };
+                    let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
+                    let vorige = locked
+                        .group(&group_hex)
+                        .and_then(|g| g.einladung_previous.clone());
+                    let rumpf = groups::einladung_leave_body(
+                        &gruppen_id,
+                        vorige.as_deref().and_then(|v| from_hex(v)).as_deref(),
+                    );
+                    let kennung = to_hex(&crate::ids::message_id(
+                        &einladungsgruppe,
+                        timestamp,
+                        &rumpf,
+                    ));
+                    locked.queue(
+                        *kontakt,
+                        OutMessage {
+                            id: kennung,
+                            group: to_hex(&einladungsgruppe),
+                            timestamp,
+                            body: to_hex(&rumpf),
+                            acked: false,
+                        },
+                    );
+                }
+            }
             locked.state.groups.retain(|g| g.id != group_hex);
             let _ = locked.save();
+            drop(locked);
+            spawn_poll(&store);
             json!({"ok": true})
         }
 

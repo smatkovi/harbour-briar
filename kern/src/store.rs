@@ -220,6 +220,11 @@ pub struct PrivateGroup {
     pub messages: Vec<GroupPost>,
     /// Our own last message in this group: the next one names it
     pub our_previous: Option<String>,
+    /// Die letzte Nachricht, die WIR in der Einladungsgruppe dieses Kontakts
+    /// geschrieben haben. Briar fuehrt damit eine Kette je Kontaktgruppe --
+    /// JOIN und LEAVE tragen sie als drittes Listenglied.
+    #[serde(default)]
+    pub einladung_previous: Option<String>,
     /// Contacts this group is synced with
     #[serde(default)]
     pub contacts: Vec<u32>,

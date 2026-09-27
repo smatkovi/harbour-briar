@@ -1745,6 +1745,7 @@ impl Node {
             last_read: 0,
             messages: Vec::new(),
             our_previous: None,
+            einladung_previous: None,
             contacts: vec![contact_id],
         });
         log(&format!(

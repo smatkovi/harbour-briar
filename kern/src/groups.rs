@@ -25,9 +25,17 @@ const SIGNING_LABEL_JOIN: &str = "org.briarproject.briar.privategroup/JOIN";
 const SIGNING_LABEL_POST: &str = "org.briarproject.briar.privategroup/POST";
 const SIGNING_LABEL_INVITE: &str = "org.briarproject.briar.privategroup.invitation/INVITE";
 
+// Der Gruppenklient selbst: seine Nachrichten stehen IN der Gruppe.
 const JOIN: i64 = 0;
 const POST: i64 = 1;
+
+// Der Einladungsklient: seine Nachrichten stehen in der Kontaktgruppe, die
+// sich die beiden Kontakte teilen. Die Zahlen stammen aus MessageType.java:
+//   INVITE(0), JOIN(1), LEAVE(2), ABORT(3)
 const INVITE: i64 = 0;
+const EINLADUNG_JOIN: i64 = 1;
+const EINLADUNG_LEAVE: i64 = 2;
+const EINLADUNG_ABORT: i64 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Author {
@@ -285,6 +293,46 @@ pub fn verify_invite_signature(
     crypto::verify_signature(signature, SIGNING_LABEL_INVITE, &token, creator_public_key)
 }
 
+/// JOIN, LEAVE und ABORT, genau wie Briars MessageEncoderImpl sie schreibt:
+///
+///   JOIN  = [1, Gruppenkennung, vorige Nachricht]
+///   LEAVE = [2, Gruppenkennung, vorige Nachricht]
+///   ABORT = [3, Gruppenkennung]
+///
+/// "vorige Nachricht" ist die letzte Nachricht, die WIR in dieser
+/// Einladungsgruppe geschrieben haben, oder Null beim ersten Mal. Briar fuehrt
+/// damit eine Kette je Kontaktgruppe.
+///
+/// Ohne JOIN teilt der Einladende die Gruppe nie: seine Sitzung wartet darauf
+/// und bleibt sonst ewig im Zustand INVITED. Umgekehrt steht eine von Android
+/// angelegte Gruppe bei uns auf sichtbar statt geteilt -- wir bekommen die
+/// Beitraege der anderen Mitglieder nie, obwohl wir formal beigetreten sind.
+pub fn einladung_join_body(group_id: &[u8], previous: Option<&[u8]>) -> Vec<u8> {
+    kette_body(EINLADUNG_JOIN, group_id, previous)
+}
+
+pub fn einladung_leave_body(group_id: &[u8], previous: Option<&[u8]>) -> Vec<u8> {
+    kette_body(EINLADUNG_LEAVE, group_id, previous)
+}
+
+pub fn einladung_abort_body(group_id: &[u8]) -> Vec<u8> {
+    crate::bdf::to_bytes(&Bdf::List(vec![
+        Bdf::Int(EINLADUNG_ABORT),
+        Bdf::Raw(group_id.to_vec()),
+    ]))
+}
+
+fn kette_body(art: i64, group_id: &[u8], previous: Option<&[u8]>) -> Vec<u8> {
+    crate::bdf::to_bytes(&Bdf::List(vec![
+        Bdf::Int(art),
+        Bdf::Raw(group_id.to_vec()),
+        match previous {
+            Some(p) => Bdf::Raw(p.to_vec()),
+            None => Bdf::Null,
+        },
+    ]))
+}
+
 /// The INVITE message, in the shape Briar's MessageEncoder writes it.
 pub fn invite_body(
     creator: &Author,
@@ -332,4 +380,49 @@ pub fn parse_invite(body: &[u8]) -> Option<Invite> {
         text: items[4].as_str().map(|s| s.to_string()),
         signature: items[5].as_raw()?.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod einladung_tests {
+    use super::*;
+
+    #[test]
+    fn die_nummern_sind_briars() {
+        // MessageType.java: INVITE(0), JOIN(1), LEAVE(2), ABORT(3).
+        // Nicht zu verwechseln mit dem Gruppenklienten, dessen JOIN 0 ist --
+        // dieselben Namen, andere Zahlen, andere Gruppe.
+        assert_eq!(INVITE, 0);
+        assert_eq!(EINLADUNG_JOIN, 1);
+        assert_eq!(EINLADUNG_LEAVE, 2);
+        assert_eq!(EINLADUNG_ABORT, 3);
+        assert_eq!(JOIN, 0);
+        assert_eq!(POST, 1);
+    }
+
+    #[test]
+    fn join_und_leave_tragen_die_kette() {
+        let gruppe = [7u8; 32];
+        let vorige = [9u8; 32];
+        // Beim ersten Mal gibt es keine vorige Nachricht -- dann Null, nicht
+        // etwa Nullbytes.
+        let erste = crate::bdf::from_bytes(&einladung_join_body(&gruppe, None)).unwrap();
+        let teile = erste.as_list().unwrap();
+        assert_eq!(teile[0].as_int(), Some(1));
+        assert_eq!(teile[1].as_raw().unwrap(), &gruppe);
+        assert!(matches!(teile[2], Bdf::Null));
+
+        let zweite = crate::bdf::from_bytes(&einladung_leave_body(&gruppe, Some(&vorige))).unwrap();
+        let teile = zweite.as_list().unwrap();
+        assert_eq!(teile[0].as_int(), Some(2));
+        assert_eq!(teile[2].as_raw().unwrap(), &vorige);
+    }
+
+    #[test]
+    fn abort_hat_nur_die_gruppe() {
+        let gruppe = [3u8; 32];
+        let liste = crate::bdf::from_bytes(&einladung_abort_body(&gruppe)).unwrap();
+        let teile = liste.as_list().unwrap();
+        assert_eq!(teile.len(), 2, "ABORT traegt keine vorige Nachricht");
+        assert_eq!(teile[0].as_int(), Some(3));
+    }
 }
