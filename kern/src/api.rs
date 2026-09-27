@@ -1094,6 +1094,28 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     );
                 }
             }
+            // Die Sitzungen ueberleben die Gruppe. Entfernen ist auf der
+            // Leitung eine Ablehnung -- Briar verbucht unser LEAVE als solche,
+            // geht nach START und darf neu einladen. Kommt diese neue Einladung,
+            // muss unser JOIN die Kette fortsetzen: Briar erwartet als vorige
+            // Nachricht unser LEAVE (isValidDependency) und bricht sonst ab.
+            if let Some(g) = locked.group(&group_hex) {
+                let sitzungen = g.einladungen.clone();
+                if !sitzungen.is_empty() {
+                    locked
+                        .state
+                        .verlassene_einladungen
+                        .insert(group_hex.clone(), sitzungen);
+                }
+            }
+            // Und die eigene Gruppenpost aus dem Korb: wir gehen, also wird sie
+            // niemand mehr annehmen. Bei einem echten Briar bliebe ein vorher
+            // abgewiesener Beitrag sonst fuer immer unquittiert liegen und
+            // stuende dauerhaft im Zaehler am Kontakt. Das LEAVE selbst liegt in
+            // der Einladungsgruppe und bleibt davon unberuehrt.
+            for kontakt in &kontakte {
+                locked.verwerfe_gruppenpost(*kontakt, &group_hex);
+            }
             locked.state.groups.retain(|g| g.id != group_hex);
             let _ = locked.save();
             drop(locked);

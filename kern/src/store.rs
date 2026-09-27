@@ -417,6 +417,15 @@ pub struct State {
     pub contacts: Vec<Contact>,
     #[serde(default)]
     pub groups: Vec<PrivateGroup>,
+    /// Die Einladungssitzungen entfernter Gruppen, nach Gruppenkennung. Briar
+    /// behaelt eine Sitzung, wenn eine Einladung abgelehnt wird -- der Zustand
+    /// geht auf START, und die Kette laeuft weiter (CreatorProtocolEngine
+    /// onRemoteDecline). Bei uns lebt die Sitzung an der Gruppe, und die Gruppe
+    /// zu entfernen IST die Ablehnung: ohne dieses Gedaechtnis nennt unser
+    /// spaeteres JOIN nach einer neuen Einladung keine vorige Nachricht, und
+    /// Briar bricht die Sitzung ab, statt die Gruppe zu teilen.
+    #[serde(default)]
+    pub verlassene_einladungen: BTreeMap<String, BTreeMap<u32, Einladungssitzung>>,
     /// Attachment identifier -> the file it was written to
     #[serde(default)]
     pub attachments: BTreeMap<String, Attachment>,

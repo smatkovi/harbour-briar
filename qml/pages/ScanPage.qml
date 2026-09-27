@@ -21,7 +21,12 @@ Page {
     // Knopf unten weiterdreht -- einmal tippen, bis es aufrecht steht.
     // Das Erkennen beruehrt das ohnehin nicht: der Filter liest den Code in
     // jeder Lage, die Drehung ist fuers Auge.
-    property int drehung: -90
+    //
+    // 0 und nicht -90: an der Jolla nachgesehen stand das Sucherbild mit -90
+    // um 90 Grad im Uhrzeigersinn verdreht. VideoOutput dreht bei positivem
+    // Wert gegen den Uhrzeigersinn, -90 hat das aufrechte Rohbild also erst
+    // gekippt. Bleibt es an einem anderen Geraet quer, hilft der Knopf.
+    property int drehung: 0
 
     Camera {
         id: camera

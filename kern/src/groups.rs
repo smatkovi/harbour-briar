@@ -9,9 +9,10 @@
 //! The wire formats here are Briar's, and so is the invitation session: one
 //! per (contact, group), each message naming the previous one, with JOIN, LEAVE
 //! and ABORT read and answered (`net.rs`). What is still missing from Briar's
-//! protocol is the PEER role between two members who are not contacts of each
-//! other, and declining an invitation as its own step -- here one leaves the
-//! group instead.
+//! protocol is the PEER role between two members who ARE contacts of each other
+//! without either having invited the other -- Briar lets them confirm that with
+//! `revealRelationship`. Declining has no step of its own: removing the group
+//! before joining sends the LEAVE that Briar books as a decline.
 
 use crate::bdf::Bdf;
 use crate::crypto::{self, SecretKey};

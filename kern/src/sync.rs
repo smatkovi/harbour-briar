@@ -356,9 +356,11 @@ pub fn versioning_update_body(update_version: i64) -> Vec<u8> {
     // Das ist jetzt gebaut (Kette je (Kontakt, Gruppe), Zustand je Sitzung,
     // JOIN/LEAVE/ABORT gelesen und beantwortet, Zeitstempel ruecken vor), und
     // darum darf es angesagt werden. Was weiterhin fehlt, steht in der README:
-    // die PEER-Rolle zwischen zwei Mitgliedern, die keine Kontakte sind
-    // (Briars revealRelationship), und das Ablehnen einer Einladung als
-    // eigener Griff in der Oberflaeche.
+    // die PEER-Rolle zwischen zwei Mitgliedern, die einander als Kontakt haben,
+    // ohne dass eines das andere eingeladen hat (Briars revealRelationship --
+    // die Sitzung liegt in einer Kontaktgruppe, es geht also nur um Kontakte).
+    // Ablehnen gibt es dagegen: die Gruppe zu entfernen schickt das LEAVE, das
+    // Briar als Ablehnung verbucht; nur einen eigenen Knopf hat es nicht.
     let eintrag = |id: &str, haupt: u32, neben: u32| {
         Bdf::List(vec![
             Bdf::Str(id.to_string()),

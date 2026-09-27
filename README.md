@@ -95,9 +95,11 @@ What this port does **differently**, and why:
   groups invisible. What is built: one invitation session per (contact, group),
   as Briar keeps it, with the chain of previous messages, rising timestamps, and
   JOIN, LEAVE and ABORT both read and answered. What is not: the PEER role
-  between two members who are not contacts of each other (Briar's
-  `revealRelationship`), and declining an invitation as its own action — you can
-  only leave the group afterwards. The invitation client is announced as minor
+  between two members who *are* contacts of each other but where neither invited
+  the other (Briar's `revealRelationship`) — they cannot confirm to each other
+  that both are in the group, though the member list and every post reach them
+  anyway. Declining has no button of its own: removing the group before joining
+  sends the LEAVE that Briar books as a decline. The invitation client is announced as minor
   version 0, not Briar's 1: minor 1 promises to honour the disappearing-message
   timer, and this port ignores that field.
 - **No SDP record on Harmattan.** The Jolla publishes one through BlueZ 5's

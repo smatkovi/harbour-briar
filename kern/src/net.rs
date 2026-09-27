@@ -2014,26 +2014,6 @@ impl Node {
         timestamp: u64,
         body: &[u8],
     ) -> bool {
-        // Briars erste Pruefung an jeder eintreffenden Nachricht, noch vor dem
-        // Format: liegt ihr Zeitstempel mehr als einen Tag in der Zukunft, wird
-        // sie verworfen (BdfMessageValidator: "Timestamp is too far in the
-        // future", MAX_CLOCK_DIFFERENCE = 24 h).
-        //
-        // Hier ist das mehr als Formtreue. Unsere eigenen Zeitstempel ruecken
-        // seit dieser Fassung hinter fremde: das JOIN hinter die Einladung, der
-        // Beitrag hinter die vorige eigene Nachricht. Ein Gegenueber mit
-        // verstellter Uhr -- oder eines, das es darauf anlegt -- koennte uns
-        // sonst einen Stempel weit in der Zukunft unterschieben, und von da an
-        // traegt jede eigene Nachricht in dieser Gruppe denselben Sprung mit:
-        // ein echtes Briar wirft sie dann alle weg, und unsere Kette kommt nie
-        // wieder herunter.
-        if timestamp.saturating_sub(now_ms()) > MAX_CLOCK_DIFFERENCE {
-            log(&format!(
-                "a message from contact {} is dated more than a day ahead -- discarded",
-                contact_id
-            ));
-            return false;
-        }
         let identity = match store.identity() {
             Some(i) => i.clone(),
             None => return false,
@@ -2188,6 +2168,34 @@ impl Node {
         false
     }
 
+    /// Briars Pruefung auf einen Zeitstempel weit in der Zukunft
+    /// (BdfMessageValidator: "Timestamp is too far in the future",
+    /// MAX_CLOCK_DIFFERENCE = 24 h) -- aber nur dort, wo sie etwas schuetzt.
+    ///
+    /// Sie schuetzt die eigenen Ketten: unsere Zeitstempel ruecken hinter
+    /// fremde (das JOIN hinter die Einladung, der Beitrag hinter die vorige
+    /// eigene Nachricht), und ein Gegenueber mit verstellter Uhr koennte uns
+    /// sonst einen Sprung unterschieben, den von da an jede eigene Nachricht
+    /// in dieser Gruppe mittraegt.
+    ///
+    /// Auf ALLES anzuwenden war ein Rueckschritt: die Empfangsschleife
+    /// quittiert eine verworfene Nachricht trotzdem, der Absender sieht sie
+    /// also als zugestellt und schickt sie nie wieder. Geht die eigene Uhr
+    /// mehr als einen Tag nach -- und auf N9 und N950 laeuft sie ohne
+    /// Zeitdienst --, waere so jede Privatnachricht still verloren gegangen,
+    /// obwohl sie unter 0.26.0 ankam. Eine Privatnachricht speist keine Kette,
+    /// da gibt es nichts zu schuetzen.
+    fn zu_weit_in_der_zukunft(&self, contact_id: u32, art: &str, timestamp: u64) -> bool {
+        if timestamp.saturating_sub(now_ms()) > MAX_CLOCK_DIFFERENCE {
+            log(&format!(
+                "{} von Kontakt {} ist mehr als einen Tag in der Zukunft datiert -- verworfen",
+                art, contact_id
+            ));
+            return true;
+        }
+        false
+    }
+
     /// Alles, was in der Einladungsgruppe ankommt. Bisher wurde nur INVITE
     /// gelesen; JOIN, LEAVE und ABORT fielen durch -- quittiert und vergessen.
     fn receive_einladung(
@@ -2198,6 +2206,11 @@ impl Node {
         timestamp: u64,
         body: &[u8],
     ) -> bool {
+        // Hier gilt der Deckel: der Zeitstempel einer Einladung wird zur
+        // Untergrenze unserer eigenen Zeitstempel in dieser Gruppe.
+        if self.zu_weit_in_der_zukunft(contact_id, "eine Einladungsnachricht", timestamp) {
+            return false;
+        }
         match groups::parse_einladung(body) {
             Some(groups::Einladungsnachricht::Invite(invite)) => {
                 self.receive_invite(store, contact_id, id, timestamp, invite)
@@ -2262,11 +2275,28 @@ impl Node {
         // Die Kennung DIESER INVITE ist der Anker der Gegenseite: ihr JOIN
         // wird sie als vorige Nachricht nennen, und jeder eigene Zeitstempel
         // in dieser Sitzung muss echt ueber dem der Einladung liegen.
-        let mut einladungen = BTreeMap::new();
+        // Hatten wir diese Gruppe schon einmal und wieder entfernt, lebt die
+        // Kette weiter: das Entfernen war eine Ablehnung, Briar steht in START
+        // und erwartet bei unserem naechsten JOIN unser damaliges LEAVE als
+        // vorige Nachricht.
+        let mut einladungen = store
+            .state
+            .verlassene_einladungen
+            .remove(&group_hex)
+            .unwrap_or_default();
+        let frueher = einladungen
+            .get(&contact_id)
+            .and_then(|s| s.letzte_eigene.clone());
+        if frueher.is_some() {
+            log(&format!(
+                "die Einladung zur Gruppe {} kommt erneut -- die alte Kette wird fortgesetzt",
+                group_hex
+            ));
+        }
         einladungen.insert(
             contact_id,
             crate::store::Einladungssitzung {
-                letzte_eigene: None,
+                letzte_eigene: frueher,
                 letzte_fremde: Some(to_hex(id)),
                 eigener_zeitstempel: 0,
                 einladungs_zeitstempel: timestamp,
@@ -2446,15 +2476,24 @@ impl Node {
         // Einladender bricht in START ab; das duerfen wir nicht -- jede Gruppe,
         // die vor dieser Fassung eingeladen wurde, hat keine Sitzung und landet
         // genau dort.
+        // "Hat angenommen" sagen wir nur, wenn es eine Zusage auf UNSERE
+        // Einladung sein kann. Briar schickt in derselben Gruppe auch ein JOIN,
+        // wenn ein Mitglied "Kontakte zeigen" antippt (PeerProtocolEngine,
+        // revealRelationship) -- das ist keine Zusage, und wir haben dort nie
+        // eingeladen. Ohne diese Unterscheidung stand in der Liste, jemand habe
+        // eine Einladung angenommen, die es nicht gab.
+        let eine_zusage = sind_wir_erstellerin || zustand == Sitzungszustand::Eingeladen;
         if let Some(g) = store.group_mut(&group_hex) {
             if !g.contacts.contains(&contact_id) {
                 g.contacts.push(contact_id);
             }
-            g.letztes_ereignis = Some(Ereignis {
-                art: Ereignisart::Angenommen,
-                wer: name,
-                wann: timestamp,
-            });
+            if eine_zusage {
+                g.letztes_ereignis = Some(Ereignis {
+                    art: Ereignisart::Angenommen,
+                    wer: name,
+                    wann: timestamp,
+                });
+            }
         }
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
             s.letzte_fremde = Some(to_hex(id));
@@ -2481,14 +2520,53 @@ impl Node {
         // (isValidDependency), und gewonnen waere nichts: vor 0.27.0 wurden die
         // Gruppenklienten nicht angesagt, ein echtes Briar hat diese Gruppe also
         // ohnehin nie gesehen. Lieber nichts schicken als die Sitzung zerlegen.
+        let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
+        // Fuer eine Gruppe, die dieses Geraet vor 0.27.0 angelegt hat, wurde die
+        // Kennung der eigenen Einladung nie in eine Sitzung geschrieben. Sie ist
+        // aber oft noch zu finden: liegt die INVITE unquittiert im Ausgangskorb
+        // -- und genau das ist der Fall bei einem echten Briar, das sie mangels
+        // Ansage verworfen und nicht quittiert hat --, dann steht ihre Kennung
+        // dort. Ohne diesen Griff blieb ein Briar-Mitglied fuer immer in
+        // ACCEPTED: es wartet auf unser JOIN, und wir schicken keines.
+        let anker = match anker {
+            Some(a) => Some(a),
+            None => {
+                let gruppe_hex = to_hex(&einladungsgruppe);
+                let gefunden = store.contact(contact_id).and_then(|c| {
+                    c.outbox
+                        .iter()
+                        .filter(|m| m.group == gruppe_hex)
+                        .find(|m| {
+                            from_hex(&m.body)
+                                .and_then(|b| groups::parse_einladung(&b))
+                                .map(|n| {
+                                    matches!(n, groups::Einladungsnachricht::Invite(_))
+                                })
+                                .unwrap_or(false)
+                        })
+                        .map(|m| m.id.clone())
+                });
+                if let Some(kennung) = gefunden {
+                    log(&format!(
+                        "Kette zur Gruppe {} aus dem Ausgangskorb nachgeholt: {}",
+                        group_hex, kennung
+                    ));
+                    if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+                        s.letzte_eigene = Some(kennung.clone());
+                    }
+                    Some(kennung)
+                } else {
+                    None
+                }
+            }
+        };
         if anker.is_none() {
             log(&format!(
-                "die Gruppe {} stammt aus einer Fassung vor 0.27.0 -- kein eigenes JOIN, die Kette hat keinen Kopf",
+                "die Gruppe {} stammt aus einer Fassung vor 0.27.0 und ihre Einladung ist quittiert -- kein eigenes JOIN, die Kette hat keinen Kopf",
                 group_hex
             ));
             return true;
         }
-        let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
         let zeitstempel = store
             .sitzung(&group_hex, contact_id)
             .map(|s| s.naechster_zeitstempel())
@@ -2701,6 +2779,11 @@ impl Node {
         timestamp: u64,
         body: &[u8],
     ) -> bool {
+        // Und hier: der Beitrag eines anderen wird zur Untergrenze, sobald er
+        // als vorige Nachricht in der Gruppe steht.
+        if self.zu_weit_in_der_zukunft(contact_id, "ein Gruppenbeitrag", timestamp) {
+            return false;
+        }
         let parsed = match groups::parse_body(group, timestamp, body) {
             Some(p) => p,
             None => {
