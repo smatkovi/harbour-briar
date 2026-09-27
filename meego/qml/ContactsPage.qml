@@ -111,12 +111,12 @@ Page {
                 text: fenster.tr("create")
                 width: 160
                 enabled: nameFeld.text.length > 0
-                onClicked: Briar.createIdentity(nameFeld.text, function(antwort) {
-                    if (antwort.error)
-                        fenster.fehler = antwort.error
-                    else
-                        fenster.zustand = antwort
-                })
+                onClicked: {
+                    // Wie bei Briar: der Name ist der erste Schritt, das
+                    // Konto entsteht erst nach dem Passwort.
+                    pageStack.push(Qt.resolvedUrl("SetupPasswordPage.qml"),
+                                   { "wunschname": nameFeld.text })
+                }
             }
         }
     }

@@ -27,6 +27,7 @@ DISTFILES += \
     qml/pages/AboutPage.qml \
     qml/pages/UnlockPage.qml \
     qml/pages/PasswordPage.qml \
+    qml/pages/SetupPasswordPage.qml \
     qml/cover/CoverPage.qml \
     rpm/harbour-briar.spec \
     harbour-briar.desktop \

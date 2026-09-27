@@ -22,26 +22,29 @@ use crate::crypto::{secretbox_decrypt, secretbox_encrypt};
 /// Steht am Anfang jeder verschluesselten Datei. Fehlt es, ist die Datei ein
 /// Klartext-JSON aus einer Fassung vor der Verschluesselung -- die wird
 /// weiterhin gelesen und beim naechsten Speichern mit Passwort umgestellt.
-pub const MAGIE: &[u8; 8] = b"BRIARTR1";
+pub const MAGIE: &[u8; 8] = b"BRIARTR2";
 
 const SALZ_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
+const MAC_BYTES: usize = 16;
+/// Der eingepackte Speicherschluessel: 32 Byte Schluessel plus Beglaubigung.
+const PAKET_BYTES: usize = 32 + MAC_BYTES;
 
 /// scrypt-Kosten. Briar kalibriert sie am Geraet; wir nehmen einen festen,
 /// fuer ein Telefon von 2011 noch tragbaren Wert und schreiben ihn mit, damit
 /// eine spaetere Fassung ihn erhoehen kann, ohne alte Dateien unlesbar zu
-/// machen. log_n = 14 heisst 16384 Runden, das sind auf dem N9 einige
-/// Sekunden -- einmal beim Entsperren, nicht bei jedem Speichern.
+/// machen.
 const LOG_N: u8 = 14;
 const R: u32 = 8;
 const P: u32 = 1;
 
+/// Ist diese Datei verschluesselt?
 pub fn ist_verschluesselt(rohdaten: &[u8]) -> bool {
     rohdaten.len() > MAGIE.len() && &rohdaten[..MAGIE.len()] == MAGIE
 }
 
 /// Aus Passwort und Salz einen Schluessel ableiten.
-fn schluessel(passwort: &str, salz: &[u8], log_n: u8, r: u32, p: u32)
+fn aus_passwort(passwort: &str, salz: &[u8], log_n: u8, r: u32, p: u32)
     -> Result<[u8; 32], String>
 {
     let parameter = scrypt::Params::new(log_n, r, p, 32)
@@ -52,33 +55,73 @@ fn schluessel(passwort: &str, salz: &[u8], log_n: u8, r: u32, p: u32)
     Ok(key)
 }
 
-/// Verschluesseln. Salz und Nonce sind je Aufruf frisch -- zweimal derselbe
-/// Inhalt ergibt nie dieselbe Datei.
-pub fn verschluesseln(klartext: &[u8], passwort: &str) -> Result<Vec<u8>, String> {
+/// Ein frischer Speicherschluessel. Er aendert sich nie wieder -- ein
+/// Passwortwechsel packt ihn nur neu ein.
+pub fn neuer_speicherschluessel() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&crate::util::random(32));
+    k
+}
+
+/// Den Speicherschluessel aus einer Datei holen. Das ist der Schritt, der ein
+/// Passwort prueft -- die Beglaubigung schlaegt bei einem falschen fehl.
+pub fn schluessel_holen(rohdaten: &[u8], passwort: &str) -> Result<[u8; 32], String> {
+    let (log_n, r, p, salz, paket, _, _) = zerlegen(rohdaten)?;
+    let wickel = aus_passwort(passwort, &salz, log_n, r, p)?;
+    // Das Paket hat seine eigene Nonce nicht noetig: der Wickelschluessel
+    // haengt schon an einem Salz, das nie wiederverwendet wird.
+    let klar = secretbox_decrypt(&wickel, &[0u8; NONCE_BYTES], &paket)
+        .ok_or_else(|| "falsches Passwort oder beschaedigte Datei".to_string())?;
+    if klar.len() != 32 {
+        return Err("beschaedigter Speicherschluessel".to_string());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&klar);
+    Ok(k)
+}
+
+/// Verschluesseln. Der Speicherschluessel wird mit dem Passwort eingepackt,
+/// der Inhalt mit dem Speicherschluessel -- wie bei Briar. Ein
+/// Passwortwechsel packt dann nur die 32 Byte neu ein und nicht den ganzen
+/// Speicher.
+pub fn verschluesseln(klartext: &[u8], passwort: &str, speicherschluessel: &[u8; 32])
+    -> Result<Vec<u8>, String>
+{
     let mut salz = [0u8; SALZ_BYTES];
     salz.copy_from_slice(&crate::util::random(SALZ_BYTES));
-    let mut nonce_bytes = [0u8; NONCE_BYTES];
-    nonce_bytes.copy_from_slice(&crate::util::random(NONCE_BYTES));
+    let mut nonce = [0u8; NONCE_BYTES];
+    nonce.copy_from_slice(&crate::util::random(NONCE_BYTES));
 
-    let key = schluessel(passwort, &salz, LOG_N, R, P)?;
-    let geheim = secretbox_encrypt(&key, &nonce_bytes, klartext);
+    let wickel = aus_passwort(passwort, &salz, LOG_N, R, P)?;
+    let paket = secretbox_encrypt(&wickel, &[0u8; NONCE_BYTES], speicherschluessel);
+    let geheim = secretbox_encrypt(speicherschluessel, &nonce, klartext);
 
-    let mut aus = Vec::with_capacity(8 + 1 + 8 + SALZ_BYTES + NONCE_BYTES + geheim.len());
+    let mut aus = Vec::with_capacity(
+        MAGIE.len() + 9 + SALZ_BYTES + PAKET_BYTES + NONCE_BYTES + geheim.len());
     aus.extend_from_slice(MAGIE);
     aus.push(LOG_N);
     aus.extend_from_slice(&R.to_be_bytes());
     aus.extend_from_slice(&P.to_be_bytes());
     aus.extend_from_slice(&salz);
-    aus.extend_from_slice(&nonce_bytes);
+    aus.extend_from_slice(&paket);
+    aus.extend_from_slice(&nonce);
     aus.extend_from_slice(&geheim);
     Ok(aus)
 }
 
-/// Entschluesseln. Ein falsches Passwort und eine verfaelschte Datei sind
-/// beide ein Fehler und nie ein stiller Ruecksturz auf einen leeren Zustand --
-/// XSalsa20-Poly1305 ist beglaubigt, eine geaenderte Datei faellt auf.
-pub fn entschluesseln(rohdaten: &[u8], passwort: &str) -> Result<Vec<u8>, String> {
-    let kopf = MAGIE.len() + 1 + 8 + SALZ_BYTES + NONCE_BYTES;
+/// Entschluesseln mit dem Passwort.
+pub fn entschluesseln(rohdaten: &[u8], passwort: &str) -> Result<(Vec<u8>, [u8; 32]), String> {
+    let schluessel = schluessel_holen(rohdaten, passwort)?;
+    let (_, _, _, _, _, nonce, geheim) = zerlegen(rohdaten)?;
+    let klar = secretbox_decrypt(&schluessel, &nonce, &geheim)
+        .ok_or_else(|| "beschaedigte Datei".to_string())?;
+    Ok((klar, schluessel))
+}
+
+type Zerlegt = (u8, u32, u32, [u8; SALZ_BYTES], Vec<u8>, [u8; NONCE_BYTES], Vec<u8>);
+
+fn zerlegen(rohdaten: &[u8]) -> Result<Zerlegt, String> {
+    let kopf = MAGIE.len() + 9 + SALZ_BYTES + PAKET_BYTES + NONCE_BYTES;
     if rohdaten.len() < kopf || !ist_verschluesselt(rohdaten) {
         return Err("keine verschluesselte Datei".to_string());
     }
@@ -89,15 +132,15 @@ pub fn entschluesseln(rohdaten: &[u8], passwort: &str) -> Result<Vec<u8>, String
     p += 4;
     let par_p = u32::from_be_bytes(rohdaten[p..p + 4].try_into().unwrap());
     p += 4;
-    let salz = &rohdaten[p..p + SALZ_BYTES];
+    let mut salz = [0u8; SALZ_BYTES];
+    salz.copy_from_slice(&rohdaten[p..p + SALZ_BYTES]);
     p += SALZ_BYTES;
-    let nonce = &rohdaten[p..p + NONCE_BYTES];
+    let paket = rohdaten[p..p + PAKET_BYTES].to_vec();
+    p += PAKET_BYTES;
+    let mut nonce = [0u8; NONCE_BYTES];
+    nonce.copy_from_slice(&rohdaten[p..p + NONCE_BYTES]);
     p += NONCE_BYTES;
-    let geheim = &rohdaten[p..];
-
-    let key = schluessel(passwort, salz, log_n, r, par_p)?;
-    secretbox_decrypt(&key, nonce, geheim)
-        .ok_or_else(|| "falsches Passwort oder beschaedigte Datei".to_string())
+    Ok((log_n, r, par_p, salz, paket, nonce, rohdaten[p..].to_vec()))
 }
 
 #[cfg(test)]
@@ -106,35 +149,46 @@ mod tests {
 
     #[test]
     fn hin_und_zurueck() {
+        let k = neuer_speicherschluessel();
         let inhalt = b"{\"identity\":{\"name\":\"Jolla\"}}";
-        let datei = verschluesseln(inhalt, "geheim").unwrap();
+        let datei = verschluesseln(inhalt, "geheim", &k).unwrap();
         assert!(ist_verschluesselt(&datei));
-        // Der Klartext darf nirgends mehr in der Datei stehen.
         assert!(datei.windows(5).all(|f| f != b"Jolla"));
-        assert_eq!(entschluesseln(&datei, "geheim").unwrap(), inhalt);
+        let (klar, k2) = entschluesseln(&datei, "geheim").unwrap();
+        assert_eq!(klar, inhalt);
+        assert_eq!(k2, k);
     }
 
     #[test]
     fn falsches_passwort_faellt_auf() {
-        let datei = verschluesseln(b"geheimer Inhalt", "richtig").unwrap();
+        let k = neuer_speicherschluessel();
+        let datei = verschluesseln(b"geheimer Inhalt", "richtig", &k).unwrap();
         assert!(entschluesseln(&datei, "falsch").is_err());
+        assert!(schluessel_holen(&datei, "falsch").is_err());
     }
 
     #[test]
     fn verfaelschte_datei_faellt_auf() {
-        let mut datei = verschluesseln(b"geheimer Inhalt", "geheim").unwrap();
+        let k = neuer_speicherschluessel();
+        let mut datei = verschluesseln(b"geheimer Inhalt", "geheim", &k).unwrap();
         let letzte = datei.len() - 1;
         datei[letzte] ^= 1;
         assert!(entschluesseln(&datei, "geheim").is_err());
     }
 
     #[test]
-    fn zweimal_dasselbe_ergibt_verschiedene_dateien() {
-        let a = verschluesseln(b"gleich", "geheim").unwrap();
-        let b = verschluesseln(b"gleich", "geheim").unwrap();
-        assert_ne!(a, b, "Salz oder Nonce wiederholen sich");
-        assert_eq!(entschluesseln(&a, "geheim").unwrap(),
-                   entschluesseln(&b, "geheim").unwrap());
+    fn passwortwechsel_behaelt_den_speicherschluessel() {
+        // Das ist der Punkt an Briars Aufbau: der Speicherschluessel aendert
+        // sich nie, nur seine Verpackung. Ein Wechsel packt 32 Byte neu ein
+        // und nicht den ganzen Speicher.
+        let k = neuer_speicherschluessel();
+        let alt = verschluesseln(b"Inhalt", "alt", &k).unwrap();
+        let geholt = schluessel_holen(&alt, "alt").unwrap();
+        let neu = verschluesseln(b"Inhalt", "neu", &geholt).unwrap();
+        let (klar, k2) = entschluesseln(&neu, "neu").unwrap();
+        assert_eq!(klar, b"Inhalt");
+        assert_eq!(k2, k, "der Speicherschluessel darf sich nicht aendern");
+        assert!(entschluesseln(&neu, "alt").is_err(), "altes darf nicht mehr gehen");
     }
 
     #[test]

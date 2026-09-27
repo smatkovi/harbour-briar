@@ -262,6 +262,12 @@ pub fn tor_default() -> bool {
 pub struct Store {
     pub path: PathBuf,
     pub state: State,
+    /// Der Speicherschluessel. Zufaellig erzeugt, aendert sich nie wieder --
+    /// das Passwort verpackt nur ihn. Genau so macht es Briar
+    /// (AccountManagerImpl.changePassword: den Schluessel mit dem alten
+    /// Passwort auspacken, mit dem neuen wieder einpacken), und deshalb
+    /// kostet ein Passwortwechsel 32 Byte statt den ganzen Speicher.
+    speicherschluessel: [u8; 32],
     /// Das Passwort, solange der Dienst laeuft. Es steht nie auf der Platte --
     /// aus ihm wird beim Speichern jedes Mal frisch mit scrypt der Schluessel
     /// abgeleitet. Ist es None, liegt der Speicher wie frueher im Klartext.
@@ -269,13 +275,29 @@ pub struct Store {
 }
 
 impl Store {
-    /// Ein Passwort setzen oder aendern. Der naechste Speichervorgang stellt
-    /// die Datei um; ein leeres Passwort hebt die Verschluesselung auf.
-    pub fn passwort_setzen(&mut self, passwort: &str) -> std::io::Result<()> {
-        self.passwort = if passwort.is_empty() {
+    /// Ein Passwort setzen, aendern oder -- mit leerer Zeichenkette --
+    /// aufheben.
+    ///
+    /// Ist schon eines gesetzt, muss das alte stimmen. Das ist keine
+    /// Foermlichkeit: sonst koennte jeder, der kurz an das entsperrte Geraet
+    /// kommt, das Passwort aendern und den Besitzer aussperren. Briar prueft
+    /// es an derselben Stelle, indem es den Speicherschluessel mit dem alten
+    /// Passwort auspackt.
+    pub fn passwort_setzen(&mut self, alt: Option<&str>, neu: &str) -> std::io::Result<()> {
+        if self.passwort.is_some() {
+            let stimmt = alt.map(|a| Some(a) == self.passwort.as_deref())
+                .unwrap_or(false);
+            if !stimmt {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "das alte Passwort stimmt nicht",
+                ));
+            }
+        }
+        self.passwort = if neu.is_empty() {
             None
         } else {
-            Some(passwort.to_string())
+            Some(neu.to_string())
         };
         self.save()
     }
@@ -327,6 +349,10 @@ impl Store {
         default_port: u16,
         passwort: Option<String>,
     ) -> std::io::Result<Store> {
+        // Der Speicherschluessel aus der Datei, falls sie verschluesselt war.
+        // Er aendert sich nie wieder -- ein Passwortwechsel packt nur ihn neu
+        // ein, wie bei Briar.
+        let mut gefundener_schluessel: Option<[u8; 32]> = None;
         let state = if path.exists() {
             let rohdaten = std::fs::read(path)?;
             let text = if crate::tresor::ist_verschluesselt(&rohdaten) {
@@ -336,9 +362,10 @@ impl Store {
                         "der Speicher ist verschluesselt, es fehlt das Passwort",
                     )
                 })?;
-                let klartext = crate::tresor::entschluesseln(&rohdaten, pw)
+                let (klartext, schluessel) = crate::tresor::entschluesseln(&rohdaten, pw)
                     .map_err(|e| std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied, e))?;
+                gefundener_schluessel = Some(schluessel);
                 String::from_utf8(klartext).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -378,6 +405,8 @@ impl Store {
             path: path.to_path_buf(),
             state,
             passwort,
+            speicherschluessel: gefundener_schluessel
+                .unwrap_or_else(crate::tresor::neuer_speicherschluessel),
         };
         if store.state.listen_port == 0 {
             store.state.listen_port = default_port;
@@ -417,7 +446,8 @@ impl Store {
         // Umstellung passiert damit beim ersten Speichern nach dem Setzen
         // eines Passworts, ohne eigenen Wanderungsschritt.
         let inhalt: Vec<u8> = match &self.passwort {
-            Some(pw) => crate::tresor::verschluesseln(text.as_bytes(), pw)
+            Some(pw) => crate::tresor::verschluesseln(
+                text.as_bytes(), pw, &self.speicherschluessel)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
             None => text.into_bytes(),
         };
@@ -584,7 +614,7 @@ mod tresor_tests {
 
         {
             let mut s = Store::open(&p, 7327).unwrap();
-            s.passwort_setzen("geheim").unwrap();
+            s.passwort_setzen(None, "geheim").unwrap();
         }
         // Nachher nicht mehr -- und die Portnummer steht nirgends im Klartext.
         let roh = std::fs::read(&p).unwrap();
@@ -604,7 +634,7 @@ mod tresor_tests {
         let p = pfad("falsch");
         {
             let mut s = Store::open(&p, 7327).unwrap();
-            s.passwort_setzen("richtig").unwrap();
+            s.passwort_setzen(None, "richtig").unwrap();
         }
         assert!(Store::open_mit_passwort(&p, 7327, "falsch").is_err());
         let _ = std::fs::remove_file(&p);
@@ -634,6 +664,58 @@ mod tresor_tests {
         }
         let modus = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(modus, 0o600, "Speicher stand auf {:o}", modus);
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod wechsel_tests {
+    use super::*;
+
+    fn pfad(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-wechsel-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn aendern_verlangt_das_alte_passwort() {
+        let p = pfad("aendern");
+        {
+            let mut s = Store::open(&p, 7327).unwrap();
+            s.state.listen_port = 4242;
+            s.passwort_setzen(None, "alt").unwrap();
+        }
+        {
+            let mut s = Store::open_mit_passwort(&p, 7327, "alt").unwrap();
+            // Ohne das alte geht es nicht -- sonst koennte jeder, der kurz
+            // an das entsperrte Geraet kommt, den Besitzer aussperren.
+            assert!(s.passwort_setzen(None, "neu").is_err());
+            assert!(s.passwort_setzen(Some("falsch"), "neu").is_err());
+            s.passwort_setzen(Some("alt"), "neu").unwrap();
+        }
+        assert!(Store::open_mit_passwort(&p, 7327, "alt").is_err());
+        let s = Store::open_mit_passwort(&p, 7327, "neu").unwrap();
+        assert_eq!(s.state.listen_port, 4242);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn aufheben_verlangt_das_alte_ebenfalls() {
+        let p = pfad("aufheben");
+        {
+            let mut s = Store::open(&p, 7327).unwrap();
+            s.passwort_setzen(None, "geheim").unwrap();
+        }
+        {
+            let mut s = Store::open_mit_passwort(&p, 7327, "geheim").unwrap();
+            assert!(s.passwort_setzen(None, "").is_err());
+            s.passwort_setzen(Some("geheim"), "").unwrap();
+            assert!(!s.verschluesselt());
+        }
+        let roh = std::fs::read(&p).unwrap();
+        assert!(!crate::tresor::ist_verschluesselt(&roh));
         let _ = std::fs::remove_file(&p);
     }
 }

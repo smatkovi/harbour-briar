@@ -73,6 +73,18 @@ function status(callback) {
     request("GET", "/status", null, callback)
 }
 
+// Antworten des Dienstes, die einem Menschen nichts sagen, in etwas
+// uebersetzen, das weiterhilft. "unknown request" heisst in der Praxis
+// immer dasselbe: der Dienst laeuft noch in einer aelteren Fassung als die
+// Oberflaeche und muss neu gestartet werden.
+function klartext(fehler) {
+    if (!fehler)
+        return ""
+    if (fehler.indexOf("unknown request") >= 0)
+        return "Der Dienst ist älter als die Oberfläche — bitte neu starten."
+    return fehler
+}
+
 // Entsperren. Der Dienst unterscheidet nach aussen nicht, ob das Passwort
 // falsch oder die Datei beschaedigt ist -- der Grund steht in seinem
 // Protokoll. Fuer die Oberflaeche ist beides "so nicht".
@@ -80,9 +92,35 @@ function unlock(password, callback) {
     request("POST", "/unlock", { password: password }, callback)
 }
 
+// Briars Staerkemass, eins zu eins: die Zahl der VERSCHIEDENEN Zeichen
+// geteilt durch zwoelf, gedeckelt bei 1 (PasswordStrengthEstimatorImpl,
+// STRONG_UNIQUE_CHARS = 12). Die Schwellen dort: 0 keins, 0,25 schwach,
+// 0,5 eher schwach, 0,75 eher stark, 1 stark. Briar laesst ein Passwort ab
+// 0,5 zu -- also ab sechs verschiedenen Zeichen.
+function passwordStrength(password) {
+    if (!password)
+        return 0
+    var gesehen = {}
+    var verschieden = 0
+    for (var i = 0; i < password.length; i++) {
+        var z = password.charAt(i)
+        if (!gesehen[z]) {
+            gesehen[z] = true
+            verschieden++
+        }
+    }
+    return Math.min(1, verschieden / 12)
+}
+
+// Ab hier laesst Briar ein Passwort zu (QUITE_WEAK).
+var PASSWORD_MIN_STRENGTH = 0.5
+
 // Passwort setzen, aendern oder -- mit leerer Zeichenkette -- entfernen.
-function setPassword(password, callback) {
-    request("POST", "/password", { password: password }, callback)
+// Ist schon eines gesetzt, muss das alte mitkommen: sonst koennte jeder, der
+// kurz an das entsperrte Geraet kommt, den Besitzer aussperren.
+function setPassword(oldPassword, password, callback) {
+    request("POST", "/password",
+            { old: oldPassword, password: password }, callback)
 }
 
 function createIdentity(name, callback) {

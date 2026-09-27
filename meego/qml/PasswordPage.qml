@@ -8,6 +8,7 @@ Page {
     id: seite
 
     property bool laeuft: false
+    property bool erfolg: false
     property string meldung: fenster.zustand && fenster.zustand.encrypted
                              ? fenster.tr("passwordIsSet")
                              : fenster.tr("passwordNotSet")
@@ -27,12 +28,15 @@ Page {
             return
         }
         seite.laeuft = true
-        Briar.setPassword(eins.text, function(antwort) {
+        Briar.setPassword(alt.text, eins.text, function(antwort) {
             seite.laeuft = false
             if (antwort.error) {
-                seite.meldung = antwort.error
+                seite.erfolg = false
+                seite.meldung = Briar.klartext(antwort.error)
                 return
             }
+            seite.erfolg = true
+            alt.text = ""
             eins.text = ""
             zwei.text = ""
             fenster.aktualisieren()
@@ -73,6 +77,17 @@ Page {
                 text: fenster.tr("passwordWarn")
             }
 
+            // Nur wenn schon eines gesetzt ist.
+            TextField {
+                id: alt
+                width: parent.width
+                placeholderText: fenster.tr("passwordOld")
+                echoMode: TextInput.Password
+                visible: fenster.zustand && fenster.zustand.encrypted
+                enabled: !seite.laeuft
+                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+            }
+
             TextField {
                 id: eins
                 width: parent.width
@@ -94,8 +109,9 @@ Page {
             Label {
                 width: parent.width
                 wrapMode: Text.Wrap
-                font.pixelSize: 16
-                color: "#a0a0a0"
+                horizontalAlignment: Text.AlignHCenter
+                font.pixelSize: 22
+                color: seite.erfolg ? "#4caf50" : "#ff6b6b"
                 text: seite.meldung
             }
 

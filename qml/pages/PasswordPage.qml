@@ -12,6 +12,9 @@ Page {
     allowedOrientations: Orientation.All
 
     property bool busy: false
+    // Steuert nur die Farbe der Rueckmeldung: eine kleine graue Zeile hat
+    // sich nicht von "nichts passiert" unterschieden.
+    property bool erfolg: false
     property string message: app.status && app.status.encrypted
                              ? app.tr("passwordIsSet") : app.tr("passwordNotSet")
 
@@ -23,12 +26,15 @@ Page {
             return
         }
         page.busy = true
-        Briar.setPassword(eins.text, function(answer) {
+        Briar.setPassword(alt.text, eins.text, function(answer) {
             page.busy = false
             if (answer.error) {
-                page.message = answer.error
+                page.erfolg = false
+                page.message = Briar.klartext(answer.error)
                 return
             }
+            page.erfolg = true
+            alt.text = ""
             eins.text = ""
             zwei.text = ""
             app.refresh()
@@ -66,6 +72,17 @@ Page {
                 text: app.tr("passwordWarn")
             }
 
+            // Nur wenn schon eines gesetzt ist. Briar prueft das an
+            // derselben Stelle, indem es den Speicherschluessel mit dem
+            // alten Passwort auspackt.
+            PasswordField {
+                id: alt
+                width: parent.width
+                label: app.tr("passwordOld")
+                visible: app.status && app.status.encrypted
+                enabled: !page.busy
+            }
+
             PasswordField {
                 id: eins
                 width: parent.width
@@ -84,8 +101,9 @@ Page {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                color: Theme.secondaryHighlightColor
-                font.pixelSize: Theme.fontSizeExtraSmall
+                horizontalAlignment: Text.AlignHCenter
+                color: page.erfolg ? Theme.highlightColor : Theme.errorColor
+                font.pixelSize: Theme.fontSizeMedium
                 text: page.message
             }
 

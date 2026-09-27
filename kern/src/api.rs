@@ -478,9 +478,10 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
         // die Verschluesselung auf -- das soll gehen, sonst waere ein
         // vergessenes Passwort bei noch laufendem Dienst eine Sackgasse.
         ("POST", "/password") => {
+            let alt = body["old"].as_str();
             let passwort = body["password"].as_str().unwrap_or("");
             let mut locked = store.lock().unwrap();
-            match locked.passwort_setzen(passwort) {
+            match locked.passwort_setzen(alt, passwort) {
                 Ok(()) => json!({"ok": true, "encrypted": locked.verschluesselt()}),
                 Err(e) => json!({"error": e.to_string()}),
             }
