@@ -135,6 +135,15 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
 
+    // Das Rendezvous laeuft in einem eigenen Faden: es taktet anders als der
+    // Abgleich (eine Minute, Aufgabe nach zwei Tagen) und darf ihn nicht
+    // aufhalten, wenn Tor gerade langsam ist.
+    let rv_store = Arc::clone(&shared);
+    std::thread::spawn(move || {
+        let node = Node::new(rv_store);
+        node.run_rendezvous(tor_port);
+    });
+
     let poll_store = Arc::clone(&shared);
     let takt = Arc::new(std::sync::Mutex::new(POLL_INTERVAL));
     let takt_poller = Arc::clone(&takt);

@@ -112,6 +112,23 @@ enum Recognised {
 }
 
 /// Handshake root key and our role for a pending contact.
+/// Die beiden Rendezvous-Saaten fuer einen schwebenden Kontakt: erst unsere,
+/// dann seine. Wer von beiden Alice ist, entscheidet derselbe Vergleich der
+/// Handschlagschluessel wie ueberall sonst.
+fn rendezvous_saaten(store: &Store, their_public_hex: &str) -> Option<([u8; 32], [u8; 32])> {
+    let identity = store.identity()?;
+    let their_public = key_from_hex(their_public_hex);
+    let our_private = key_from_hex(&identity.handshake_private);
+    let our_public = key_from_hex(&identity.handshake_public);
+    let static_master = derive_static_master_key(&their_public, &our_private, &our_public)?;
+    let rk = crate::rendezvous::rendezvous_key(&static_master);
+    Some(crate::rendezvous::own_and_peer_seed(
+        &rk,
+        TOR_TRANSPORT_ID,
+        is_alice(&their_public, &our_public),
+    ))
+}
+
 fn pending_keys(store: &Store, their_public_hex: &str) -> Option<(SecretKey, bool)> {
     let identity = store.identity()?;
     let their_public = key_from_hex(their_public_hex);
@@ -593,6 +610,93 @@ impl Node {
 
     /// Publishes the hidden service and accepts what comes through it.
     /// Without a Tor running on the device this simply does nothing.
+    /// Das Rendezvous: schwebende Kontakte treffen, von denen wir nur den
+    /// Link haben.
+    ///
+    /// Beide Seiten leiten aus dem gemeinsamen Geheimnis dieselben zwei
+    /// Saaten ab, machen daraus je einen versteckten Dienst und treffen sich
+    /// dort -- ohne dass je eine Adresse ausgetauscht wurde. Das ist der
+    /// einzige Weg, mit einem echten Briar einen Kontakt anzulegen: dessen
+    /// Oberflaeche bietet das Eintippen einer Adresse gar nicht an.
+    ///
+    /// Laeuft in einem eigenen Faden und im Minutentakt, wie Briars
+    /// RendezvousPoller. Nach zwei Tagen gilt ein schwebender Kontakt als
+    /// gescheitert und wird nicht mehr versucht.
+    pub fn run_rendezvous(&self, tor_port: u16) {
+        let mut veroeffentlicht: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        loop {
+            std::thread::sleep(Duration::from_millis(
+                crate::rendezvous::POLLING_INTERVAL_MS,
+            ));
+            let schwebende: Vec<(String, [u8; 32], [u8; 32])> = {
+                let store = self.store.lock().unwrap();
+                if !store.state.tor {
+                    continue;
+                }
+                let jetzt = crate::util::now_ms();
+                store
+                    .state
+                    .pending
+                    .iter()
+                    .filter(|p| {
+                        // Wer schon eine Adresse hat, braucht kein Treffen.
+                        p.onion.is_none()
+                            && p.address.is_none()
+                            && jetzt.saturating_sub(p.added)
+                                < crate::rendezvous::TIMEOUT_MS
+                    })
+                    .filter_map(|p| {
+                        let (eigene, fremde) =
+                            rendezvous_saaten(&store, &p.public_key)?;
+                        Some((p.public_key.clone(), eigene, fremde))
+                    })
+                    .collect()
+            };
+            if schwebende.is_empty() {
+                continue;
+            }
+            for (schluessel, eigene, fremde) in schwebende {
+                // Unseren Treffpunkt anmelden -- einmal je schwebendem
+                // Kontakt, danach laeuft er weiter.
+                if !veroeffentlicht.contains(&schluessel) {
+                    if let Some(mut tor) = tor::connect() {
+                        let blob = crate::rendezvous::private_key_blob(&eigene);
+                        match tor.publish(tor_port, Some(&blob)) {
+                            Ok(_) => {
+                                log("rendezvous: own meeting point published");
+                                veroeffentlicht.insert(schluessel.clone());
+                            }
+                            Err(e) => {
+                                log(&format!("rendezvous: cannot publish: {}", e));
+                                continue;
+                            }
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                // Und die Gegenseite anwaehlen. Sie ist erst da, wenn sie
+                // ihren Dienst ebenfalls angemeldet hat -- deshalb der Takt.
+                let ziel = format!("{}.onion", crate::rendezvous::onion(&fremde));
+                let index = {
+                    let store = self.store.lock().unwrap();
+                    store
+                        .state
+                        .pending
+                        .iter()
+                        .position(|p| p.public_key == schluessel)
+                };
+                if let Some(index) = index {
+                    match self.connect_pending_at(index, TOR_TRANSPORT_ID, &ziel) {
+                        Ok(()) => log("rendezvous: met"),
+                        Err(e) => log(&format!("rendezvous: not yet ({})", e)),
+                    }
+                }
+            }
+        }
+    }
+
     pub fn run_tor_listener(&self, tor_port: u16) {
         let data_dir = {
             let store = self.store.lock().unwrap();
@@ -825,6 +929,36 @@ impl Node {
     }
 
     /// Dials a pending contact and becomes its contact.
+    /// Wie `connect_pending`, aber mit einer Adresse, die nicht im Speicher
+    /// steht -- beim Rendezvous wird sie ja gerade erst ausgerechnet.
+    pub fn connect_pending_at(
+        &self,
+        index: usize,
+        transport_id: &str,
+        address: &str,
+    ) -> std::io::Result<()> {
+        let (alice, root) = {
+            let store = self.store.lock().unwrap();
+            let pending = store
+                .state
+                .pending
+                .get(index)
+                .ok_or_else(|| bad("no such pending contact"))?;
+            let (root, alice) = pending_keys(&store, &pending.public_key)
+                .ok_or_else(|| bad("no identity yet"))?;
+            (alice, root)
+        };
+        let conn = dial(transport_id, address)?;
+        let keys = derive_handshake_keys(transport_id, &root, current_time_period(), alice);
+        let peer_ip = match &conn {
+            Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
+            Conn::Bluetooth(_) => None,
+        };
+        let mut writer = StreamWriter::new(conn.try_clone()?, &keys, 0);
+        writer.flush()?;
+        self.finish_handshake(conn, transport_id, index, writer, None, alice, peer_ip)
+    }
+
     pub fn connect_pending(&self, index: usize, transport_id: &str) -> std::io::Result<()> {
         let (address, alice, root) = {
             let store = self.store.lock().unwrap();
