@@ -30,6 +30,16 @@ Nokia N950 (Harmattan, armv7):
 - Attachments up to 32 KB (images are scaled down first)
 - Tor: a statically built Tor 0.4.8.14 ships in the package; the daemon starts
   it, publishes a hidden service and reaches peers at their onion address
+- The store is encrypted with a password: scrypt over the password, then
+  XSalsa20-Poly1305 over a random store key (`kern/src/tresor.rs`). The app
+  asks for one while the identity is created — there is no way past it — and
+  asks again after every restart before it shows anything
+- Tor rendezvous: a contact can be added from the link alone, with no address
+  typed in anywhere. Built and checked against Briar's own values; a meeting
+  has not been watched happen yet, see "Not tested"
+- Bluetooth over SDP: the device announces a UUID, publishes its own SDP
+  record and looks the peer's channel up over SDP. Publishing works on the
+  Jolla only; channel 11 stays as the fallback for peers that announce no UUID
 - English and German, switchable in the menu; the choice lives in the daemon,
   so it applies to both interfaces and survives a restart
 
@@ -42,6 +52,23 @@ the Jolla's onion address without anyone typing it in.
 Not tested: the MeeGo interface has only been looked at by hand (no screenshot
 — the device sleeps), and the attachment path is verified byte for byte on the
 build machine but only exercised on the devices.
+
+Three things from 0.24 are built and measured, but not yet proven in use:
+
+- **The Tor rendezvous** agrees with Briar's own values byte for byte — the
+  seven `rv_*` vectors cover the key schedule, the Salsa20 stream, the onion
+  address and the key blob — and the poller runs. What nobody has watched
+  happen is a meeting itself: not between two of our own daemons, and not with
+  a real Briar.
+- **Our own SDP record**: on the Jolla `RegisterProfile` returns without an
+  error and the log says `SDP record published for <uuid>`. BlueZ rejects a
+  malformed UUID or an occupied object path, so that much is real. That the
+  record is also *found* from outside is not shown — that needs an SDP query
+  from a second device.
+- **Looking the peer's channel up** over SDP is exercised by unit tests against
+  a hand-written protocol descriptor, never against a real Briar.
+
+And one thing is known **not** to work with a real Briar: see the list below.
 
 ## What is Briar's, and what is not
 
@@ -57,16 +84,24 @@ Every row below is verified against reference bytes from `bramble-core` 1.5.20
 | Identifiers (author, group, message) | `kern/src/ids.rs` | `author_id`, `group_id`, `message_id` |
 | Handshake 0.1 and contact exchange | `kern/src/handshake.rs`, `exchange.rs` | `hs_master_*`, `ex_*` |
 | `briar://` links | `kern/src/ids.rs` | `link`, `link_pending_id` |
+| Tor rendezvous: key schedule, seeds, onion address, key blob | `kern/src/rendezvous.rs` | `rv_*` |
 | Sync protocol, private groups, attachments | `kern/src/sync.rs`, `groups.rs` | format read from the source |
 
 What this port does **differently**, and why:
 
-- **No Tor rendezvous for new contacts.** Briar finds a new contact over Tor.
-  Here one of the two sides enters the other's address once — on the LAN, over
-  Bluetooth, or as an onion address. After that the devices exchange addresses
-  by themselves.
-- **No SDP over Bluetooth.** Briar registers a UUID per device and looks up the
-  channel. Without a BlueZ binding this port uses a fixed RFCOMM channel (11).
+- **The private-group clients are not announced.** The versioning update lists
+  the messaging and the properties client and nothing else
+  (`kern/src/sync.rs`). JOIN and LEAVE go out by now, ABORT is written but
+  never sent, and announcing a client we cannot carry through is worse than
+  leaving it out. A real Briar keeps a group it has not been told about
+  invisible — it drops such messages and does not even acknowledge them — so a
+  group shared with Briar on Android cannot work. Groups between devices
+  running this port are unaffected.
+- **No SDP record on Harmattan.** The Jolla publishes one through BlueZ 5's
+  `ProfileManager1`; BlueZ 4 on the N9 and N950 offers a different interface
+  (`org.bluez.Service.AddRecord`) and that is not written yet. Those two
+  devices listen on channel 11 and are therefore invisible to a real Briar over
+  Bluetooth, whatever else works.
 - **No forums, no blogs, no introductions.**
 - **A QR code, but not Briar's BQP.** Briar exchanges a handshake secret
   through the code. Here the code carries the `briar://` link with the
@@ -80,8 +115,15 @@ What this port does **differently**, and why:
   same shape (transport, version, dictionary) through the outbox and are
   repeated until the other side confirms. That way a contact from before Tor
   still learns the onion address.
-- **Storage is a JSON file**, not an encrypted H2 database. The format is not
-  Briar's business — only the wire has to match.
+- **Storage is an encrypted file, not an encrypted H2 database.** Inside it is
+  JSON, sealed the way Briar seals its database key: scrypt over the password
+  (log N = 14, r = 8, p = 1), then XSalsa20-Poly1305 over a random store key
+  that never changes, so a new password rewrites 32 bytes instead of
+  everything (`kern/src/tresor.rs`, file version `BRIARTR2`). The format is not
+  Briar's business — only the wire has to match. A file written before the
+  encryption existed is still read as plain text and sealed the first time it
+  is saved with a password; the password can also be taken away again, and then
+  the file is plain text once more.
 
 ## Ways to reach a contact
 
@@ -92,6 +134,15 @@ What this port does **differently**, and why:
 | Tor | onion address | nothing — a static Tor ships in the package |
 
 If several are known they are tried in order: Wi-Fi, Bluetooth, Tor.
+
+If no address is known at all, the two sides meet over Tor instead. Both derive
+the same two seeds from the shared secret behind the links, each publishes a
+hidden service for its own seed and dials the other's; no address is ever
+exchanged, and the two onion addresses belong to nobody and never come back.
+Both sides need Tor switched on; it is retried once a minute and given up after
+two days, like Briar's `RendezvousPoller` (`kern/src/rendezvous.rs`). This is
+the only way a real Briar adds a contact — its interface has no field for an
+address at all.
 
 Tor ships with the package because none of these devices can install one:
 Sailfish has no Tor in its repositories and Harmattan's have been dead for
@@ -105,8 +156,9 @@ switched on.
 kern/       the daemon in Rust (briard), static against musl
   src/crypto.rs transport.rs stream.rs record.rs   Briar's foundation
   src/handshake.rs exchange.rs sync.rs groups.rs   the protocols
-  src/bt.rs tor.rs net.rs                          the transports
-  src/store.rs api.rs                              storage and interface
+  src/rendezvous.rs                                meeting without an address
+  src/bt.rs btprofile.rs tor.rs net.rs             the transports
+  src/store.rs tresor.rs entsperren.rs api.rs      storage and interface
 qml/        Silica interface (Sailfish OS)
 meego/      Qt 4.7 interface and Debian package (Harmattan)
 qml/Briar.js qml/Strings.js                        used by both

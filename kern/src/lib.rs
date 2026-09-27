@@ -3,8 +3,11 @@
 //!
 //! The wire formats are Briar's, byte for byte, and are checked against
 //! reference values dumped from bramble-core itself (see ../vectors). What is
-//! not Briar's: the storage format, and how a contact's address is found --
-//! Briar rendezvouses over Tor, this port is told the LAN address.
+//! not Briar's: the storage format -- which is its own business, and encrypted
+//! (`tresor.rs`). Finding a contact is Briar's again since 0.24: the
+//! rendezvous over Tor lives in `rendezvous.rs` and matches Briar's own values
+//! byte for byte. An address may still be typed in instead, which Briar has no
+//! field for.
 
 pub mod api;
 pub mod bdf;

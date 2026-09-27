@@ -6,10 +6,16 @@
 //! matters because the two devices have BlueZ 4 (Harmattan) and BlueZ 5
 //! (Sailfish) and nothing in common above the kernel.
 //!
-//! What is missing compared to Briar: SDP. Briar advertises a per-device
-//! UUID and looks up the channel for it. Registering an SDP record needs
-//! BlueZ, so this port uses one fixed channel instead and is told the peer's
-//! address, exactly like the LAN transport is told ip:port.
+//! The peer's channel is looked up over SDP, the way Briar expects it, and
+//! raw over L2CAP -- so even that needs no library and no D-Bus; it is the
+//! second half of this file. The fixed channel further down is only the
+//! fallback for a peer that announces no UUID, which means our own older
+//! releases.
+//!
+//! Our own SDP record is the one part that does need BlueZ, and it lives in
+//! `btprofile.rs` -- on Harmattan there is none, so a real Briar cannot find
+//! those two devices over Bluetooth. The peer's Bluetooth address still goes
+//! in by hand, exactly like the LAN transport is told ip:port.
 
 use std::io;
 use std::os::unix::io::FromRawFd;
@@ -18,8 +24,11 @@ use std::os::unix::net::UnixStream;
 const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_RFCOMM: libc::c_int = 3;
 
-/// The channel both sides use. Briar picks one per device and publishes it
-/// over SDP; without SDP a fixed number is the honest substitute.
+/// Der Kanal, auf dem wir immer lauschen. Briar waehlt je Geraet einen und
+/// veroeffentlicht ihn per SDP; das tun wir inzwischen auch (`btprofile.rs`,
+/// dort ohne Vorgabe, BlueZ sucht sich einen). Diese feste Nummer bleibt
+/// daneben stehen, damit unsere eigenen aelteren Fassungen uns weiter finden
+/// -- die suchen nicht per SDP.
 pub const CHANNEL: u8 = 11;
 
 /// Die UUID, unter der ein Geraet seinen Dienst anbietet.
@@ -28,7 +37,8 @@ pub const CHANNEL: u8 = 11;
 /// Kanal, sondern mit einer **zufaelligen UUID je Geraet**: sie wird als
 /// Transporteigenschaft `uuid` gemeldet, per SDP veroeffentlicht, und die
 /// Gegenseite sucht damit den Kanal (BluetoothConstants.PROP_UUID,
-/// UUID_BYTES = 16). Ein fester Kanal funktioniert nur im eigenen Kreis.
+/// UUID_BYTES = 16). Ein fester Kanal wuerde nur im eigenen Kreis reichen --
+/// darum dieser Weg.
 ///
 /// Briar erzeugt sie mit `UUID.nameUUIDFromBytes` aus 16 Zufallsbytes, also
 /// als Fassung 3. Wir wuerfeln eine der Fassung 4. Das ist der einzige
@@ -299,8 +309,9 @@ pub fn connect(address: &str, channel: u8) -> io::Result<UnixStream> {
 // --- SDP: den Kanal zu einer UUID finden ---------------------------------
 //
 // Briar veroeffentlicht seinen Dienst unter einer zufaelligen UUID und
-// erwartet, dass die Gegenseite den RFCOMM-Kanal per SDP nachschlaegt. Ein
-// fester Kanal wie unserer funktioniert nur im eigenen Kreis.
+// erwartet, dass die Gegenseite den RFCOMM-Kanal per SDP nachschlaegt. Genau
+// das steht hier. Der feste Kanal bleibt nur der Rueckfall fuer Gegenstellen,
+// die keine UUID melden.
 //
 // Gesprochen wird SDP roh ueber L2CAP auf PSM 1 -- dasselbe, was sdptool tut.
 // Der Weg ueber BlueZ' D-Bus waere umstaendlicher: dort gibt es keine

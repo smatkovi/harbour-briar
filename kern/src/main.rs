@@ -135,9 +135,6 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
 
-    // Das Rendezvous laeuft in einem eigenen Faden: es taktet anders als der
-    // Abgleich (eine Minute, Aufgabe nach zwei Tagen) und darf ihn nicht
-    // aufhalten, wenn Tor gerade langsam ist.
     // Den eigenen SDP-Eintrag veroeffentlichen, damit Briar uns ueber
     // Bluetooth findet: es sucht den Kanal ueber die gemeldete UUID und
     // findet ohne Eintrag gar nichts.

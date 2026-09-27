@@ -308,9 +308,12 @@ pub fn versioning_update_body(update_version: i64) -> Vec<u8> {
     // INVISIBLE)"). Bis 0.24.0 stand hier nur messaging; damit war das ganze
     // Adressgedaechtnis gegen echtes Briar wirkungslos, in beide Richtungen.
     //
-    // Die Gruppenklienten fehlen noch mit Absicht: sie kommen erst dazu,
-    // wenn JOIN, LEAVE und ABORT gebaut sind. Etwas anzusagen, das man nicht
-    // zu Ende kann, ist schlimmer als es wegzulassen.
+    // Die Gruppenklienten fehlen weiter mit Absicht: JOIN und LEAVE gehen
+    // inzwischen hinaus (api.rs), ABORT ist geschrieben (groups.rs), hat aber
+    // keinen Aufrufer. Etwas anzusagen, das man nicht zu Ende kann, ist
+    // schlimmer als es wegzulassen. Solange das so bleibt, kann eine Gruppe
+    // mit einem echten Briar nicht gehen -- so steht es auch in der README
+    // unter "What this port does differently".
     let eintrag = |id: &str, haupt: u32, neben: u32| {
         Bdf::List(vec![
             Bdf::Str(id.to_string()),
