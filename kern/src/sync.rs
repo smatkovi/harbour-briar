@@ -42,6 +42,21 @@ const ATTACHMENT: i64 = 1;
 /// message -- which is why Briar compresses images before sending them.
 pub const MAX_MESSAGE_BODY_LEN: usize = 32 * 1024;
 
+/// Briars Grenzen, in UTF-8-Bytes. Sie hier zu pruefen ist nicht Hoeflichkeit
+/// gegenueber der Gegenseite, sondern Selbstschutz:
+///
+/// * Der **Autorenname** steckt in der Autorenkennung. Ein zu langer wird von
+///   Briars Pruefer verworfen -- und heilen laesst sich das nicht, einen
+///   Umbenennungsweg gibt es nicht. Das ist der einzige Fehler hier, den man
+///   nicht mehr gutmachen kann.
+/// * Ein zu langer **Text** reisst nicht die Nachricht ab, sondern die
+///   Verbindung (SyncRecordReaderImpl). Und weil der Ausgangskorb
+///   Unquittiertes behaelt, stolpert danach jede weitere Verbindung an
+///   derselben Nachricht -- der Kontakt waere dauerhaft unerreichbar.
+pub const MAX_AUTHOR_NAME_LEN: usize = 50;
+pub const MAX_GROUP_NAME_LEN: usize = 100;
+pub const MAX_PRIVATE_MESSAGE_TEXT_LEN: usize = MAX_MESSAGE_BODY_LEN - 2048;
+
 /// The group in which two contacts exchange private messages.
 pub fn messaging_group_id(author_a: &SecretKey, author_b: &SecretKey) -> SecretKey {
     ids::contact_group_id(
@@ -386,4 +401,31 @@ pub fn versioning_group_id(author_a: &SecretKey, author_b: &SecretKey) -> Secret
         author_a,
         author_b,
     )
+}
+
+#[cfg(test)]
+mod laengen_tests {
+    use super::*;
+
+    #[test]
+    fn briars_grenzen_stimmen() {
+        // Nachgelesen in Briar 1.5.20:
+        //   AuthorConstants.MAX_AUTHOR_NAME_LENGTH = 50
+        //   PrivateGroupConstants.MAX_GROUP_NAME_LENGTH = 100
+        //   MessagingConstants.MAX_PRIVATE_MESSAGE_TEXT_LENGTH
+        //       = MAX_MESSAGE_BODY_LENGTH - 2048
+        //   SyncConstants.MAX_MESSAGE_BODY_LENGTH = 32 * 1024
+        assert_eq!(MAX_AUTHOR_NAME_LEN, 50);
+        assert_eq!(MAX_GROUP_NAME_LEN, 100);
+        assert_eq!(MAX_MESSAGE_BODY_LEN, 32 * 1024);
+        assert_eq!(MAX_PRIVATE_MESSAGE_TEXT_LEN, 32 * 1024 - 2048);
+    }
+
+    #[test]
+    fn zu_grosser_satz_wird_nicht_abgeschnitten() {
+        let mut aus = Vec::new();
+        let riesig = crate::record::Record::new(PROTOCOL_VERSION, MESSAGE, vec![0u8; 70000]);
+        assert!(crate::record::write_record(&mut aus, &riesig).is_err());
+        assert!(aus.is_empty(), "es darf gar nichts geschrieben worden sein");
+    }
 }

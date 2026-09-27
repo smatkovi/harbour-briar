@@ -1456,9 +1456,44 @@ impl Node {
                     // ihn beim ersten Start aus 32768..65535, eine feste 7327
                     // waere dort immer falsch. Ohne bekannten Port wird gar
                     // nichts gelernt.
-                    if state.address.is_none() {
-                        if let (Some(ip), Some(port)) = (peer_ip, state.port) {
-                            state.address = Some(format!("{}:{}", ip, port));
+                    //
+                    // HINZUFUEGEN, nicht zuweisen, und nicht nur bei leerem
+                    // Feld. Die beobachtete Absenderadresse ist die beste,
+                    // die es gibt -- durch einen beglaubigten Strom belegt,
+                    // und bei Briar deckungsgleich mit dem Lauschsockel, weil
+                    // es die ausgehende Verbindung daran bindet. Vorher
+                    // wurde sie nur bei leerem Feld gelernt: kam einmal eine
+                    // IPv6-Adresse herein, landete "fe80::...:7327" im Feld,
+                    // das parse_ip_port nie waehlen kann -- und weil das Feld
+                    // dann nicht mehr leer war, blockierte es das Lernen
+                    // einer brauchbaren IPv4-Adresse dauerhaft.
+                    if let (Some(ip), Some(port)) = (peer_ip, state.port) {
+                        if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+                            if reachable_by_a_contact(v4.octets()) {
+                                let eintrag = format!("{}:{}", v4, port);
+                                let schon = state
+                                    .address
+                                    .as_deref()
+                                    .map(|a| a.split(',').any(|e| e.trim() == eintrag))
+                                    .unwrap_or(false);
+                                if !schon {
+                                    // Nach vorne: die zuletzt erfolgreiche
+                                    // Adresse ist die aussichtsreichste.
+                                    state.address = Some(match state.address.take() {
+                                        Some(alt) if !alt.is_empty() => {
+                                            format!("{},{}", eintrag, alt)
+                                        }
+                                        _ => eintrag,
+                                    });
+                                    // Nicht unbegrenzt wachsen lassen: jeder
+                                    // Fehlversuch kostet drei Sekunden.
+                                    if let Some(a) = state.address.take() {
+                                        let gekuerzt: Vec<&str> =
+                                            a.split(',').take(6).collect();
+                                        state.address = Some(gekuerzt.join(","));
+                                    }
+                                }
+                            }
                         }
                     }
                 }

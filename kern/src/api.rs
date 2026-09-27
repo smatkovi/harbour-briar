@@ -174,6 +174,13 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
 
         ("POST", "/identity") => {
             let name = body["name"].as_str().unwrap_or("").trim().to_string();
+            // In UTF-8-Bytes, nicht in Zeichen -- Briar misst so, und ein
+            // Name mit Umlauten ist sonst laenger als er aussieht.
+            if name.len() > crate::sync::MAX_AUTHOR_NAME_LEN {
+                return json!({"error": format!(
+                    "Der Name ist zu lang ({} von hoechstens {} Byte). Er steckt                      in der Kennung und laesst sich spaeter nicht mehr aendern.",
+                    name.len(), crate::sync::MAX_AUTHOR_NAME_LEN)});
+            }
             if name.is_empty() {
                 return json!({"error": "name is empty"});
             }
@@ -251,6 +258,11 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
         ("POST", "/send") => {
             let contact_id = body["contact"].as_u64().unwrap_or(0) as u32;
             let text = body["text"].as_str().unwrap_or("").to_string();
+            if text.len() > crate::sync::MAX_PRIVATE_MESSAGE_TEXT_LEN {
+                return json!({"error": format!(
+                    "Die Nachricht ist zu lang ({} von hoechstens {} Byte).",
+                    text.len(), crate::sync::MAX_PRIVATE_MESSAGE_TEXT_LEN)});
+            }
             let file = body["file"].as_str().map(|s| s.to_string());
             if text.trim().is_empty() && file.is_none() {
                 return json!({"error": "message is empty"});
@@ -521,6 +533,11 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
 
         ("POST", "/group") => {
             let name = body["name"].as_str().unwrap_or("").trim().to_string();
+            if name.len() > crate::sync::MAX_GROUP_NAME_LEN {
+                return json!({"error": format!(
+                    "Der Gruppenname ist zu lang ({} von hoechstens {} Byte).",
+                    name.len(), crate::sync::MAX_GROUP_NAME_LEN)});
+            }
             if name.is_empty() {
                 return json!({"error": "the group needs a name"});
             }

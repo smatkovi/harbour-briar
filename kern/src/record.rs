@@ -24,6 +24,21 @@ impl Record {
 }
 
 pub fn write_record(out: &mut impl Write, r: &Record) -> std::io::Result<()> {
+    // Lieber gar nicht schreiben als falsch: `as u16` schnitt eine zu grosse
+    // Laenge stillschweigend ab, und der Satz kam als Unsinn bei der
+    // Gegenseite an. Die reisst daraufhin die Verbindung ab -- und weil der
+    // Ausgangskorb Unquittiertes behaelt, stolpert jede weitere Verbindung an
+    // derselben Nachricht. Der Kontakt waere dauerhaft unerreichbar.
+    if r.payload.len() > u16::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Satzrumpf zu gross: {} von hoechstens {} Byte",
+                r.payload.len(),
+                u16::MAX
+            ),
+        ));
+    }
     let mut header = [0u8; RECORD_HEADER_LEN];
     header[0] = r.protocol_version;
     header[1] = r.record_type;
