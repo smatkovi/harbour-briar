@@ -30,8 +30,26 @@ ApplicationWindow {
         })
     }
 
+    // Meldet der Dienst "locked", steht die Entsperrseite vor allem anderen.
+    property bool locked: false
+
+    function entsperrseiteZeigen() {
+        if (pageStack.currentPage
+                && pageStack.currentPage.objectName === "unlockPage")
+            return
+        pageStack.replace(Qt.resolvedUrl("pages/UnlockPage.qml"),
+                          { "objectName": "unlockPage" })
+    }
+
     function refresh() {
         Briar.status(function(answer) {
+            if (answer.locked) {
+                app.locked = true
+                app.lastError = ""
+                app.entsperrseiteZeigen()
+                return
+            }
+            app.locked = false
             if (answer.error) {
                 app.lastError = answer.error
                 // The daemon is gone -- start it again rather than leaving

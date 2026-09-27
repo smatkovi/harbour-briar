@@ -93,6 +93,10 @@ Page {
                 onClicked: app.toggleLanguage()
             }
             MenuItem {
+                text: app.tr("passwordMenu")
+                onClicked: pageStack.push(Qt.resolvedUrl("PasswordPage.qml"))
+            }
+            MenuItem {
                 text: app.tr("about")
                 onClicked: pageStack.push(Qt.resolvedUrl("AboutPage.qml"))
             }

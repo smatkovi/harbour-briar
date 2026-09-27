@@ -73,6 +73,18 @@ function status(callback) {
     request("GET", "/status", null, callback)
 }
 
+// Entsperren. Der Dienst unterscheidet nach aussen nicht, ob das Passwort
+// falsch oder die Datei beschaedigt ist -- der Grund steht in seinem
+// Protokoll. Fuer die Oberflaeche ist beides "so nicht".
+function unlock(password, callback) {
+    request("POST", "/unlock", { password: password }, callback)
+}
+
+// Passwort setzen, aendern oder -- mit leerer Zeichenkette -- entfernen.
+function setPassword(password, callback) {
+    request("POST", "/password", { password: password }, callback)
+}
+
 function createIdentity(name, callback) {
     request("POST", "/identity", { name: name }, callback)
 }

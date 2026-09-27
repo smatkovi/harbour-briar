@@ -41,6 +41,10 @@ Page {
                 onClicked: pageStack.push(Qt.resolvedUrl("LinkPage.qml"))
             }
             MenuItem {
+                text: fenster.tr("passwordMenu")
+                onClicked: pageStack.push(Qt.resolvedUrl("PasswordPage.qml"))
+            }
+            MenuItem {
                 text: fenster.tr("groups")
                 enabled: !!fenster.zustand.identity
                 onClicked: pageStack.push(Qt.resolvedUrl("GroupsPage.qml"))

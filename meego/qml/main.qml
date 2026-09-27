@@ -27,8 +27,26 @@ PageStackWindow {
                           function() { fenster.aktualisieren() })
     }
 
+    // Meldet der Dienst "locked", steht die Entsperrseite vor allem anderen.
+    property bool gesperrt: false
+
+    function entsperrseiteZeigen() {
+        if (pageStack.currentPage
+                && pageStack.currentPage.objectName === "entsperren")
+            return
+        pageStack.replace(Qt.resolvedUrl("UnlockPage.qml"),
+                          { "objectName": "entsperren" })
+    }
+
     function aktualisieren() {
         Briar.status(function(antwort) {
+            if (antwort.locked) {
+                fenster.gesperrt = true
+                fenster.fehler = ""
+                fenster.entsperrseiteZeigen()
+                return
+            }
+            fenster.gesperrt = false
             if (antwort.error) {
                 fenster.fehler = antwort.error
                 dienst.starten()
