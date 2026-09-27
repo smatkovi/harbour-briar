@@ -97,6 +97,19 @@ public:
         return QString();
     }
 
+    /// Wie decode(), raeumt die Datei danach aber weg. Der Sucher schiesst
+    /// alle anderthalb Sekunden ein Bild; ohne das Wegraeumen liefe der
+    /// Zwischenspeicher voll, und QML kann keine Datei loeschen.
+    Q_INVOKABLE QString decodeAndRemove(const QString &file)
+    {
+        const QString text = decode(file);
+        QString path = file;
+        if (path.startsWith(QLatin1String("file://")))
+            path = path.mid(7);
+        QFile::remove(path);
+        return text;
+    }
+
     // Dasselbe wie decode(), aber ohne Objekt -- die Kamera-Klasse liest so
     // das zuletzt aufgenommene Foto.
     static QString decodeStatic(const QString &file)

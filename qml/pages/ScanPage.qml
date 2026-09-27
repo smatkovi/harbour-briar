@@ -1,72 +1,87 @@
 import QtQuick 2.0
 import QtMultimedia 5.0
-import Amber.QrFilter 1.0
 import Sailfish.Silica 1.0
 import "../Briar.js" as Briar
 
-// Liest den QR-Code der Gegenseite laufend aus dem Sucherbild -- kein Foto,
-// kein Ausloesen. Der Filter gehoert zu Sailfish (qr-filter-qml-plugin) und
-// ist derselbe, den die Kamera-App benutzt; deren Fund laesst sich nicht
-// abgreifen, sie gibt ihn nicht heraus.
+// Liest den QR-Code der Gegenseite von selbst aus dem Sucherbild -- kein
+// Knopf, kein Ausloesen: alle anderthalb Sekunden ein Bild, gelesen wird es
+// hier.
+//
+// Gelesen wird mit unserem eigenen Leser (quirc, src/quirc), nicht mit
+// Sailfishs QrFilter auf dem Sucherstrom. Der Filter haengt am Videostrom und
+// hat an der Jolla nachgesehen nichts erkannt -- die Bilder kommen dort als
+// Textur aus dem Kamerastapel, und der Filter bekommt nichts Lesbares. Unser
+// Leser liest ein gespeichertes Bild, und das ist derselbe Weg, der am N9
+// zuverlaessig geht.
+//
+// Die Bilder wandern in den Zwischenspeicher und werden nach dem Lesen sofort
+// weggeraeumt (QrCode.decodeAndRemove), sonst laeuft er voll.
 Page {
     id: page
     allowedOrientations: Orientation.Portrait
 
     property string message: app.tr("scanLiveHint")
+    // Laeuft gerade ein Bild durch den Leser? Dann kein zweites schiessen.
     property bool busy: false
-
-    // Wie das Sucherbild gedreht wird. Der Sensor sitzt quer im Geraet, und
-    // wie weit, ist von Geraet zu Geraet verschieden; `camera.orientation`
-    // meldet es nicht ueberall verlaesslich. Darum ein Vorgabewert, den der
-    // Knopf unten weiterdreht -- einmal tippen, bis es aufrecht steht.
-    // Das Erkennen beruehrt das ohnehin nicht: der Filter liest den Code in
-    // jeder Lage, die Drehung ist fuers Auge.
-    //
-    // 0 und nicht -90: an der Jolla nachgesehen stand das Sucherbild mit -90
-    // um 90 Grad im Uhrzeigersinn verdreht. VideoOutput dreht bei positivem
-    // Wert gegen den Uhrzeigersinn, -90 hat das aufrechte Rohbild also erst
-    // gekippt. Bleibt es an einem anderen Geraet quer, hilft der Knopf.
-    property int drehung: 0
+    property int zaehler: 0
 
     Camera {
         id: camera
+        cameraState: Camera.ActiveState
+        captureMode: Camera.CaptureStillImage
         focus.focusMode: Camera.FocusContinuous
+
+        imageCapture {
+            onImageSaved: page.lesen(path)
+            onCaptureFailed: {
+                page.busy = false
+                page.message = app.tr("scanLiveHint")
+            }
+        }
     }
 
     VideoOutput {
-        id: view
         anchors { top: parent.top; left: parent.left; right: parent.right }
         height: parent.height - footer.height
         source: camera
         fillMode: VideoOutput.PreserveAspectFit
-        orientation: page.drehung
-        filters: [ qrLeser ]
     }
 
-    QrFilter {
-        id: qrLeser
-        active: !page.busy
-
-        onDecodeFinished: {
-            if (!result)
+    // Der Taktgeber. Nur wenn die Seite vorn ist und der Leser frei ist --
+    // sonst stapeln sich Aufnahmen, die niemand mehr braucht.
+    Timer {
+        interval: 1500
+        repeat: true
+        running: page.status === PageStatus.Active
+        onTriggered: {
+            if (page.busy || !camera.imageCapture.ready)
                 return
             page.busy = true
-            qrLeser.clearResult()
-            var found = Briar.qrParse(result)
-            if (!found || !found.link) {
-                // Ein Code, aber keiner von Briar -- weiterschauen statt
-                // stehenbleiben.
-                page.message = app.tr("scanNotBriar")
-                page.busy = false
-                return
-            }
-            pageStack.replace(Qt.resolvedUrl("AddContactPage.qml"), {
-                "prefillLink": found.link,
-                "prefillAddress": found.address,
-                "prefillBluetooth": found.bluetooth,
-                "prefillOnion": found.onion
-            })
+            page.zaehler++
+            camera.imageCapture.captureToLocation(
+                StandardPaths.temporary + "/briar-qr-" + page.zaehler + ".jpg")
         }
+    }
+
+    // Ein frisches Bild ist da: lesen, wegraeumen, entscheiden.
+    function lesen(pfad) {
+        var text = QrCode.decodeAndRemove(pfad)
+        page.busy = false
+        if (!text)
+            return
+        var found = Briar.qrParse(text)
+        if (!found || !found.link) {
+            // Ein Code, aber keiner von Briar -- weiterschauen statt
+            // stehenbleiben.
+            page.message = app.tr("scanNotBriar")
+            return
+        }
+        pageStack.replace(Qt.resolvedUrl("AddContactPage.qml"), {
+            "prefillLink": found.link,
+            "prefillAddress": found.address,
+            "prefillBluetooth": found.bluetooth,
+            "prefillOnion": found.onion
+        })
     }
 
     Column {
@@ -82,12 +97,6 @@ Page {
             color: Theme.secondaryColor
             font.pixelSize: Theme.fontSizeSmall
             text: page.message
-        }
-
-        Button {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: app.tr("turnPicture")
-            onClicked: page.drehung = (page.drehung + 90) % 360
         }
     }
 }

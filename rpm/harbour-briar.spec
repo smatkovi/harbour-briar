@@ -6,9 +6,6 @@ License:    GPLv3
 URL:        https://github.com/smatkovi/harbour-briar
 Source0:    %{name}-%{version}.tar.bz2
 Requires:   sailfishsilica-qt5 >= 0.10.9
-# Der QR-Leser auf dem Sucherbild; gehoert zum Kamera-Stack von Sailfish und
-# ist derselbe, den die Kamera-App benutzt.
-Requires:   qr-filter-qml-plugin
 BuildRequires:  pkgconfig(sailfishapp) >= 1.0.2
 BuildRequires:  pkgconfig(Qt5Core)
 BuildRequires:  pkgconfig(Qt5Qml)
