@@ -321,12 +321,20 @@ pub fn note_local_addresses(state: &mut crate::store::State) -> bool {
     neu
 }
 
+/// Was die Kontakte zu sehen bekommen: die zuletzt verteilte Liste. Sie
+/// aendert sich nur, wenn eine neue Adresse dazugekommen ist -- ein
+/// Umsortieren bleibt oertlich.
+fn veroeffentlichte(state: &crate::store::State) -> Vec<String> {
+    if state.lan_published.is_empty() {
+        state.lan_recent.clone()
+    } else {
+        state.lan_published.split(',').map(str::to_string).collect()
+    }
+}
+
 /// Sind ausser den LAN-Adressen keine anderen Eigenschaften dabei? Nur dann
 /// darf eine unveraenderte Adressliste das Melden verhindern -- eine neue
 /// Onion- oder Bluetooth-Adresse muss immer durch.
-fn properties_nur_lan(props: &BTreeMap<String, BTreeMap<String, String>>) -> bool {
-    props.len() == 1 && props.contains_key(LAN_TRANSPORT_ID)
-}
 
 fn local_properties(
     port: u16,
@@ -1194,27 +1202,32 @@ impl Node {
                 | note_local_addresses6(&mut store.state);
             let properties = local_properties(
                 store.state.listen_port,
-                &store.state.lan_recent,
+                &veroeffentlichte(&store.state),
                 &store.state.lan6_recent,
                 store.state.bluetooth,
                 store.state.tor_onion.clone(),
             );
-            // Nur verteilen, wenn sich an der Liste wirklich etwas geaendert
-            // hat. Ein Wechsel zwischen zwei schon bekannten Netzen sortiert
-            // nur um und bleibt fuer die Kontakte unsichtbar -- sonst laege
-            // bei jedem Netzwechsel eine neue Nachricht an jeden Kontakt im
-            // Ausgangskorb.
-            let liste = store.state.lan_recent.join(",");
-            let liste_neu = etwas_neu || liste != store.state.lan_published;
-            if liste_neu {
-                store.state.lan_published = liste;
+            // Nur wenn wirklich eine neue Adresse dazugekommen ist, aendert
+            // sich das, was die Kontakte zu sehen bekommen. Ein blosses
+            // Umsortieren zwischen zwei bekannten Netzen aendert nur die
+            // oertliche Liste -- genau so trennt Briar es auch
+            // (updateRecentAddresses ruft mergeLocalProperties nur im
+            // else-Zweig, also nur bei einer neuen Adresse).
+            //
+            // Frueher stand hier ein Gatter, das das Verteilen unterband.
+            // Das war falsch: lan_published ist global, run_sync laeuft je
+            // Kontakt -- der erste verbrauchte das "neu", und jeder weitere
+            // erfuhr die neue Adresse nie. Gegen unnoetiges Wiederholen
+            // schuetzt schon sent_properties, und das ist je Kontakt.
+            if etwas_neu {
+                store.state.lan_published = store.state.lan_recent.join(",");
             }
             let fingerprint = properties_fingerprint(&properties);
             let noch_nicht_gemeldet = store
                 .contact(contact_id)
                 .map(|c| c.sent_properties.as_deref() != Some(fingerprint.as_str()))
                 .unwrap_or(false);
-            if noch_nicht_gemeldet && (liste_neu || !properties_nur_lan(&properties)) {
+            if noch_nicht_gemeldet {
                 let our_author = store
                     .identity()
                     .map(|i| key_from_hex(&i.author_id))

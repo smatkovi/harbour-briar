@@ -17,7 +17,17 @@ pub const PRIORITY: u8 = 5;
 
 pub const MESSAGING_CLIENT_ID: &str = "org.briarproject.briar.messaging";
 pub const MESSAGING_MAJOR_VERSION: u32 = 0;
-pub const MESSAGING_MINOR_VERSION: u32 = 3;
+/// Absichtlich 2 und nicht 3.
+///
+/// Ab Nebenversion 3 sagt man zu, verschwindende Nachrichten zu koennen.
+/// Android nimmt das beim Wort, haengt seinen Nachrichten eine Zuenddauer an
+/// -- und wir behalten sie fuer immer, weil unser Leser das vierte
+/// Listenglied gar nicht ansieht. Eine Zusage, die man bricht, ist schlimmer
+/// als eine, die man nicht macht: der Absender glaubt, seine Nachricht sei
+/// verschwunden. Briar selbst sagt in genau dieser Lage 2 an
+/// (MessagingModule.java:71). Auf 3 gehoben wird erst, wenn das Auto-Loeschen
+/// wirklich gebaut ist.
+pub const MESSAGING_MINOR_VERSION: u32 = 2;
 pub const VERSIONING_CLIENT_ID: &str = "org.briarproject.bramble.versioning";
 pub const VERSIONING_MAJOR_VERSION: u32 = 0;
 pub const PROPERTIES_CLIENT_ID: &str = "org.briarproject.bramble.properties";
