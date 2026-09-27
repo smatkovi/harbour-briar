@@ -21,6 +21,7 @@ DISTFILES += \
     qml/pages/HelpPage.qml \
     qml/pages/MainPage.qml \
     qml/pages/ChatPage.qml \
+    qml/pages/AttachmentPage.qml \
     qml/pages/AddContactPage.qml \
     qml/pages/LinkPage.qml \
     qml/pages/ScanPage.qml \

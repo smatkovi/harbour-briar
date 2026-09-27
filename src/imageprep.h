@@ -15,6 +15,7 @@
 
 #include <QBuffer>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QObject>
@@ -26,6 +27,26 @@ class ImagePrep : public QObject
 
 public:
     explicit ImagePrep(QObject *parent = 0) : QObject(parent) {}
+
+    /**
+     * Der Text eines Anhangs, fuer den Betrachter in der App. QML kann keine
+     * Datei lesen, und hinausgeben wollen wir sie nicht: die Anhaenge liegen im
+     * Datenordner der App, der auf 0700 steht.
+     *
+     * Ein Anhang passt in eine Briar-Nachricht, ist also hoechstens 32 KiB
+     * gross; die Grenze hier ist bloss ein Riegel gegen eine verbogene Datei.
+     */
+    Q_INVOKABLE QString textOf(const QString &pfad, int maxBytes = 200000)
+    {
+        QString p = pfad;
+        if (p.startsWith(QLatin1String("file://")))
+            p = p.mid(7);
+        QFile datei(p);
+        if (!datei.open(QIODevice::ReadOnly))
+            return QString();
+        const QByteArray rohdaten = datei.read(maxBytes);
+        return QString::fromUtf8(rohdaten.constData(), rohdaten.size());
+    }
 
     /**
      * Returns a path that fits in maxBytes: the file itself when it is

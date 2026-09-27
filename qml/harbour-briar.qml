@@ -48,6 +48,18 @@ ApplicationWindow {
                           { "objectName": "unlockPage" })
     }
 
+    // Ein Konto ohne Passwort: das kennt Briar auf Android nicht, dort entsteht
+    // keines ohne. Hier kann es eines geben -- angelegt mit einer Fassung, die
+    // noch keines verlangte. Dann fragt die App beim Start danach und laesst
+    // nichts anderes zu, sonst liegt alles offen auf dem Geraet.
+    function passwortseiteZeigen() {
+        if (pageStack.currentPage
+                && pageStack.currentPage.objectName === "passwordSetup")
+            return
+        pageStack.replace(Qt.resolvedUrl("pages/SetupPasswordPage.qml"),
+                          { "objectName": "passwordSetup", "nurPasswort": true })
+    }
+
     function refresh() {
         Briar.status(function(answer) {
             if (answer.locked) {
@@ -65,6 +77,10 @@ ApplicationWindow {
             } else {
                 app.lastError = ""
                 app.status = answer
+                if (answer.identity && answer.encrypted === false) {
+                    app.passwortseiteZeigen()
+                    return
+                }
                 // The daemon keeps the choice, so a restart or the other
                 // front end finds the same language.
                 if (answer.language && answer.language !== Strings.language()) {

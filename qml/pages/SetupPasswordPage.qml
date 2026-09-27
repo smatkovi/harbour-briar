@@ -14,6 +14,11 @@ Page {
     property string wunschname: ""
     property bool busy: false
     property string message: ""
+    /// Nur das Passwort setzen: das Konto gibt es schon. Das ist der Fall, den
+    /// Briar auf Android nicht kennt -- dort entsteht kein Konto ohne Passwort.
+    /// Hier kann es eines geben, angelegt mit einer Fassung vor dem Passwort;
+    /// dann fragt die App beim Start danach und laesst nichts anderes zu.
+    property bool nurPasswort: false
 
     property real staerke: Briar.passwordStrength(eins.text)
 
@@ -29,6 +34,24 @@ Page {
             return
         }
         page.busy = true
+        function passwortSetzen() {
+            Briar.setPassword("", eins.text, function(zweite) {
+                page.busy = false
+                if (zweite.error) {
+                    page.message = Briar.klartext(zweite.error)
+                    return
+                }
+                app.refresh()
+                if (page.nurPasswort)
+                    pageStack.replace(Qt.resolvedUrl("MainPage.qml"))
+                else
+                    pageStack.pop()
+            })
+        }
+        if (page.nurPasswort) {
+            passwortSetzen()
+            return
+        }
         // Erst das Konto, dann sofort das Passwort -- bei Briar entsteht das
         // Konto ebenfalls erst am Ende dieses Schrittes.
         Briar.createIdentity(page.wunschname, function(answer) {
@@ -37,15 +60,7 @@ Page {
                 page.message = answer.error
                 return
             }
-            Briar.setPassword("", eins.text, function(zweite) {
-                page.busy = false
-                if (zweite.error) {
-                    page.message = Briar.klartext(zweite.error)
-                    return
-                }
-                app.refresh()
-                pageStack.pop()
-            })
+            passwortSetzen()
         })
     }
 
@@ -53,7 +68,10 @@ Page {
         width: parent.width
         spacing: Theme.paddingLarge
 
-        PageHeader { title: app.tr("setupPassword") }
+        PageHeader {
+            title: app.tr("setupPassword")
+            description: page.nurPasswort ? app.tr("passwordMissing") : ""
+        }
 
         Label {
             x: Theme.horizontalPageMargin

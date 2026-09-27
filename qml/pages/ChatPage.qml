@@ -141,6 +141,20 @@ Page {
                             picture.visible ? picture.width : 0,
                             other.visible ? other.implicitWidth : 0)
 
+                    // Ein Anhang laesst sich antippen und dann in der App
+                    // ansehen -- eigene ebenso wie empfangene. Aus der Hand
+                    // gegeben wird er dabei nicht: die Datei bleibt im
+                    // Datenordner, der auf 0700 steht.
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: !!modelData.attachmentPath
+                        onClicked: pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
+                            "pfad": modelData.attachmentPath,
+                            "typ": "" + modelData.attachmentType,
+                            "groesse": modelData.attachmentSize || 0
+                        })
+                    }
+
                     Image {
                         id: picture
                         visible: modelData.attachmentPath

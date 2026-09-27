@@ -101,6 +101,19 @@ Page {
                     width: liste.width - 48
                     spacing: 6
 
+                    // Antippen zeigt den Anhang in der App -- eigene ebenso
+                    // wie empfangene. Die Datei bleibt dabei im Datenordner.
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: modelData.attachmentPath !== undefined
+                                 && modelData.attachmentPath !== null
+                        onClicked: pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
+                            "pfad": modelData.attachmentPath,
+                            "typ": "" + modelData.attachmentType,
+                            "groesse": modelData.attachmentSize ? modelData.attachmentSize : 0
+                        })
+                    }
+
                     Image {
                         id: bild
                         visible: modelData.attachmentPath !== undefined
