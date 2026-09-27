@@ -64,6 +64,16 @@ pub struct TransportState {
     /// nicht fest.
     #[serde(default)]
     pub bt_uuid: Option<String>,
+    /// Die Adresse, unter der die Gegenseite bei UNS angekommen ist -- bei
+    /// Bluetooth ihre MAC aus dem angenommenen Sockel.
+    ///
+    /// Briar meldet sie dem Kontakt als `u:address` zurueck, weil ein Android
+    /// ab 8.0 seine eigene MAC nicht mehr lesen darf: es uebernimmt sie erst,
+    /// wenn die Mehrheit seiner Kontakte dieselbe zurueckmeldet
+    /// (AbstractBluetoothPlugin). Ohne diese Meldung hat ein solches Briar
+    /// keine Bluetooth-Adresse, und niemand kann es anwaehlen.
+    #[serde(default)]
+    pub gesehene_adresse: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -182,6 +192,18 @@ pub struct Contact {
     /// switched on, a new WLAN -- the announcement goes out again.
     #[serde(default)]
     pub sent_properties: Option<String>,
+    /// Die Fassungsnummer der letzten Adressmeldung an diesen Kontakt. Briar
+    /// laesst strikt die hoehere gewinnen und loescht eine Meldung mit
+    /// kleinerer Nummer (TransportPropertyManagerImpl) -- quittiert sie aber.
+    ///
+    /// Vorher stand hier die Uhrzeit. Wird die Uhr zurueckgestellt, und auf N9
+    /// und N950 laeuft sie ohne Zeitdienst, traegt jede weitere Meldung eine
+    /// kleinere Nummer: Briar behaelt die alte Adressliste, wir halten die neue
+    /// fuer zugestellt. Jetzt ist es ein Zaehler, der nie zurueckgeht -- und
+    /// weil er von der Uhr ausgeht, ist er auch groesser als alles, was frueher
+    /// schon hinausging.
+    #[serde(default)]
+    pub props_sent_version: u64,
     /// When the user last looked at this chat -- what came later counts as
     /// unread, and that is what a notification is raised for.
     #[serde(default)]

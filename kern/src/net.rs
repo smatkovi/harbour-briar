@@ -39,6 +39,11 @@ const MAX_CLOCK_DIFFERENCE: u64 = 24 * 60 * 60 * 1000;
 // der schlimmste Fall von fuenf vollen Wartezeiten auf wenige Sekunden.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wie lange auf das naechste Byte der Gegenseite gewartet wird, wenn wir schon
+/// alles geschrieben haben. Briar beendet seinen Strom nicht von selbst -- dass
+/// nichts mehr kommt, zeigt sich nur an der Ruhe. Kurz genug, dass eine Runde
+/// nicht haengt, lang genug fuer die Datenbankarbeit auf der anderen Seite.
+const RUHE: Duration = Duration::from_millis(1500);
 
 pub type Shared = Arc<Mutex<Store>>;
 
@@ -59,6 +64,14 @@ impl Conn {
         match self {
             Conn::Tcp(s) => Ok(Conn::Tcp(s.try_clone()?)),
             Conn::Bluetooth(s) => Ok(Conn::Bluetooth(s.try_clone()?)),
+        }
+    }
+
+    /// Nur die Lesegrenze umstellen, fuers Warten auf Ruhe.
+    fn set_read_timeout(&self, dauer: Duration) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => s.set_read_timeout(Some(dauer)),
+            Conn::Bluetooth(s) => s.set_read_timeout(Some(dauer)),
         }
     }
 
@@ -1031,7 +1044,14 @@ impl Node {
                     Ok((socket, address)) => {
                         failures = 0;
                         log(&format!("Bluetooth connection from {}", address));
-                        self.spawn_incoming(Conn::Bluetooth(socket), BLUETOOTH_TRANSPORT_ID, None);
+                        // Die MAC der Gegenseite wandert mit: wir melden sie ihr
+                        // als `u:address` zurueck, weil ein Android ab 8.0 seine
+                        // eigene nicht lesen darf.
+                        self.spawn_incoming(
+                            Conn::Bluetooth(socket),
+                            BLUETOOTH_TRANSPORT_ID,
+                            Some(address),
+                        );
                     }
                     Err(e) => {
                         failures += 1;
@@ -1480,14 +1500,34 @@ impl Node {
             } else {
                 alias.clone()
             };
+            // Nicht nur die Adresse: der Kontaktaustausch traegt bei Briar ALLE
+            // lokalen Eigenschaften mit (ContactExchangeManagerImpl), also auch
+            // den Lauschport, die Bluetooth-UUID und die link-lokalen
+            // IPv6-Adressen. Uebernahmen wir nur die Adresse, faellt Bluetooth
+            // zu einem Briar aus (ohne UUID findet man seinen RFCOMM-Kanal
+            // nicht, der ist nicht fest) und die beobachtete Absenderadresse
+            // laesst sich nicht vervollstaendigen -- bis zur ersten
+            // Eigenschaftsmeldung, und die reist ihrerseits langsam.
             let mut transports = BTreeMap::new();
             for (transport, address) in addresses {
+                let gemeldet = remote.properties.get(&transport);
+                let port = gemeldet
+                    .and_then(|w| w.get("port"))
+                    .and_then(|p| p.parse::<u16>().ok());
+                let ipv6 = gemeldet
+                    .and_then(|w| w.get("ipv6"))
+                    .map(|v| clean_ipv6_list(v))
+                    .filter(|v| !v.is_empty());
+                let bt_uuid = gemeldet.and_then(|w| w.get("uuid")).cloned();
                 transports.insert(
                     transport.clone(),
                     TransportState {
                         address: Some(address),
                         out_stream: 0,
                         in_stream: BTreeMap::new(),
+                        port,
+                        ipv6,
+                        bt_uuid,
                         ..Default::default()
                     },
                 );
@@ -1510,6 +1550,7 @@ impl Node {
                 versioning_version: 0,
                 last_seen: now_ms(),
                 sent_properties: None,
+                props_sent_version: 0,
                 last_read: 0,
             });
             store
@@ -1706,6 +1747,22 @@ impl Node {
             if etwas_neu {
                 store.state.lan_published = store.state.lan_recent.join(",");
             }
+            // Je Kontakt eine eigene Meldung: `u:address` ist seine Adresse,
+            // wie WIR sie gesehen haben, und die ist bei jedem anders. Briar
+            // haengt sie jeder Meldung an (TransportPropertyManagerImpl), weil
+            // ein Android ab 8.0 seine eigene MAC nicht lesen darf und sie erst
+            // uebernimmt, wenn die Mehrheit seiner Kontakte dasselbe meldet.
+            let mut properties = properties;
+            if let Some(gesehen) = store
+                .contact(contact_id)
+                .and_then(|c| c.transport(BLUETOOTH_TRANSPORT_ID))
+                .and_then(|t| t.gesehene_adresse.clone())
+            {
+                properties
+                    .entry(BLUETOOTH_TRANSPORT_ID.to_string())
+                    .or_default()
+                    .insert("u:address".to_string(), gesehen);
+            }
             let fingerprint = properties_fingerprint(&properties);
             let noch_nicht_gemeldet = store
                 .contact(contact_id)
@@ -1719,8 +1776,23 @@ impl Node {
                     c.outbox.retain(|m| m.group != group_hex);
                 }
                 let timestamp = now_ms();
+                // Die Fassungsnummer steigt, auch wenn die Uhr zurueckgeht:
+                // max(jetzt, vorige + 1). Briar verwirft eine Meldung mit
+                // kleinerer Nummer und quittiert sie trotzdem -- die alte
+                // Adressliste bliebe dort fuer immer stehen.
+                let fassung = {
+                    let vorige = store
+                        .contact(contact_id)
+                        .map(|c| c.props_sent_version)
+                        .unwrap_or(0);
+                    let neu = crate::groups::vorgerueckt(timestamp, vorige);
+                    if let Some(c) = store.contact_mut(contact_id) {
+                        c.props_sent_version = neu;
+                    }
+                    neu
+                };
                 for (transport, values) in &properties {
-                    let body = sync::properties_update_body(transport, timestamp as i64, values);
+                    let body = sync::properties_update_body(transport, fassung as i64, values);
                     let id = crate::ids::message_id(&properties_group, timestamp, &body);
                     store.queue(
                         contact_id,
@@ -1799,7 +1871,21 @@ impl Node {
             let body = from_hex(&message.body).unwrap_or_default();
             sync::write_message(&mut writer, &group, message.timestamp, &body)?;
         }
-        writer.send_end_of_stream()?;
+        // KEIN Stromende hier. Briar beendet seine ausgehende Sitzung nicht von
+        // selbst -- sie schreibt "until interrupted"
+        // (DuplexOutgoingSession.java:147-149) --, und unterbrochen wird sie von
+        // genau diesem Stromende: sobald Briars eingehende Sitzung es liest,
+        // ruft es interruptOutgoingSession, und danach kehrt jede
+        // Schreibaufgabe still zurueck, auch eine schon erzeugte.
+        //
+        // Wer also sofort das Ende schickt, wuergt der Gegenseite den Mund zu:
+        // Quittungen, Angebote und angeforderte Nachrichten bleiben liegen.
+        // Nachrichten von Briar kamen darum nur in Runden an, die Briar selbst
+        // eroeffnet hat, und eine angeforderte brauchte dafuer noch eine
+        // weitere.
+        //
+        // Jetzt: schreiben, lesen, antworten, dann das Ende.
+        writer.flush()?;
 
         // The peer's stream: if we dialled, its tag is still to come
         let mut raw_reader = conn.try_clone()?;
@@ -1824,7 +1910,13 @@ impl Node {
 
         let mut acked_ids: Vec<SecretKey> = Vec::new();
         let mut offered_ids: Vec<SecretKey> = Vec::new();
+        let mut requested_ids: Vec<SecretKey> = Vec::new();
         let mut received: Vec<(SecretKey, SecretKey, u64, Vec<u8>)> = Vec::new();
+        // Kurze Zeitgrenze fuer diese Phase: eine Gegenseite, die ihren Strom
+        // nicht beendet (genau das tut Briar), erkennt man nur an der Ruhe.
+        // Eine Fassung bis 0.27.1 schickt ihr Ende sofort, dort wartet also
+        // niemand.
+        let _ = conn.set_read_timeout(RUHE);
         loop {
             match read_record(&mut reader) {
                 Ok(Some(record)) => {
@@ -1836,6 +1928,10 @@ impl Node {
                         // Ein Angebot: die Gegenseite haelt diese Nachrichten
                         // bereit und schickt sie erst, wenn wir sie anfordern.
                         sync::OFFER => offered_ids.extend(sync::parse_ids(&record.payload)),
+                        // Eine Anforderung: sie will etwas, das wir ihr
+                        // angeboten haben. Das geht gleich in dieser Runde
+                        // hinaus, nicht erst in der naechsten.
+                        sync::REQUEST => requested_ids.extend(sync::parse_ids(&record.payload)),
                         sync::MESSAGE => {
                             if let Some((group, timestamp, body)) =
                                 ids::parse_raw_message(&record.payload)
@@ -1849,7 +1945,9 @@ impl Node {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    let ruhe = e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut;
+                    if ruhe || e.kind() == std::io::ErrorKind::UnexpectedEof {
                         break;
                     }
                     log(&format!("sync read stopped: {}", e));
@@ -1857,6 +1955,7 @@ impl Node {
                 }
             }
         }
+        let _ = conn.set_timeouts();
 
         // Menge statt Liste: ab jetzt laufen hier wirklich tausende Kennungen
         // durch, und darunter stehen Schleifen, die fuer jede Nachricht der
@@ -1866,6 +1965,7 @@ impl Node {
         let acked_now: std::collections::BTreeSet<String> =
             to_ack.iter().map(|id| to_hex(id)).collect();
         let mut new_messages = 0;
+        let nachgefordert: Vec<OutMessage>;
         {
             let mut store = self.store.lock().unwrap();
             if let Some(contact) = store.contact_mut(contact_id) {
@@ -1916,6 +2016,16 @@ impl Node {
                     .transport_mut(transport_id)
                     .in_stream
                     .insert(in_period.to_string(), in_stream_number + 1);
+                if transport_id == BLUETOOTH_TRANSPORT_ID {
+                    // Ihre MAC, wie wir sie gesehen haben. Sie geht mit der
+                    // naechsten Adressmeldung als `u:address` an sie zurueck.
+                    if let Some(gesehen) = peer_ip.as_ref() {
+                        let state = contact.transport_mut(BLUETOOTH_TRANSPORT_ID);
+                        if state.gesehene_adresse.as_deref() != Some(gesehen.as_str()) {
+                            state.gesehene_adresse = Some(gesehen.to_uppercase());
+                        }
+                    }
+                }
                 if transport_id == LAN_TRANSPORT_ID {
                     let state = contact.transport_mut(LAN_TRANSPORT_ID);
                     // Der Port kommt aus dem, was die Gegenseite gemeldet hat,
@@ -1934,7 +2044,7 @@ impl Node {
                     // das parse_ip_port nie waehlen kann -- und weil das Feld
                     // dann nicht mehr leer war, blockierte es das Lernen
                     // einer brauchbaren IPv4-Adresse dauerhaft.
-                    if let (Some(ip), Some(port)) = (peer_ip, state.port) {
+                    if let (Some(ip), Some(port)) = (peer_ip.as_ref(), state.port) {
                         if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
                             if reachable_by_a_contact(v4.octets()) {
                                 let eintrag = format!("{}:{}", v4, port);
@@ -1965,19 +2075,64 @@ impl Node {
                     }
                 }
             }
-            for (id, group, timestamp, body) in received {
-                if self.receive_message(&mut store, contact_id, &id, &group, timestamp, &body) {
+            for (id, group, timestamp, body) in &received {
+                if self.receive_message(&mut store, contact_id, id, group, *timestamp, body) {
                     new_messages += 1;
                 }
                 if let Some(contact) = store.contact_mut(contact_id) {
-                    let hex = to_hex(&id);
+                    let hex = to_hex(id);
                     if !contact.to_ack.contains(&hex) {
                         contact.to_ack.push(hex);
                     }
                 }
             }
+            // Was gleich hier quittiert wird, braucht in der Liste fuer die
+            // naechste Runde nicht zu stehen. Scheitert das Schreiben unten,
+            // schickt die Gegenseite es erneut -- eine doppelte Nachricht faengt
+            // die Entdoppelung ab.
+            if !received.is_empty() {
+                let jetzt_quittiert: std::collections::BTreeSet<String> =
+                    received.iter().map(|(id, ..)| to_hex(id)).collect();
+                if let Some(contact) = store.contact_mut(contact_id) {
+                    contact.to_ack.retain(|id| !jetzt_quittiert.contains(id));
+                }
+            }
+            // Angefordert heisst: sie will es jetzt. Aus dem Korb heraussuchen,
+            // was noch nicht in dieser Runde hinausging.
+            let schon_geschickt: std::collections::BTreeSet<String> =
+                to_send.iter().map(|m| m.id.clone()).collect();
+            nachgefordert = match store.contact(contact_id) {
+                Some(c) => requested_ids
+                    .iter()
+                    .map(|id| to_hex(id))
+                    .filter(|hex| !schon_geschickt.contains(hex))
+                    .filter_map(|hex| c.outbox.iter().find(|m| m.id == hex).cloned())
+                    .collect(),
+                None => Vec::new(),
+            };
             store.save()?;
         }
+
+        // Jetzt erst die Antwort in derselben Runde: die Quittungen fuer das,
+        // was gerade angekommen ist, und die angeforderten Nachrichten. Danach
+        // das Stromende -- damit beendet die Gegenseite ihre Sitzung.
+        if !received.is_empty() {
+            let kennungen: Vec<SecretKey> = received.iter().map(|(id, ..)| *id).collect();
+            sync::write_ack(&mut writer, &kennungen)?;
+        }
+        for message in &nachgefordert {
+            let group = key_from_hex(&message.group);
+            let body = from_hex(&message.body).unwrap_or_default();
+            sync::write_message(&mut writer, &group, message.timestamp, &body)?;
+        }
+        if !nachgefordert.is_empty() {
+            log(&format!(
+                "{} angeforderte Nachricht(en) in derselben Runde an Kontakt {}",
+                nachgefordert.len(),
+                contact_id
+            ));
+        }
+        writer.send_end_of_stream()?;
         log(&format!(
             "sync round with contact {} over {} done, {} new message(s)",
             contact_id,
@@ -2503,6 +2658,29 @@ impl Node {
             "contact {} accepted the invitation to group {}",
             contact_id, group_hex
         ));
+        // Jetzt, und nicht beim Einladen, geht der Verlauf der Gruppe an sie
+        // hinaus: vor der Zusage ist die Gruppe bei einem echten Briar
+        // unsichtbar, und was dort ankommt, wird verworfen und nicht quittiert.
+        // Beim Einladen eingereiht haette der Korb ihn in jeder Runde erneut
+        // geschickt.
+        let verlauf: Vec<OutMessage> = match store.group(&group_hex) {
+            Some(g) => g
+                .messages
+                .iter()
+                .map(|m| OutMessage {
+                    id: m.id.clone(),
+                    group: group_hex.clone(),
+                    timestamp: m.timestamp,
+                    body: m.body.clone(),
+                    acked: false,
+                    intern: false,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        for nachricht in verlauf {
+            store.queue(contact_id, nachricht);
+        }
         if !sind_wir_erstellerin {
             // Als Eingeladene ist das JOIN der Erstellerin nur die Nachricht,
             // dass sie die Gruppe jetzt mit uns teilt. Nichts zu tun.
@@ -3614,6 +3792,7 @@ mod versionsansage_tests {
             versioning_sent: String::new(),
             versioning_version: 0,
             sent_properties: None,
+            props_sent_version: 0,
             last_read: 0,
         }
     }
@@ -3713,6 +3892,7 @@ mod einladungsantwort_tests {
             versioning_sent: String::new(),
             versioning_version: 0,
             sent_properties: None,
+            props_sent_version: 0,
             last_read: 0,
         });
         store

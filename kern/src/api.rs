@@ -734,26 +734,15 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 s.einladungs_zeitstempel = timestamp;
                 s.zustand = crate::store::Sitzungszustand::Eingeladen;
             }
-            // The invited contact also needs every message the group already
-            // holds, once it joins.
-            let existing: Vec<OutMessage> = match locked.group(&group_hex) {
-                Some(g) => g
-                    .messages
-                    .iter()
-                    .map(|m| OutMessage {
-                        id: m.id.clone(),
-                        group: group_hex.clone(),
-                        timestamp: m.timestamp,
-                        body: m.body.clone(),
-                        acked: false,
-                        intern: false,
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
-            for message in existing {
-                locked.queue(contact_id, message);
-            }
+            // Den Verlauf der Gruppe bekommt die Eingeladene NICHT schon jetzt,
+            // sondern erst mit ihrer Zusage (net.rs, receive_einladung_join).
+            //
+            // Vorher ging er sofort hinaus. Bei einem echten Briar existiert die
+            // Gruppe vor der Zusage aber gar nicht, sie gilt als unsichtbar --
+            // und in einer unsichtbaren Gruppe wird jede Nachricht verworfen UND
+            // nicht quittiert. Der Korb haette also den ganzen Verlauf in jeder
+            // Runde erneut geschickt, bis sie zusagt, und fuer immer, wenn sie
+            // nie antwortet.
             if let Some(group) = locked.group_mut(&group_hex) {
                 if !group.contacts.contains(&contact_id) {
                     group.contacts.push(contact_id);
