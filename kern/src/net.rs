@@ -854,7 +854,7 @@ impl Node {
         }
     }
 
-    fn spawn_incoming(&self, conn: Conn, transport_id: &'static str, peer_ip: Option<String>) {
+    pub fn spawn_incoming(&self, conn: Conn, transport_id: &'static str, peer_ip: Option<String>) {
         let store = Arc::clone(&self.store);
         std::thread::spawn(move || {
             let node = Node { store };

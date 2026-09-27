@@ -9,6 +9,8 @@
 pub mod api;
 pub mod bdf;
 pub mod bt;
+#[cfg(feature = "dbus")]
+pub mod btprofile;
 pub mod crypto;
 pub mod exchange;
 pub mod groups;

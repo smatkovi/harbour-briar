@@ -138,6 +138,18 @@ fn main() {
     // Das Rendezvous laeuft in einem eigenen Faden: es taktet anders als der
     // Abgleich (eine Minute, Aufgabe nach zwei Tagen) und darf ihn nicht
     // aufhalten, wenn Tor gerade langsam ist.
+    // Den eigenen SDP-Eintrag veroeffentlichen, damit Briar uns ueber
+    // Bluetooth findet: es sucht den Kanal ueber die gemeldete UUID und
+    // findet ohne Eintrag gar nichts.
+    #[cfg(feature = "dbus")]
+    {
+        let bt_store = Arc::clone(&shared);
+        let uuid = bt_store.lock().unwrap().state.bt_uuid.clone();
+        if let Some(uuid) = uuid {
+            briarkern::btprofile::serve(Arc::clone(&bt_store), uuid);
+        }
+    }
+
     let rv_store = Arc::clone(&shared);
     std::thread::spawn(move || {
         let node = Node::new(rv_store);
