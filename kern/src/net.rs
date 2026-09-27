@@ -2100,7 +2100,7 @@ impl Node {
         }
 
         if *group == groups::invite_group_id(&our_author, &their_author) {
-            return self.receive_invite(store, contact_id, timestamp, body);
+            return self.receive_einladung(store, contact_id, id, timestamp, body);
         }
 
         let group_hex = to_hex(group);
@@ -2110,23 +2110,68 @@ impl Node {
         false
     }
 
+    /// Alles, was in der Einladungsgruppe ankommt. Bisher wurde nur INVITE
+    /// gelesen; JOIN, LEAVE und ABORT fielen durch -- quittiert und vergessen.
+    fn receive_einladung(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        id: &SecretKey,
+        timestamp: u64,
+        body: &[u8],
+    ) -> bool {
+        match groups::parse_einladung(body) {
+            Some(groups::Einladungsnachricht::Invite(invite)) => {
+                self.receive_invite(store, contact_id, id, timestamp, invite)
+            }
+            Some(groups::Einladungsnachricht::Join { gruppe, vorige }) => {
+                self.receive_einladung_join(store, contact_id, id, &gruppe, vorige)
+            }
+            Some(groups::Einladungsnachricht::Leave { gruppe, vorige }) => {
+                self.receive_einladung_leave(store, contact_id, id, &gruppe, vorige)
+            }
+            Some(groups::Einladungsnachricht::Abort { gruppe }) => {
+                log(&format!(
+                    "contact {} aborted the invitation for group {}",
+                    contact_id,
+                    to_hex(&gruppe)
+                ));
+                if let Some(s) = store.sitzung_mut(&to_hex(&gruppe), contact_id) {
+                    s.letzte_fremde = Some(to_hex(id));
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     fn receive_invite(
         &self,
         store: &mut Store,
         contact_id: u32,
+        id: &SecretKey,
         timestamp: u64,
-        body: &[u8],
+        invite: crate::groups::Invite,
     ) -> bool {
-        let invite = match groups::parse_invite(body) {
-            Some(i) => i,
-            None => return false,
-        };
         let creator_author_id = invite.creator.id();
         let group_id = groups::group_id(&invite.creator, &invite.group_name, &invite.salt);
         let our_author = match store.identity() {
             Some(i) => key_from_hex(&i.author_id),
             None => return false,
         };
+        let their_author = match store.contact(contact_id) {
+            Some(c) => c.author_id_bytes(),
+            None => return false,
+        };
+        // Briar prueft, dass die Einladende auch die Erstellerin ist
+        // (InviteeProtocolEngine.onRemoteInvite). Ohne die Pruefung koennte ein
+        // Kontakt eine Einladung weiterreichen, die jemand anderes fuer uns
+        // unterschrieben hat -- die Signatur passt ja, sie gilt fuer die
+        // Kontaktgruppe des Erstellers.
+        if creator_author_id != their_author {
+            log("an invitation named someone other than the sender as creator");
+            return false;
+        }
         if !groups::verify_invite_signature(
             &invite.creator.public_key,
             &creator_author_id,
@@ -2144,6 +2189,19 @@ impl Node {
         }
         let mut member_names = BTreeMap::new();
         member_names.insert(to_hex(&creator_author_id), invite.creator.name.clone());
+        // Die Kennung DIESER INVITE ist der Anker der Gegenseite: ihr JOIN
+        // wird sie als vorige Nachricht nennen, und jeder eigene Zeitstempel
+        // in dieser Sitzung muss echt ueber dem der Einladung liegen.
+        let mut einladungen = BTreeMap::new();
+        einladungen.insert(
+            contact_id,
+            crate::store::Einladungssitzung {
+                letzte_eigene: None,
+                letzte_fremde: Some(to_hex(id)),
+                eigener_zeitstempel: 0,
+                einladungs_zeitstempel: timestamp,
+            },
+        );
         store.state.groups.push(crate::store::PrivateGroup {
             id: group_hex,
             name: invite.group_name.clone(),
@@ -2159,6 +2217,7 @@ impl Node {
             last_read: 0,
             messages: Vec::new(),
             our_previous: None,
+            einladungen,
             einladung_previous: None,
             contacts: vec![contact_id],
         });
@@ -2166,6 +2225,147 @@ impl Node {
             "invited to the group \"{}\" by contact {}",
             invite.group_name, contact_id
         ));
+        true
+    }
+
+    /// Die Eingeladene hat zugesagt. Sind wir die Erstellerin, schickt Briar
+    /// jetzt sein eigenes JOIN, und erst damit stellt die Gegenseite die
+    /// Gruppe auf "geteilt" und laesst ihre Beitraege heraus
+    /// (InviteeProtocolEngine.onRemoteJoin -> SHARED). Die vorige Nachricht
+    /// darin ist unsere INVITE.
+    fn receive_einladung_join(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        id: &SecretKey,
+        gruppe: &SecretKey,
+        vorige: Option<SecretKey>,
+    ) -> bool {
+        let group_hex = to_hex(gruppe);
+        let unsere = match store.identity() {
+            Some(i) => key_from_hex(&i.author_id),
+            None => return false,
+        };
+        let ihre = match store.contact(contact_id) {
+            Some(c) => c.author_id_bytes(),
+            None => return false,
+        };
+        let (sind_wir_erstellerin, anker, schon_gesehen) = match store.group(&group_hex) {
+            Some(g) => {
+                let s = g.einladungen.get(&contact_id);
+                (
+                    g.creator_author_id == to_hex(&unsere),
+                    s.and_then(|s| s.letzte_eigene.clone()),
+                    s.and_then(|s| s.letzte_fremde.clone()) == Some(to_hex(id)),
+                )
+            }
+            None => return false,
+        };
+        // Briar bekommt das Entdoppeln von der Datenbank geschenkt: eine schon
+        // gespeicherte Nachricht wird nie zweimal ausgeliefert. Hier gibt es
+        // diese Schicht nicht -- geht eine Quittung verloren, kommt dasselbe
+        // JOIN wieder, und wir wuerden ein zweites eigenes JOIN schicken.
+        if schon_gesehen {
+            return true;
+        }
+        let genannt = vorige.map(|v| to_hex(&v));
+        if genannt != anker {
+            // Nur melden, nicht abbrechen. Briar schickt hier ABORT, aber die
+            // Fassungen, die schon im Feld laufen, fuehren die Kette je Gruppe
+            // und nennen darum manchmal eine fremde vorige Nachricht. Ein
+            // Abbruch wuerde laufende Gruppen zerschlagen.
+            log(&format!(
+                "the JOIN from contact {} names {:?} as previous, expected {:?}",
+                contact_id, genannt, anker
+            ));
+        }
+        if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+            s.letzte_fremde = Some(to_hex(id));
+        }
+        if !sind_wir_erstellerin {
+            // Als Eingeladene ist das JOIN der Erstellerin nur die Nachricht,
+            // dass sie die Gruppe jetzt mit uns teilt. Nichts zu tun.
+            return true;
+        }
+        let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
+        let zeitstempel = store
+            .sitzung(&group_hex, contact_id)
+            .map(|s| s.naechster_zeitstempel())
+            .unwrap_or_else(now_ms);
+        let rumpf = groups::einladung_join_body(
+            gruppe,
+            anker.as_deref().and_then(from_hex).as_deref(),
+        );
+        let kennung = to_hex(&crate::ids::message_id(
+            &einladungsgruppe,
+            zeitstempel,
+            &rumpf,
+        ));
+        store.queue(
+            contact_id,
+            OutMessage {
+                id: kennung.clone(),
+                group: to_hex(&einladungsgruppe),
+                timestamp: zeitstempel,
+                body: to_hex(&rumpf),
+                acked: false,
+            },
+        );
+        if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+            s.letzte_eigene = Some(kennung);
+            s.eigener_zeitstempel = zeitstempel;
+        }
+        if let Some(g) = store.group_mut(&group_hex) {
+            if !g.contacts.contains(&contact_id) {
+                g.contacts.push(contact_id);
+            }
+        }
+        log(&format!(
+            "contact {} accepted the invitation to group {}",
+            contact_id, group_hex
+        ));
+        true
+    }
+
+    /// Die Gegenseite verlaesst die Gruppe. Bisher blieb sie fuer uns Mitglied,
+    /// und wir schickten weiter Beitraege an jemanden, der nicht mehr zuhoert
+    /// -- genau das, was unser eigenes LEAVE der Gegenseite ersparen soll.
+    fn receive_einladung_leave(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        id: &SecretKey,
+        gruppe: &SecretKey,
+        vorige: Option<SecretKey>,
+    ) -> bool {
+        let group_hex = to_hex(gruppe);
+        let (anker, schon_gesehen) = match store.group(&group_hex) {
+            Some(g) => {
+                let s = g.einladungen.get(&contact_id);
+                (
+                    s.and_then(|s| s.letzte_eigene.clone()),
+                    s.and_then(|s| s.letzte_fremde.clone()) == Some(to_hex(id)),
+                )
+            }
+            None => return false,
+        };
+        if schon_gesehen {
+            return true;
+        }
+        let genannt = vorige.map(|v| to_hex(&v));
+        if genannt != anker {
+            log(&format!(
+                "the LEAVE from contact {} names {:?} as previous, expected {:?}",
+                contact_id, genannt, anker
+            ));
+        }
+        if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
+            s.letzte_fremde = Some(to_hex(id));
+        }
+        if let Some(g) = store.group_mut(&group_hex) {
+            g.contacts.retain(|c| *c != contact_id);
+        }
+        log(&format!("contact {} left the group {}", contact_id, group_hex));
         true
     }
 

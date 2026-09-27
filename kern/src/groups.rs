@@ -409,6 +409,58 @@ pub fn parse_invite(body: &[u8]) -> Option<Invite> {
     })
 }
 
+/// Was in der Einladungsgruppe ankommen kann. Bisher wurde alles ausser
+/// INVITE stillschweigend weggeworfen: net.rs rief nur `parse_invite`, und der
+/// Aufrufer quittiert die Nachricht trotzdem. Damit erfuhr die Einladende nie,
+/// dass zugesagt wurde, und niemand erfuhr, dass ein Mitglied gegangen ist.
+#[derive(Clone, Debug)]
+pub enum Einladungsnachricht {
+    Invite(Invite),
+    Join {
+        gruppe: SecretKey,
+        vorige: Option<SecretKey>,
+    },
+    Leave {
+        gruppe: SecretKey,
+        vorige: Option<SecretKey>,
+    },
+    Abort {
+        gruppe: SecretKey,
+    },
+}
+
+pub fn parse_einladung(body: &[u8]) -> Option<Einladungsnachricht> {
+    let list = crate::bdf::from_bytes(body).ok()?;
+    let items = list.as_list()?;
+    let art = items.first()?.as_int()?;
+    // Die Laengen stehen im GroupInvitationValidator: Klientenfassung 0.0 hat
+    // ein Glied weniger als 0.1, das den Loeschzeitgeber traegt. Wir lesen
+    // beide, denn eine Gegenstelle darf neuer sein als wir.
+    if art == INVITE {
+        return parse_invite(body).map(Einladungsnachricht::Invite);
+    }
+    if (art == EINLADUNG_JOIN || art == EINLADUNG_LEAVE)
+        && (items.len() == 3 || items.len() == 4)
+    {
+        let gruppe = raw32(&items[1])?;
+        let vorige = match &items[2] {
+            Bdf::Null => None,
+            other => Some(raw32(other)?),
+        };
+        return Some(if art == EINLADUNG_JOIN {
+            Einladungsnachricht::Join { gruppe, vorige }
+        } else {
+            Einladungsnachricht::Leave { gruppe, vorige }
+        });
+    }
+    if art == EINLADUNG_ABORT && items.len() == 2 {
+        return Some(Einladungsnachricht::Abort {
+            gruppe: raw32(&items[1])?,
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod einladung_tests {
     use super::*;
@@ -451,6 +503,56 @@ mod einladung_tests {
         let teile = liste.as_list().unwrap();
         assert_eq!(teile.len(), 2, "ABORT traegt keine vorige Nachricht");
         assert_eq!(teile[0].as_int(), Some(3));
+    }
+
+    #[test]
+    fn parse_einladung_liest_was_wir_schreiben() {
+        let gruppe = [7u8; 32];
+        let vorige = [9u8; 32];
+        // JOIN ohne vorige Nachricht: Null im dritten Glied.
+        match parse_einladung(&einladung_join_body(&gruppe, None)) {
+            Some(Einladungsnachricht::Join { gruppe: g, vorige: v }) => {
+                assert_eq!(g, gruppe);
+                assert!(v.is_none());
+            }
+            other => panic!("kein JOIN: {:?}", other),
+        }
+        // LEAVE mit Kette.
+        match parse_einladung(&einladung_leave_body(&gruppe, Some(&vorige))) {
+            Some(Einladungsnachricht::Leave { gruppe: g, vorige: v }) => {
+                assert_eq!(g, gruppe);
+                assert_eq!(v, Some(vorige));
+            }
+            other => panic!("kein LEAVE: {:?}", other),
+        }
+        match parse_einladung(&einladung_abort_body(&gruppe)) {
+            Some(Einladungsnachricht::Abort { gruppe: g }) => assert_eq!(g, gruppe),
+            other => panic!("kein ABORT: {:?}", other),
+        }
+        // Zu kurz, zu lang, und die Fassung 0.1 mit Loeschzeitgeber.
+        let kurz = crate::bdf::to_bytes(&Bdf::List(vec![
+            Bdf::Int(EINLADUNG_JOIN),
+            Bdf::Raw(gruppe.to_vec()),
+        ]));
+        assert!(parse_einladung(&kurz).is_none());
+        let lang = crate::bdf::to_bytes(&Bdf::List(vec![
+            Bdf::Int(EINLADUNG_JOIN),
+            Bdf::Raw(gruppe.to_vec()),
+            Bdf::Raw(vorige.to_vec()),
+            Bdf::Int(60_000),
+            Bdf::Int(1),
+        ]));
+        assert!(parse_einladung(&lang).is_none());
+        let mit_zeitgeber = crate::bdf::to_bytes(&Bdf::List(vec![
+            Bdf::Int(EINLADUNG_JOIN),
+            Bdf::Raw(gruppe.to_vec()),
+            Bdf::Raw(vorige.to_vec()),
+            Bdf::Int(60_000),
+        ]));
+        assert!(matches!(
+            parse_einladung(&mit_zeitgeber),
+            Some(Einladungsnachricht::Join { .. })
+        ));
     }
 
     #[test]

@@ -223,6 +223,44 @@ pub struct GroupPost {
     pub join: bool,
 }
 
+/// Eine Einladungssitzung, so wie Briar sie fuehrt: eine je KONTAKT und
+/// Gruppe. GroupInvitationManagerImpl sucht sie mit
+/// getSession(Kontaktgruppe, sessionId = Gruppenkennung) -- deshalb reicht ein
+/// Feld an der Gruppe nicht: die Kette zu Kontakt A und die zu Kontakt B sind
+/// zwei Ketten, und wer sie vermischt, nennt eine vorige Nachricht, die es in
+/// der anderen Kontaktgruppe nie gab.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Einladungssitzung {
+    /// Unsere letzte Nachricht in DIESER Sitzung -- Briars
+    /// lastLocalMessageId. JOIN und LEAVE tragen sie als drittes Listenglied.
+    #[serde(default)]
+    pub letzte_eigene: Option<String>,
+    /// Die letzte Nachricht, die von der Gegenseite kam --
+    /// lastRemoteMessageId. Briar prueft damit deren Kette
+    /// (AbstractProtocolEngine.isValidDependency); wir merken sie, um eine
+    /// doppelt gelieferte Nachricht zu erkennen und um sie melden zu koennen.
+    #[serde(default)]
+    pub letzte_fremde: Option<String>,
+    /// Zeitstempel unserer letzten eigenen Nachricht und der Einladung. Briar
+    /// setzt jeden neuen auf max(jetzt, groesserer + 1); eine Nachricht mit
+    /// kleinerem Stempel bricht die Sitzung der Gegenseite ab.
+    #[serde(default)]
+    pub eigener_zeitstempel: u64,
+    #[serde(default)]
+    pub einladungs_zeitstempel: u64,
+}
+
+impl Einladungssitzung {
+    /// Briars getTimestampForInvisibleMessage: nie kleiner oder gleich dem,
+    /// was in dieser Sitzung schon gesendet oder als Einladung empfangen
+    /// wurde. Auf N9 und N950 laeuft die Uhr ohne Zeitdienst, da traegt
+    /// now_ms() allein nicht.
+    pub fn naechster_zeitstempel(&self) -> u64 {
+        let untergrenze = self.eigener_zeitstempel.max(self.einladungs_zeitstempel);
+        crate::util::now_ms().max(untergrenze.saturating_add(1))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateGroup {
     pub id: String,
@@ -247,10 +285,16 @@ pub struct PrivateGroup {
     pub messages: Vec<GroupPost>,
     /// Our own last message in this group: the next one names it
     pub our_previous: Option<String>,
-    /// Die letzte Nachricht, die WIR in der Einladungsgruppe dieses Kontakts
-    /// geschrieben haben. Briar fuehrt damit eine Kette je Kontaktgruppe --
-    /// JOIN und LEAVE tragen sie als drittes Listenglied.
+    /// Je Kontakt eine Einladungssitzung, Schluessel ist die Kontaktnummer.
+    /// Bis Fassung 0.26 stand hier ein einziges `einladung_previous` fuer die
+    /// ganze Gruppe. Damit trugen die LEAVE an zwei Kontakte dieselbe vorige
+    /// Nachricht, und eines von beiden nennt eine Nachricht, die in jener
+    /// Kontaktgruppe nie vorkam -- Briar haelt es dann fuer immer zurueck.
     #[serde(default)]
+    pub einladungen: BTreeMap<u32, Einladungssitzung>,
+    /// Nur noch zum Lesen alter Dateien. Beim Oeffnen wandert der Inhalt in
+    /// `einladungen` (Speicherfassung 3) und wird nicht mehr geschrieben.
+    #[serde(default, skip_serializing)]
     pub einladung_previous: Option<String>,
     /// Contacts this group is synced with
     #[serde(default)]
@@ -328,7 +372,7 @@ pub struct State {
 }
 
 /// The newest layout this build knows.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// Transports are on unless switched off -- a state file written before a
 /// transport existed should not leave it disabled for ever.
@@ -533,6 +577,23 @@ impl Store {
                 contact.sent_properties = None;
             }
         }
+        // Fassung 2 fuehrte die Kette der Einladungsgruppe je Gruppe statt je
+        // (Kontakt, Gruppe). Was dort steht, kann nur aus der Sitzung mit dem
+        // Einladenden stammen: geschrieben wurde das Feld ausschliesslich auf
+        // dem Weg /group/join. Alles andere faengt bei Null an -- eine falsche
+        // vorige Nachricht ist schlimmer als keine, denn Briar wartet auf sie.
+        if store.state.state_version < 3 {
+            for group in store.state.groups.iter_mut() {
+                let vorige = group.einladung_previous.take();
+                if let (Some(kontakt), Some(vorige)) = (group.invited_by, vorige) {
+                    let stempel = group.invite_timestamp.unwrap_or(0);
+                    let sitzung = group.einladungen.entry(kontakt).or_default();
+                    sitzung.letzte_eigene = Some(vorige);
+                    sitzung.einladungs_zeitstempel = stempel;
+                    sitzung.eigener_zeitstempel = stempel;
+                }
+            }
+        }
         if store.state.state_version != STATE_VERSION {
             store.state.state_version = STATE_VERSION;
             let _ = store.save();
@@ -615,6 +676,21 @@ impl Store {
 
     pub fn group_mut(&mut self, id: &str) -> Option<&mut PrivateGroup> {
         self.state.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    pub fn sitzung(&self, group: &str, contact_id: u32) -> Option<&Einladungssitzung> {
+        self.group(group).and_then(|g| g.einladungen.get(&contact_id))
+    }
+
+    /// Legt die Sitzung bei Bedarf an -- aber nur fuer eine Gruppe, die es
+    /// wirklich gibt. Fuer eine unbekannte Gruppe darf nichts entstehen.
+    pub fn sitzung_mut(
+        &mut self,
+        group: &str,
+        contact_id: u32,
+    ) -> Option<&mut Einladungssitzung> {
+        self.group_mut(group)
+            .map(|g| g.einladungen.entry(contact_id).or_default())
     }
 
     pub fn add_message(&mut self, contact_id: u32, message: Message) -> bool {
@@ -723,6 +799,7 @@ mod gruppen_tests {
             last_read: 0,
             messages: posts,
             our_previous: vorher.map(|v| v.to_string()),
+            einladungen: BTreeMap::new(),
             einladung_previous: None,
             contacts: Vec::new(),
         }
@@ -746,6 +823,94 @@ mod gruppen_tests {
     fn ohne_nachrichten_null() {
         let g = gruppe(None, Vec::new());
         assert_eq!(g.vorgaenger_zeit(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wanderung_tests {
+    use super::*;
+
+    fn pfad(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-wanderung-test-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Eine Datei der Fassung 2 kennt nur `einladung_previous` an der Gruppe.
+    /// Beim Oeffnen muss daraus die Sitzung mit dem Einladenden werden, sonst
+    /// nennt das naechste LEAVE keine vorige Nachricht mehr -- und Briar
+    /// wartet dann auf eine, die nie kommt.
+    #[test]
+    fn alte_kette_wandert_in_die_sitzung() {
+        let p = pfad("kette");
+        let alt = r#"{
+            "identity": null,
+            "listen_port": 7327,
+            "state_version": 2,
+            "groups": [{
+                "id": "aa11",
+                "name": "Alte Gruppe",
+                "salt": "bb22",
+                "creator_name": "wer",
+                "creator_public": "cc33",
+                "creator_author_id": "dd44",
+                "joined": true,
+                "invited_by": 3,
+                "invite_timestamp": 1000,
+                "invite_signature": null,
+                "our_previous": null,
+                "einladung_previous": "ab12"
+            }]
+        }"#;
+        std::fs::write(&p, alt).unwrap();
+        let store = Store::open(&p, 7327).unwrap();
+        let sitzung = store.sitzung("aa11", 3).expect("Sitzung mit dem Einladenden");
+        assert_eq!(sitzung.letzte_eigene.as_deref(), Some("ab12"));
+        assert_eq!(sitzung.einladungs_zeitstempel, 1000);
+        assert_eq!(sitzung.eigener_zeitstempel, 1000);
+        // Das alte Feld wird nicht mehr geschrieben.
+        let roh = std::fs::read_to_string(&p).unwrap();
+        assert!(!roh.contains("einladung_previous"), "{}", roh);
+        assert!(
+            roh.replace(' ', "").contains("\"state_version\":3"),
+            "{}",
+            roh
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Zwei Kontakte, zwei Ketten: die beiden LEAVE duerfen nicht dieselbe
+    /// vorige Nachricht nennen. Genau das tat die Fassung bis 0.26.
+    #[test]
+    fn zwei_sitzungen_zwei_ketten() {
+        let aa = [0xaau8; 32];
+        let bb = [0xbbu8; 32];
+        let gruppe = [1u8; 32];
+        let rumpf_a = crate::groups::einladung_leave_body(&gruppe, Some(&aa));
+        let rumpf_b = crate::groups::einladung_leave_body(&gruppe, Some(&bb));
+        assert_ne!(rumpf_a, rumpf_b);
+        assert_eq!(
+            crate::groups::parse_einladung(&rumpf_a).is_some(),
+            true,
+            "eigener Rumpf muss lesbar sein"
+        );
+    }
+
+    /// Steht die Uhr hinter der Einladung, muss der naechste Zeitstempel
+    /// trotzdem darueber liegen -- N9 und N950 laufen ohne Zeitdienst.
+    #[test]
+    fn zeitstempel_steigt_auch_bei_stehender_uhr() {
+        let s = Einladungssitzung {
+            letzte_eigene: None,
+            letzte_fremde: None,
+            eigener_zeitstempel: 0,
+            einladungs_zeitstempel: u64::MAX / 2,
+        };
+        assert!(s.naechster_zeitstempel() > s.einladungs_zeitstempel);
+        // Und ohne alles gilt die Uhr.
+        let leer = Einladungssitzung::default();
+        assert!(leer.naechster_zeitstempel() > 1);
     }
 }
 

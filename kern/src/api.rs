@@ -603,6 +603,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 last_read: 0,
                 messages: Vec::new(),
                 our_previous: None,
+                einladungen: BTreeMap::new(),
                 einladung_previous: None,
                 contacts: Vec::new(),
             };
@@ -655,7 +656,21 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 Some(c) => c.author_id_bytes(),
                 None => return json!({"error": "no such contact"}),
             };
-            let timestamp = now_ms();
+            // Briar wirft hier ProtocolStateException: im Zustand INVITED ist
+            // eine zweite Einladung nicht erlaubt
+            // (CreatorProtocolEngine.onInviteAction). Sonst entsteht eine
+            // zweite Kette zum selben Kontakt, und er bekommt die ganze
+            // Gruppengeschichte noch einmal in die Warteschlange gelegt.
+            if let Some(s) = locked.sitzung(&group_hex, contact_id) {
+                if s.letzte_eigene.is_some() && s.letzte_fremde.is_none() {
+                    return json!({"error": "Die Einladung an diesen Kontakt ist noch offen."});
+                }
+            }
+            // Echt spaeter als alles, was in dieser Sitzung schon lief.
+            let timestamp = locked
+                .sitzung(&group_hex, contact_id)
+                .map(|s| s.naechster_zeitstempel())
+                .unwrap_or_else(now_ms);
             let signature = groups::invite_signature(
                 &seed,
                 &creator_author_id,
@@ -676,6 +691,16 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     acked: false,
                 },
             );
+            // Die Kennung DIESER INVITE ist der erste Anker der Kette zu
+            // DIESEM Kontakt: unser spaeteres JOIN nennt sie als vorige
+            // Nachricht (CreatorProtocolEngine.onRemoteAccept ->
+            // sendJoinMessage mit s.getLastLocalMessageId()). Bisher wurde sie
+            // berechnet und weggeworfen, und damit war die Kette kopflos.
+            if let Some(s) = locked.sitzung_mut(&group_hex, contact_id) {
+                s.letzte_eigene = Some(to_hex(&invite_id));
+                s.eigener_zeitstempel = timestamp;
+                s.einladungs_zeitstempel = timestamp;
+            }
             // The invited contact also needs every message the group already
             // holds, once it joins.
             let existing: Vec<OutMessage> = match locked.group(&group_hex) {
@@ -780,8 +805,8 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     .contact(einladender)
                     .map(|c| c.author_id_bytes());
                 let vorige = locked
-                    .group(&group_hex)
-                    .and_then(|g| g.einladung_previous.clone());
+                    .sitzung(&group_hex, einladender)
+                    .and_then(|s| s.letzte_eigene.clone());
                 if let Some(ihre) = ihre_kennung {
                     let einladungsgruppe = groups::invite_group_id(&author.id(), &ihre);
                     let rumpf = groups::einladung_join_body(
@@ -803,8 +828,12 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             acked: false,
                         },
                     );
-                    if let Some(g) = locked.group_mut(&group_hex) {
-                        g.einladung_previous = Some(kennung);
+                    // Fortschreiben in DER Sitzung, aus der die Kette kommt --
+                    // nicht an der Gruppe, wo sie sich mit anderen Kontakten
+                    // vermischt.
+                    if let Some(s) = locked.sitzung_mut(&group_hex, einladender) {
+                        s.letzte_eigene = Some(kennung);
+                        s.eigener_zeitstempel = timestamp;
                     }
                 }
             }
@@ -941,27 +970,37 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 None => (key_from_hex(&group_hex), Vec::new(), None),
             };
             if let Some(unsere) = eigene {
-                // Auch das LEAVE muss hinter der Einladung liegen, sonst
-                // bricht die Sitzung der Gegenseite ab statt unser Gehen zu
-                // verbuchen (CreatorProtocolEngine.onRemoteDecline,
-                // Zeile 219-220) -- und wir gelten dort weiter als Mitglied,
-                // genau das, was der Kommentar oben verhindern will.
-                // Eine selbst angelegte Gruppe hat keine Einladung, dann
-                // bleibt es bei der Uhr.
+                // Das LEAVE muss hinter der Einladung liegen, sonst bricht die
+                // Sitzung der Gegenseite ab statt unser Gehen zu verbuchen
+                // (CreatorProtocolEngine.onRemoteDecline) -- und wir gelten
+                // dort weiter als Mitglied, genau das, was der Kommentar oben
+                // verhindern will. Eine selbst angelegte Gruppe hat keine
+                // Einladung, dann bleibt es bei der Uhr.
                 let einladung_zeit = locked
                     .group(&group_hex)
                     .and_then(|g| g.invite_timestamp)
                     .unwrap_or(0);
-                let timestamp = groups::vorgerueckt(crate::util::now_ms(), einladung_zeit);
                 for kontakt in &kontakte {
                     let ihre = match locked.contact(*kontakt) {
                         Some(c) => c.author_id_bytes(),
                         None => continue,
                     };
                     let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
-                    let vorige = locked
-                        .group(&group_hex)
-                        .and_then(|g| g.einladung_previous.clone());
+                    // Jede Sitzung hat ihre eigene Kette und ihren eigenen
+                    // Zeitstempel. Vorher nahmen alle LEAVE dieselbe vorige
+                    // Nachricht -- sie stammte aus der Sitzung mit dem
+                    // Einladenden und kommt in der Kontaktgruppe der anderen
+                    // nicht vor. Briars Pruefer macht die vorige Nachricht zur
+                    // Vorbedingung (GroupInvitationValidator.validateLeave),
+                    // und die trifft dort nie ein: das LEAVE bliebe fuer immer
+                    // liegen.
+                    let (vorige, timestamp) = match locked.sitzung(&group_hex, *kontakt) {
+                        Some(s) => (s.letzte_eigene.clone(), s.naechster_zeitstempel()),
+                        None => (
+                            None,
+                            groups::vorgerueckt(crate::util::now_ms(), einladung_zeit),
+                        ),
+                    };
                     let rumpf = groups::einladung_leave_body(
                         &gruppen_id,
                         vorige.as_deref().and_then(|v| from_hex(v)).as_deref(),
