@@ -553,7 +553,9 @@ impl Node {
             // keins.
             {
                 let mut store = self.store.lock().unwrap();
-                if note_local_addresses(&mut store.state) {
+                let v4 = note_local_addresses(&mut store.state);
+                let v6 = note_local_addresses6(&mut store.state);
+                if v4 || v6 {
                     let _ = store.save();
                 }
             }

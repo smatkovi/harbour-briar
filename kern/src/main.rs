@@ -182,7 +182,9 @@ fn main() {
             // Runde es schon melden kann.
             {
                 let mut store = watch_store.lock().unwrap();
-                if briarkern::net::note_local_addresses(&mut store.state) {
+                let v4 = briarkern::net::note_local_addresses(&mut store.state);
+                let v6 = briarkern::net::note_local_addresses6(&mut store.state);
+                if v4 || v6 {
                     let _ = store.save();
                 }
             }
