@@ -11,7 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_API_PORT: u16 = 8105;
+// Der Taktgeber holt nicht immer gleich oft nach. Kommt keine Verbindung
+// zustande, waechst der Abstand von 60 s mit Faktor 1,2 bis hoechstens 600 s;
+// nach einer geglueckten Verbindung faellt er zurueck auf 60 s, und der
+// Netzwaechter setzt ihn ebenfalls zurueck. Briar macht es genauso
+// (LanTcpPluginFactory, backoff.reset() in TcpPlugin). Auf dem N9 ist das
+// kein Feinschliff, sondern Strom: ein Geraet ohne Gegenueber in Reichweite
+// weckt sich sonst jede Minute.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const POLL_INTERVAL_MAX: Duration = Duration::from_secs(600);
+const POLL_BACKOFF: f64 = 1.2;
 
 fn default_state_path() -> PathBuf {
     if let Ok(dir) = std::env::var("BRIAR_STATE_DIR") {
@@ -116,10 +125,20 @@ fn main() {
     });
 
     let poll_store = Arc::clone(&shared);
+    let takt = Arc::new(std::sync::Mutex::new(POLL_INTERVAL));
+    let takt_poller = Arc::clone(&takt);
     std::thread::spawn(move || loop {
-        std::thread::sleep(POLL_INTERVAL);
+        let abstand = *takt_poller.lock().unwrap();
+        std::thread::sleep(abstand);
         let node = Node::new(Arc::clone(&poll_store));
-        node.poll();
+        let erreicht = node.poll();
+        let mut abstand = takt_poller.lock().unwrap();
+        *abstand = if erreicht {
+            POLL_INTERVAL
+        } else {
+            let naechster = abstand.as_secs_f64() * POLL_BACKOFF;
+            Duration::from_secs_f64(naechster).min(POLL_INTERVAL_MAX)
+        };
     });
 
     // Der Netzwaechter. Er fragt nicht nach, er wartet: der Systembus
@@ -131,6 +150,7 @@ fn main() {
     #[cfg(feature = "dbus")]
     {
         let watch_store = Arc::clone(&shared);
+        let takt_waechter = Arc::clone(&takt);
         // Alle Adressen, nicht nur die vorderste: kommt das Tethering dazu,
         // aendert sich die vorderste vielleicht gar nicht, die Liste aber
         // schon -- und genau die wollen wir neu melden.
@@ -166,10 +186,22 @@ fn main() {
                     let _ = store.save();
                 }
             }
+            // Ein Netzwechsel ist der beste Grund, es sofort wieder zu
+            // versuchen: der Abstand faellt auf den Anfangswert zurueck.
+            *takt_waechter.lock().unwrap() = POLL_INTERVAL;
             let node = Node::new(Arc::clone(&watch_store));
             node.poll();
         });
     }
+
+    // Der IPv6-Lauscher laeuft daneben: link-lokal, eigener Faden, und wenn
+    // das Geraet kein IPv6 hat, meldet er das einmal und schweigt danach.
+    let v6_store = Arc::clone(&shared);
+    let v6_port = v6_store.lock().unwrap().state.listen_port;
+    std::thread::spawn(move || {
+        let node = Node::new(v6_store);
+        node.run_listener6(v6_port);
+    });
 
     let node = Node::new(shared);
     node.run_listener();

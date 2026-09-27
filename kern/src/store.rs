@@ -40,6 +40,12 @@ pub struct TransportState {
     /// eintreffende alte Meldung eine neuere ueberschreiben.
     #[serde(default)]
     pub props_version: u64,
+    /// Die link-lokalen IPv6-Adressen der Gegenseite, wie Briar sie meldet:
+    /// je 32 Hexzeichen der 16 Adressbytes, durch Komma getrennt, **ohne**
+    /// Port -- der kommt aus `port`. Der Zonenindex fehlt darin absichtlich;
+    /// ihn bestimmt die waehlende Seite aus ihren eigenen Schnittstellen.
+    #[serde(default)]
+    pub ipv6: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,6 +218,9 @@ pub struct State {
     /// keine Eigenschaftsmeldung an alle Kontakte ausloest.
     #[serde(default)]
     pub lan_published: String,
+    /// Dasselbe Gedaechtnis fuer die eigenen link-lokalen IPv6-Adressen.
+    #[serde(default)]
+    pub lan6_recent: Vec<String>,
     #[serde(default)]
     pub pending: Vec<PendingContact>,
     #[serde(default)]

@@ -409,7 +409,9 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             net::log(&format!("connecting to contact {} failed: {}", id, e));
                         }
                     }
-                    None => node.poll(),
+                    None => {
+                        node.poll();
+                    }
                 }
             });
             json!({"ok": true})

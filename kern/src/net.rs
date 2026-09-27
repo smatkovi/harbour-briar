@@ -331,6 +331,7 @@ fn properties_nur_lan(props: &BTreeMap<String, BTreeMap<String, String>>) -> boo
 fn local_properties(
     port: u16,
     recent: &[String],
+    recent6: &[String],
     bluetooth: bool,
     onion: Option<String>,
 ) -> BTreeMap<String, BTreeMap<String, String>> {
@@ -342,6 +343,12 @@ fn local_properties(
     // ist, und passt beim Heimkommen wieder.
     if !recent.is_empty() {
         lan.insert("ipPorts".to_string(), recent.join(","));
+    }
+    // IPv6 als eigene Eigenschaft, wie bei Briar: je 32 Hexzeichen, ohne
+    // Port -- der steht schon in "port". Der Zonenindex bleibt absichtlich
+    // weg, ihn bestimmt die waehlende Seite selbst.
+    if !recent6.is_empty() {
+        lan.insert("ipv6".to_string(), recent6.join(","));
     }
     props.insert(LAN_TRANSPORT_ID.to_string(), lan);
     if let Some(onion) = onion.filter(|o| !o.is_empty()) {
@@ -495,6 +502,32 @@ impl Node {
     /// giving up: the port can be busy for a moment after a restart (a
     /// socket in TIME_WAIT, an old daemon still dying), and a daemon without
     /// a listener is deaf until someone restarts it by hand.
+    /// Derselbe Dienst noch einmal fuer link-lokales IPv6. Scheitert das
+    /// Binden -- etwa weil der Kern ohne IPv6 laeuft --, bleibt es dabei und
+    /// der IPv4-Weg traegt allein.
+    pub fn run_listener6(&self, port: u16) {
+        let lauscher = match bind_listener6(port) {
+            Ok(l) => l,
+            Err(e) => {
+                log(&format!("no IPv6 listener on port {}: {}", port, e));
+                return;
+            }
+        };
+        log(&format!("listening on port {} over IPv6", port));
+        for socket in lauscher.incoming() {
+            match socket {
+                Ok(socket) => {
+                    let peer_ip = socket.peer_addr().ok().map(|a| a.ip().to_string());
+                    self.spawn_incoming(Conn::Tcp(socket), LAN_TRANSPORT_ID, peer_ip);
+                }
+                Err(e) => {
+                    log(&format!("IPv6 accept failed: {}", e));
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
     pub fn run_listener(&self) {
         let port = self.listen_port();
         let mut complained = false;
@@ -841,12 +874,13 @@ impl Node {
         };
         let their_handshake_public = key_from_hex(&their_public_hex);
         let (our_private, our_public, our_seed, our_name, our_signature_public,
-             port, recent, bluetooth, onion) = {
+             port, recent, recent6, bluetooth, onion) = {
             let mut store = self.store.lock().unwrap();
             // Beim Handschlag ebenfalls erst das Adressgedaechtnis
             // fortschreiben: der frische Kontakt soll sofort alle Netze
             // kennen, in denen wir zuletzt standen.
             note_local_addresses(&mut store.state);
+            note_local_addresses6(&mut store.state);
             let identity = store.identity().ok_or_else(|| bad("no identity yet"))?;
             (
                 key_from_hex(&identity.handshake_private),
@@ -856,6 +890,7 @@ impl Node {
                 key_from_hex(&identity.signature_public),
                 store.state.listen_port,
                 store.state.lan_recent.clone(),
+                store.state.lan6_recent.clone(),
                 store.state.bluetooth,
                 store.state.tor_onion.clone(),
             )
@@ -910,7 +945,7 @@ impl Node {
         let local = ContactInfo {
             name: our_name,
             public_key: our_signature_public.to_vec(),
-            properties: local_properties(port, &recent, bluetooth, onion),
+            properties: local_properties(port, &recent, &recent6, bluetooth, onion),
             timestamp: now_ms(),
         };
         let local_timestamp = local.timestamp;
@@ -1059,6 +1094,20 @@ impl Node {
                             address.push_str(&eintrag);
                         }
                     }
+                    // Die link-lokalen IPv6-Adressen kommen als Hex ohne Port
+                    // an; hier werden sie zu gewoehnlichen Kandidaten in
+                    // Klammerschreibweise, mit dem gemeldeten Port.
+                    if let Some(v6) = contact
+                        .transports
+                        .get(LAN_TRANSPORT_ID)
+                        .and_then(|t| t.ipv6.clone())
+                    {
+                        for hex in v6.split(',') {
+                            if let Some(ip) = ipv6_from_hex(hex) {
+                                address.push_str(&format!(",[{}]:{}", ip, port));
+                            }
+                        }
+                    }
                 }
             }
             address
@@ -1139,10 +1188,12 @@ impl Node {
             // -- a peer that was still running an older version when we first
             // announced them would otherwise never hear them again.
             // Erst das Gedaechtnis fortschreiben, dann daraus melden.
-            let etwas_neu = note_local_addresses(&mut store.state);
+            let etwas_neu = note_local_addresses(&mut store.state)
+                | note_local_addresses6(&mut store.state);
             let properties = local_properties(
                 store.state.listen_port,
                 &store.state.lan_recent,
+                &store.state.lan6_recent,
                 store.state.bluetooth,
                 store.state.tor_onion.clone(),
             );
@@ -1420,6 +1471,10 @@ impl Node {
                 // behaelt ihn; ohne ihn laesst sich weder eine gelernte
                 // Absenderadresse vervollstaendigen noch eine Hotspot-Adresse
                 // raten.
+                let gemeldete_v6 = values
+                    .get("ipv6")
+                    .map(|v| clean_ipv6_list(v))
+                    .filter(|v| !v.is_empty());
                 let gemeldeter_port = values
                     .get("port")
                     .and_then(|p| p.trim().parse::<u16>().ok())
@@ -1438,6 +1493,9 @@ impl Node {
                     }
                     if let Some(port) = gemeldeter_port {
                         entry.port = Some(port);
+                    }
+                    if let Some(v6) = gemeldete_v6 {
+                        entry.ipv6 = Some(v6);
                     }
                     if let Some(address) = address {
                         if entry.address.as_deref() != Some(address.as_str()) {
@@ -1677,7 +1735,9 @@ impl Node {
     }
 
     /// Tries every pending contact and every contact with an address.
-    pub fn poll(&self) {
+    /// Eine Runde. Gibt zurueck, ob dabei mindestens eine Verbindung
+    /// zustande kam -- der Taktgeber setzt daraufhin seinen Abstand zurueck.
+    pub fn poll(&self) -> bool {
         let (contacts, pending): (Vec<u32>, Vec<(usize, Vec<String>)>) = {
             let store = self.store.lock().unwrap();
             let pending = store
@@ -1705,12 +1765,14 @@ impl Node {
                 pending,
             )
         };
+        let mut erreicht = false;
         for (index, transports) in pending {
             let mut error = None;
             for transport in &transports {
                 match self.connect_pending(index, transport) {
                     Ok(()) => {
                         error = None;
+                        erreicht = true;
                         break;
                     }
                     Err(e) => error = Some(e.to_string()),
@@ -1725,10 +1787,12 @@ impl Node {
             }
         }
         for id in contacts {
-            if let Err(e) = self.reach_contact(id) {
-                log(&format!("contact {} not reachable: {}", id, e));
+            match self.reach_contact(id) {
+                Ok(()) => erreicht = true,
+                Err(e) => log(&format!("contact {} not reachable: {}", id, e)),
             }
         }
+        erreicht
     }
 }
 
@@ -1765,7 +1829,42 @@ fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
     // Zeitueberschreitungen, auf dem N9 spuerbare Sekunden. Briar siebt an
     // derselben Stelle.
     let eigene = local_nets();
+    let eigene6 = local_nets6();
     let mut last = bad("no reachable address");
+
+    // Zuerst die link-lokalen IPv6-Adressen: sie stehen in
+    // Klammerschreibweise in der Liste und brauchen einen Zonenindex, den die
+    // Gegenseite nicht mitliefern kann -- also wird jede eigene
+    // link-lokale Schnittstelle durchprobiert.
+    for eintrag in address.split(',').map(str::trim) {
+        let Some(rest) = eintrag.strip_prefix('[') else { continue };
+        let Some((ip_teil, port_teil)) = rest.split_once("]:") else { continue };
+        let Ok(ziel): Result<std::net::Ipv6Addr, _> = ip_teil.parse() else { continue };
+        let Ok(port) = port_teil.parse::<u16>() else { continue };
+        if port == 0 || !ipv6_link_local(&ziel) {
+            continue;
+        }
+        for (eigen, zone) in &eigene6 {
+            if *eigen == ziel {
+                continue;                   // das sind wir selbst
+            }
+            let kandidat = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                ziel, port, 0, *zone,
+            ));
+            let quelle = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                *eigen, 0, 0, *zone,
+            ));
+            match connect_bound(Some(quelle), kandidat, CONNECT_TIMEOUT) {
+                Ok(socket) => {
+                    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+                    socket.set_write_timeout(Some(IO_TIMEOUT))?;
+                    return Ok(Conn::Tcp(socket));
+                }
+                Err(err) => last = err,
+            }
+        }
+    }
+
     for (ziel, port) in address.split(',').filter_map(parse_ip_port) {
         // Nur Adressen, die ein Gegenueber im selben Netz haben kann -- und
         // nur solche, die zu einem unserer eigenen Netze praefixgleich sind.
@@ -1784,7 +1883,13 @@ fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
             continue;
         }
         let candidate = std::net::SocketAddr::from((ziel, port));
-        match TcpStream::connect_timeout(&candidate, CONNECT_TIMEOUT) {
+        // An die eigene Adresse in genau diesem Netz binden -- das Ergebnis
+        // des Siebs oben liegt dafuer schon vor.
+        let quelle = eigene
+            .iter()
+            .find(|(ip, prefix)| same_network(*ip, *prefix, ziel))
+            .map(|(ip, _)| std::net::SocketAddr::from((*ip, 0)));
+        match connect_bound(quelle, candidate, CONNECT_TIMEOUT) {
             Ok(socket) => {
                 socket.set_read_timeout(Some(IO_TIMEOUT))?;
                 socket.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -1794,6 +1899,283 @@ fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
         }
     }
     Err(last)
+}
+
+/// Ein Lauscher fuer link-lokales IPv6. Ausdruecklich nur IPv6: Linux macht
+/// einen `[::]`-Socket sonst zweistoeckig, und dann kollidiert er mit dem
+/// `0.0.0.0`-Socket auf demselben Port. std::net kann V6ONLY nicht setzen.
+fn bind_listener6(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use std::os::unix::io::FromRawFd;
+    let griff = unsafe {
+        libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+    };
+    if griff < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let lauscher = unsafe { std::net::TcpListener::from_raw_fd(griff) };
+    let an: libc::c_int = 1;
+    for (ebene, option) in [
+        (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+    ] {
+        let ok = unsafe {
+            libc::setsockopt(
+                griff,
+                ebene,
+                option,
+                &an as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ok != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let adresse = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+        std::net::Ipv6Addr::UNSPECIFIED,
+        port,
+        0,
+        0,
+    ));
+    let (zeiger, laenge) = sockaddr_bytes(&adresse);
+    if unsafe { libc::bind(griff, zeiger.as_ptr() as *const libc::sockaddr, laenge) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::listen(griff, 8) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(lauscher)
+}
+
+/// Briars Sieb fuer IPv6: **nur link-lokal** (`fe80::/10`). Standortlokale
+/// IPv6-Adressen gibt es nicht mehr, und eine globale wuerde dem Kontakt
+/// verraten, in welchem Netz man steht -- deshalb laesst Briar sie nicht zu.
+fn ipv6_link_local(ip: &std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] & 0xffc0 == 0xfe80
+}
+
+/// Die eigenen link-lokalen IPv6-Adressen mit ihrem Zonenindex.
+pub fn local_nets6() -> Vec<(std::net::Ipv6Addr, u32)> {
+    let mut found: Vec<(std::net::Ipv6Addr, u32)> = Vec::new();
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 {
+            return Vec::new();
+        }
+        let mut cur = list;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null()
+                || ifa.ifa_flags & libc::IFF_UP as u32 == 0
+                || ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0
+                || (*ifa.ifa_addr).sa_family != libc::AF_INET6 as libc::sa_family_t
+            {
+                continue;
+            }
+            let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+            let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            if !ipv6_link_local(&ip) {
+                continue;
+            }
+            if !found.iter().any(|(a, _)| *a == ip) {
+                found.push((ip, addr.sin6_scope_id));
+            }
+        }
+        libc::freeifaddrs(list);
+    }
+    found
+}
+
+/// Eine IPv6-Adresse als die 32 Hexzeichen, die Briar meldet.
+fn ipv6_hex(ip: &std::net::Ipv6Addr) -> String {
+    ip.octets().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Und zurueck. Alles, was keine 32 Hexzeichen sind, wird still verworfen.
+fn ipv6_from_hex(hex: &str) -> Option<std::net::Ipv6Addr> {
+    let hex = hex.trim();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    let ip = std::net::Ipv6Addr::from(bytes);
+    if ipv6_link_local(&ip) { Some(ip) } else { None }
+}
+
+/// Eine gemeldete IPv6-Liste saeubern: nur brauchbare Eintraege, Reihenfolge
+/// unangetastet.
+fn clean_ipv6_list(list: &str) -> String {
+    list.split(',')
+        .filter_map(|e| ipv6_from_hex(e).map(|ip| ipv6_hex(&ip)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Wie `note_local_addresses`, nur fuer IPv6.
+pub fn note_local_addresses6(state: &mut crate::store::State) -> bool {
+    let mut neu = false;
+    for (ip, _) in local_nets6().into_iter().rev() {
+        let eintrag = ipv6_hex(&ip);
+        if let Some(stelle) = state.lan6_recent.iter().position(|e| *e == eintrag) {
+            state.lan6_recent.remove(stelle);
+        } else {
+            neu = true;
+        }
+        state.lan6_recent.insert(0, eintrag);
+    }
+    // Ein Eintrag ist 32 Byte, mit Komma 33 -- es passen also drei.
+    while state.lan6_recent.len() > 1
+        && state.lan6_recent.join(",").len() > MAX_PROPERTY_LENGTH
+    {
+        state.lan6_recent.pop();
+    }
+    neu
+}
+
+/// Verbinden und dabei die eigene Quelladresse festlegen.
+///
+/// Warum nicht `TcpStream::connect_timeout`: das kann keine Quelladresse
+/// binden. Ohne sie waehlt der Kernel die Schnittstelle nach der Routentabelle
+/// -- auf einem Geraet mit aktiver Mobilfunkverbindung heisst das, dass ein
+/// Versuch ins WLAN womoeglich ueber das Mobilfunknetz hinausgeht und dort ins
+/// Leere laeuft. Briar loest dasselbe Problem auf Android mit der
+/// SocketFactory des WLAN-Netzes; auf Linux ist das Gegenstueck das Binden.
+///
+/// SOCK_CLOEXEC ist nicht kosmetisch: ein spaeter gestartetes Hilfsprogramm
+/// (Tor) wuerde den Griff sonst erben und festhalten.
+fn connect_bound(
+    local: Option<std::net::SocketAddr>,
+    ziel: std::net::SocketAddr,
+    frist: Duration,
+) -> std::io::Result<TcpStream> {
+    use std::os::unix::io::FromRawFd;
+
+    let familie = match ziel {
+        std::net::SocketAddr::V4(_) => libc::AF_INET,
+        std::net::SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    let griff = unsafe {
+        libc::socket(familie, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+    };
+    if griff < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Ab hier gehoert der Griff dem TcpStream, damit er auf jedem Rueckweg
+    // geschlossen wird -- auch auf den Fehlerwegen unten.
+    let strom = unsafe { TcpStream::from_raw_fd(griff) };
+
+    if let Some(quelle) = local {
+        let (zeiger, laenge) = sockaddr_bytes(&quelle);
+        let ok = unsafe {
+            libc::bind(griff, zeiger.as_ptr() as *const libc::sockaddr, laenge)
+        };
+        if ok != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    // Nicht blockierend verbinden und mit Frist warten: ein blockierendes
+    // connect() haengt sonst an der Zeitgrenze des Kernels, die deutlich
+    // laenger ist als unsere.
+    unsafe {
+        let flags = libc::fcntl(griff, libc::F_GETFL, 0);
+        libc::fcntl(griff, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let (zeiger, laenge) = sockaddr_bytes(&ziel);
+    let begonnen = unsafe {
+        libc::connect(griff, zeiger.as_ptr() as *const libc::sockaddr, laenge)
+    };
+    if begonnen != 0 {
+        let fehler = std::io::Error::last_os_error();
+        if fehler.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(fehler);
+        }
+        let mut schreiben: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe { libc::FD_ZERO(&mut schreiben) };
+        unsafe { libc::FD_SET(griff, &mut schreiben) };
+        let mut wartezeit = libc::timeval {
+            tv_sec: frist.as_secs() as libc::time_t,
+            tv_usec: frist.subsec_micros() as libc::suseconds_t,
+        };
+        let bereit = unsafe {
+            libc::select(
+                griff + 1,
+                std::ptr::null_mut(),
+                &mut schreiben,
+                std::ptr::null_mut(),
+                &mut wartezeit,
+            )
+        };
+        if bereit == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect timed out",
+            ));
+        }
+        if bereit < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // select() meldet auch einen gescheiterten Versuch als "schreibbar";
+        // der Grund steht in SO_ERROR.
+        let mut fehlernummer: libc::c_int = 0;
+        let mut groesse = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let gelesen = unsafe {
+            libc::getsockopt(
+                griff,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut fehlernummer as *mut _ as *mut libc::c_void,
+                &mut groesse,
+            )
+        };
+        if gelesen != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if fehlernummer != 0 {
+            return Err(std::io::Error::from_raw_os_error(fehlernummer));
+        }
+    }
+    unsafe {
+        let flags = libc::fcntl(griff, libc::F_GETFL, 0);
+        libc::fcntl(griff, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+    Ok(strom)
+}
+
+/// Eine Adresse in die Bytes, die bind()/connect() erwarten.
+fn sockaddr_bytes(adresse: &std::net::SocketAddr) -> (Vec<u8>, libc::socklen_t) {
+    match adresse {
+        std::net::SocketAddr::V4(v4) => {
+            let mut roh: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            roh.sin_family = libc::AF_INET as libc::sa_family_t;
+            roh.sin_port = v4.port().to_be();
+            roh.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            let groesse = std::mem::size_of::<libc::sockaddr_in>();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(&roh as *const _ as *const u8, groesse).to_vec()
+            };
+            (bytes, groesse as libc::socklen_t)
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let mut roh: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            roh.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            roh.sin6_port = v6.port().to_be();
+            roh.sin6_addr.s6_addr = v6.ip().octets();
+            // Der Zonenindex: ohne ihn weiss der Kernel bei einer
+            // link-lokalen Adresse nicht, ueber welche Schnittstelle.
+            roh.sin6_scope_id = v6.scope_id();
+            let groesse = std::mem::size_of::<libc::sockaddr_in6>();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(&roh as *const _ as *const u8, groesse).to_vec()
+            };
+            (bytes, groesse as libc::socklen_t)
+        }
+    }
 }
 
 /// Liegen zwei Adressen im selben Netz? Verglichen werden die ersten `prefix`
@@ -1920,5 +2302,42 @@ mod adress_tests {
         // Und es bleibt mehr als eine uebrig, sonst waere das Gedaechtnis
         // nutzlos.
         assert!(liste.len() >= 4, "nur {} Eintraege", liste.len());
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+
+    #[test]
+    fn nur_link_lokales_ipv6() {
+        assert!(ipv6_link_local(&"fe80::1".parse().unwrap()));
+        assert!(ipv6_link_local(&"febf::1".parse().unwrap()));
+        // Global und eindeutig-lokal laesst Briar nicht zu: eine globale
+        // Adresse verriete dem Kontakt, in welchem Netz man steht.
+        assert!(!ipv6_link_local(&"2001:db8::1".parse().unwrap()));
+        assert!(!ipv6_link_local(&"fc00::1".parse().unwrap()));
+        assert!(!ipv6_link_local(&"fec0::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn hex_hin_und_zurueck() {
+        let ip: std::net::Ipv6Addr = "fe80::215:5dff:fe01:203".parse().unwrap();
+        let hex = ipv6_hex(&ip);
+        assert_eq!(hex.len(), 32);
+        assert_eq!(ipv6_from_hex(&hex), Some(ip));
+        // Kaputtes wird still verworfen, nicht geraten.
+        assert_eq!(ipv6_from_hex("kurz"), None);
+        assert_eq!(ipv6_from_hex(&"z".repeat(32)), None);
+        // Eine globale Adresse kommt auch als Hex nicht durch.
+        let global: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(ipv6_from_hex(&ipv6_hex(&global)), None);
+    }
+
+    #[test]
+    fn ipv6_liste_wird_gesaeubert() {
+        let a = ipv6_hex(&"fe80::1".parse().unwrap());
+        let b = ipv6_hex(&"2001:db8::1".parse().unwrap());
+        assert_eq!(clean_ipv6_list(&format!("{},murks,{}", a, b)), a);
     }
 }
