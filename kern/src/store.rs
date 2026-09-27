@@ -59,6 +59,11 @@ pub struct TransportState {
     /// ihn bestimmt die waehlende Seite aus ihren eigenen Schnittstellen.
     #[serde(default)]
     pub ipv6: Option<String>,
+    /// Die Bluetooth-UUID der Gegenseite. Briar meldet sie als Eigenschaft
+    /// `uuid`; ohne sie findet man seinen RFCOMM-Kanal nicht, denn er ist
+    /// nicht fest.
+    #[serde(default)]
+    pub bt_uuid: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,6 +261,11 @@ pub struct State {
     /// Dasselbe Gedaechtnis fuer die eigenen link-lokalen IPv6-Adressen.
     #[serde(default)]
     pub lan6_recent: Vec<String>,
+    /// Unsere Bluetooth-UUID. Einmal gewuerfelt und dann behalten: die
+    /// Kontakte merken sie sich, und eine neue waere fuer sie ein neues
+    /// Geraet.
+    #[serde(default)]
+    pub bt_uuid: Option<String>,
     #[serde(default)]
     pub pending: Vec<PendingContact>,
     #[serde(default)]
@@ -443,6 +453,11 @@ impl Store {
             speicherschluessel: gefundener_schluessel
                 .unwrap_or_else(crate::tresor::neuer_speicherschluessel),
         };
+        // Einmal wuerfeln und behalten -- eine neue UUID waere fuer die
+        // Kontakte ein neues Geraet.
+        if store.state.bt_uuid.is_none() {
+            store.state.bt_uuid = Some(crate::bt::random_uuid());
+        }
         if store.state.listen_port == 0 {
             store.state.listen_port = default_port;
         }

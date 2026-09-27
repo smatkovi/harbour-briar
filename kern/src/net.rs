@@ -358,6 +358,7 @@ fn local_properties(
     recent: &[String],
     recent6: &[String],
     bluetooth: bool,
+    bt_uuid: Option<&str>,
     onion: Option<String>,
 ) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut props = BTreeMap::new();
@@ -385,6 +386,12 @@ fn local_properties(
         if let Some(address) = bt::local_address() {
             let mut values = BTreeMap::new();
             values.insert("address".to_string(), address);
+            // Die UUID, unter der wir zu finden sind. Ohne sie sucht ein
+            // echtes Briar gar nicht erst: es bricht ab, wenn die
+            // Eigenschaft fehlt (AbstractBluetoothPlugin.connect).
+            if let Some(uuid) = bt_uuid {
+                values.insert("uuid".to_string(), uuid.to_string());
+            }
             // Briar publishes a UUID per device over SDP and looks the
             // channel up; without SDP the channel is fixed, and this says
             // which one.
@@ -948,7 +955,7 @@ impl Node {
                 .ok_or_else(|| bad("no identity yet"))?;
             (alice, root)
         };
-        let conn = dial(transport_id, address)?;
+        let conn = dial(transport_id, address, None)?;
         let keys = derive_handshake_keys(transport_id, &root, current_time_period(), alice);
         let peer_ip = match &conn {
             Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
@@ -979,7 +986,7 @@ impl Node {
                 pending_keys(&store, &pending.public_key).ok_or_else(|| bad("no identity yet"))?;
             (address, alice, root)
         };
-        let conn = dial(transport_id, &address)?;
+        let conn = dial(transport_id, &address, None)?;
         let keys = derive_handshake_keys(transport_id, &root, current_time_period(), alice);
         let peer_ip = match &conn {
             Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
@@ -1018,7 +1025,7 @@ impl Node {
         };
         let their_handshake_public = key_from_hex(&their_public_hex);
         let (our_private, our_public, our_seed, our_name, our_signature_public,
-             port, recent, recent6, bluetooth, onion) = {
+             port, recent, recent6, bluetooth, bt_uuid, onion) = {
             let mut store = self.store.lock().unwrap();
             // Beim Handschlag ebenfalls erst das Adressgedaechtnis
             // fortschreiben: der frische Kontakt soll sofort alle Netze
@@ -1036,6 +1043,7 @@ impl Node {
                 store.state.lan_recent.clone(),
                 store.state.lan6_recent.clone(),
                 store.state.bluetooth,
+                store.state.bt_uuid.clone(),
                 store.state.tor_onion.clone(),
             )
         };
@@ -1089,7 +1097,7 @@ impl Node {
         let local = ContactInfo {
             name: our_name,
             public_key: our_signature_public.to_vec(),
-            properties: local_properties(port, &recent, &recent6, bluetooth, onion),
+            properties: local_properties(port, &recent, &recent6, bluetooth, bt_uuid.as_deref(), onion),
             timestamp: now_ms(),
         };
         let local_timestamp = local.timestamp;
@@ -1259,7 +1267,34 @@ impl Node {
             }
             address
         };
-        let conn = dial(transport_id, &address)?;
+        // Bei Bluetooth zuerst den Kanal zur gemeldeten UUID suchen. Schlaegt
+        // das fehl, bleibt der feste Kanal als Rueckfall -- zwischen unseren
+        // eigenen Geraeten reicht der.
+        let kanal = if transport_id == BLUETOOTH_TRANSPORT_ID {
+            let uuid = {
+                let store = self.store.lock().unwrap();
+                store
+                    .contact(id)
+                    .and_then(|c| c.transports.get(BLUETOOTH_TRANSPORT_ID))
+                    .and_then(|t| t.bt_uuid.clone())
+            };
+            match uuid {
+                Some(u) => match bt::lookup_channel(&address, &u) {
+                    Ok(k) => {
+                        log(&format!("Bluetooth: UUID gefunden, Kanal {}", k));
+                        Some(k)
+                    }
+                    Err(e) => {
+                        log(&format!("Bluetooth: SDP-Suche misslungen ({})", e));
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let conn = dial(transport_id, &address, kanal)?;
         let peer_ip = match &conn {
             Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
             Conn::Bluetooth(_) => None,
@@ -1351,6 +1386,7 @@ impl Node {
                 &veroeffentlichte(&store.state),
                 &store.state.lan6_recent,
                 store.state.bluetooth,
+                store.state.bt_uuid.as_deref(),
                 store.state.tor_onion.clone(),
             );
             // Nur wenn wirklich eine neue Adresse dazugekommen ist, aendert
@@ -1736,6 +1772,11 @@ impl Node {
                     if let Some(v6) = gemeldete_v6 {
                         entry.ipv6 = Some(v6);
                     }
+                    if let Some(u) = values.get("uuid") {
+                        if !u.trim().is_empty() {
+                            entry.bt_uuid = Some(u.trim().to_string());
+                        }
+                    }
                     if let Some(address) = address {
                         if entry.address.as_deref() != Some(address.as_str()) {
                             entry.address = Some(address.clone());
@@ -2083,7 +2124,7 @@ fn short_transport(transport_id: &str) -> &str {
     }
 }
 
-fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
+fn dial(transport_id: &str, address: &str, kanal: Option<u8>) -> std::io::Result<Conn> {
     if transport_id == TOR_TRANSPORT_ID {
         let socks = tor::connect()
             .map(|t| t.socks_port)
@@ -2093,7 +2134,11 @@ fn dial(transport_id: &str, address: &str) -> std::io::Result<Conn> {
         return Ok(Conn::Tcp(tor::connect_through_socks(socks, address)?));
     }
     if transport_id == BLUETOOTH_TRANSPORT_ID {
-        let stream = bt::connect(address, bt::CHANNEL)?;
+        // Der Kanal steht nicht fest: Briar veroeffentlicht seinen Dienst
+        // unter einer UUID, und der Kanal kommt aus der SDP-Suche. Nur wenn
+        // die Gegenseite keine UUID gemeldet hat -- also unsere eigene
+        // aeltere Fassung ist -- bleibt es beim festen Kanal.
+        let stream = bt::connect(address, kanal.unwrap_or(bt::CHANNEL))?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         return Ok(Conn::Bluetooth(stream));
