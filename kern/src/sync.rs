@@ -42,6 +42,14 @@ const ATTACHMENT: i64 = 1;
 /// message -- which is why Briar compresses images before sending them.
 pub const MAX_MESSAGE_BODY_LEN: usize = 32 * 1024;
 
+/// Wie viele Kennungen hoechstens in **einen** ACK-, OFFER- oder
+/// REQUEST-Satz passen: 48 KiB Rumpf durch 32 Byte je Kennung, also 1536
+/// (SyncConstants.java:46, "MAX_MESSAGE_IDS = MAX_RECORD_PAYLOAD_BYTES /
+/// UniqueId.LENGTH"). Aus denselben zwei Zahlen abgeleitet statt selbst
+/// ausgerechnet, damit die Grenze nicht auseinanderlaeuft, falls eine davon
+/// je wandert.
+pub const MAX_MESSAGE_IDS: usize = crate::record::MAX_RECORD_PAYLOAD_LEN / crate::ids::ID_LEN;
+
 /// Briars Grenzen, in UTF-8-Bytes. Sie hier zu pruefen ist nicht Hoeflichkeit
 /// gegenueber der Gegenseite, sondern Selbstschutz:
 ///
@@ -56,6 +64,14 @@ pub const MAX_MESSAGE_BODY_LEN: usize = 32 * 1024;
 pub const MAX_AUTHOR_NAME_LEN: usize = 50;
 pub const MAX_GROUP_NAME_LEN: usize = 100;
 pub const MAX_PRIVATE_MESSAGE_TEXT_LEN: usize = MAX_MESSAGE_BODY_LEN - 2048;
+
+/// Ein Gruppenbeitrag darf 1024 Byte mehr Text tragen als eine
+/// Privatnachricht (PrivateGroupConstants.java:20). Das ist bei Briar keine
+/// Schlamperei, sondern gerechnet: die Privatnachricht haelt Platz fuer
+/// Anhangskoepfe frei, der Beitrag braucht nur Mitglied, Kette und
+/// Unterschrift. Beide Zahlen genau so uebernehmen -- Briars Pruefer rechnet
+/// nicht nach, er vergleicht.
+pub const MAX_GROUP_POST_TEXT_LEN: usize = MAX_MESSAGE_BODY_LEN - 1024;
 
 /// The group in which two contacts exchange private messages.
 pub fn messaging_group_id(author_a: &SecretKey, author_b: &SecretKey) -> SecretKey {
@@ -252,25 +268,34 @@ pub fn write_priority(out: &mut impl Write, nonce: &[u8]) -> std::io::Result<()>
 /// Das Format ist dasselbe wie bei ACK: aneinandergereihte 32-Byte-Kennungen
 /// (SyncRecordWriterImpl.writeRequest).
 pub fn write_request(out: &mut impl Write, ids: &[SecretKey]) -> std::io::Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let mut payload = Vec::with_capacity(ids.len() * 32);
-    for id in ids {
-        payload.extend_from_slice(id);
-    }
-    write_record(out, &Record::new(PROTOCOL_VERSION, REQUEST, payload))
+    write_kennungen(out, REQUEST, ids)
 }
 
 pub fn write_ack(out: &mut impl Write, ids: &[SecretKey]) -> std::io::Result<()> {
-    if ids.is_empty() {
-        return Ok(());
+    write_kennungen(out, ACK, ids)
+}
+
+/// Kennungen in Saetze von hoechstens MAX_MESSAGE_IDS stueckeln.
+///
+/// Mehr passt in keinen Satz -- und es geht nicht bloss der Satz verloren:
+/// Briars Leser verwirft einen Rumpf ueber 48 KiB (RecordReaderImpl.java:38)
+/// und legt die Verbindung ab, unser eigener ebenso. Weil der Ausgangskorb
+/// Unquittiertes behaelt, stolpert danach jede weitere Verbindung an
+/// derselben Stelle: der Kontakt waere dauerhaft unerreichbar.
+///
+/// Briar stueckelt auch, nur woanders -- sein Schreiber ist stumpf, und die
+/// Sitzung holt je Satz hoechstens MAX_MESSAGE_IDS Kennungen aus der
+/// Datenbank. Hier sitzt es im Schreiber, weil die Aufrufstelle sonst
+/// dieselbe Rechnung dreimal machen muesste.
+fn write_kennungen(out: &mut impl Write, art: u8, ids: &[SecretKey]) -> std::io::Result<()> {
+    for stueck in ids.chunks(MAX_MESSAGE_IDS) {
+        let mut payload = Vec::with_capacity(stueck.len() * crate::ids::ID_LEN);
+        for id in stueck {
+            payload.extend_from_slice(id);
+        }
+        write_record(out, &Record::new(PROTOCOL_VERSION, art, payload))?;
     }
-    let mut payload = Vec::with_capacity(ids.len() * 32);
-    for id in ids {
-        payload.extend_from_slice(id);
-    }
-    write_record(out, &Record::new(PROTOCOL_VERSION, ACK, payload))
+    Ok(())
 }
 
 pub fn write_message(
@@ -422,6 +447,7 @@ mod laengen_tests {
         assert_eq!(MAX_GROUP_NAME_LEN, 100);
         assert_eq!(MAX_MESSAGE_BODY_LEN, 32 * 1024);
         assert_eq!(MAX_PRIVATE_MESSAGE_TEXT_LEN, 32 * 1024 - 2048);
+        assert_eq!(MAX_GROUP_POST_TEXT_LEN, 32 * 1024 - 1024);
     }
 
     #[test]
@@ -430,5 +456,44 @@ mod laengen_tests {
         let riesig = crate::record::Record::new(PROTOCOL_VERSION, MESSAGE, vec![0u8; 70000]);
         assert!(crate::record::write_record(&mut aus, &riesig).is_err());
         assert!(aus.is_empty(), "es darf gar nichts geschrieben worden sein");
+    }
+
+    #[test]
+    fn grenze_ist_briars_grenze() {
+        // SyncConstants.java:46 mit Record.java:12 und UniqueId.LENGTH = 32.
+        assert_eq!(MAX_MESSAGE_IDS, 1536);
+    }
+
+    #[test]
+    fn genau_ein_satz_bleibt_ein_satz() {
+        let kennungen = vec![[7u8; 32]; MAX_MESSAGE_IDS];
+        let mut aus = Vec::new();
+        write_request(&mut aus, &kennungen).unwrap();
+        assert_eq!(
+            aus.len(),
+            crate::record::RECORD_HEADER_LEN + crate::record::MAX_RECORD_PAYLOAD_LEN
+        );
+    }
+
+    #[test]
+    fn eine_kennung_zu_viel_wird_gestueckelt() {
+        // Genau der Fall, an dem die Verbindung starb: ein Satz mehr, nicht
+        // ein Satz zu gross.
+        let kennungen = vec![[9u8; 32]; MAX_MESSAGE_IDS + 1];
+        let mut aus = Vec::new();
+        write_ack(&mut aus, &kennungen).unwrap();
+        let kopf = crate::record::RECORD_HEADER_LEN;
+        assert_eq!(
+            aus.len(),
+            2 * kopf + crate::record::MAX_RECORD_PAYLOAD_LEN + crate::ids::ID_LEN
+        );
+        // Und beide Stuecke sind lesbar, mit der richtigen Satzart.
+        let mut rest: &[u8] = &aus;
+        let erster = crate::record::read_record(&mut rest).unwrap().unwrap();
+        let zweiter = crate::record::read_record(&mut rest).unwrap().unwrap();
+        assert_eq!(erster.record_type, ACK);
+        assert_eq!(zweiter.record_type, ACK);
+        assert_eq!(parse_ids(&erster.payload).len(), MAX_MESSAGE_IDS);
+        assert_eq!(parse_ids(&zweiter.payload).len(), 1);
     }
 }

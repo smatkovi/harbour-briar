@@ -226,6 +226,14 @@ pub fn parse_body(group: &SecretKey, timestamp: u64, body: &[u8]) -> Option<Grou
             };
             let previous = raw32(&items[3])?;
             let text = items[4].as_str()?.to_string();
+            // So streng wie Briars Pruefer (GroupMessageValidator.validatePost:
+            // 1 bis MAX_GROUP_POST_TEXT_LENGTH). Und nicht aus Formtreue: wir
+            // reichen Beitraege unveraendert an die anderen Mitglieder weiter
+            // -- ein zu langer Beitrag von einem alten Geraet ginge sonst
+            // ueber uns hinaus und risse dort die Verbindung ab.
+            if text.is_empty() || text.len() > crate::sync::MAX_GROUP_POST_TEXT_LEN {
+                return None;
+            }
             let signature = items[5].as_raw()?;
             let parent_bdf = match parent {
                 Some(id) => Bdf::Raw(id.to_vec()),

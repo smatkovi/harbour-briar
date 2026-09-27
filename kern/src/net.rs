@@ -102,6 +102,10 @@ enum Recognised {
         index: usize,
         header_key: SecretKey,
         stream_number: u64,
+        /// Der Abschnitt, zu dem die erkannte Marke gehoert -- nicht
+        /// unbedingt der laufende: erkannt werden voriger, jetziger und
+        /// naechster, und das Fenster gehoert zum Abschnitt der Marke.
+        period: u64,
         alice: bool,
     },
     Contact {
@@ -148,15 +152,25 @@ fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recogn
             Some(v) => v,
             None => continue,
         };
+        // Derselbe Fusspunkt wie beim Kontakt weiter unten: die Gegenseite
+        // zaehlt ihre Handschlagversuche hoch, also darf unser Fenster nicht
+        // auf null stehen bleiben -- sonst ist ihre Nummer 32 in diesem
+        // Abschnitt nicht mehr zu erkennen.
+        let base = pending
+            .transport(transport_id)
+            .map(|t| t.in_stream.clone())
+            .unwrap_or_default();
         for p in periods {
             // Incoming keys belong to the peer's role
             let keys = derive_handshake_keys(transport_id, &root, p, !alice);
-            for stream_number in 0..WINDOW {
+            let first = *base.get(&p.to_string()).unwrap_or(&0);
+            for stream_number in first..first + WINDOW {
                 if encode_tag(&keys.tag_key, PROTOCOL_VERSION, stream_number) == tag[..] {
                     return Some(Recognised::Pending {
                         index,
                         header_key: keys.header_key,
                         stream_number,
+                        period: p,
                         alice,
                     });
                 }
@@ -478,11 +492,25 @@ fn addresses_from_properties(
 /// The peer's tag cannot be read before the handshake starts: whoever dialled
 /// may have to speak first, and reading eagerly deadlocks both ends. So the
 /// tag is read on the first actual read, and the stream keys are picked then.
+///
+/// Die Regel gilt fuer beide Richtungen und darf nicht aufgeweicht werden:
+/// jede Seite schreibt ihren Stromkopf, bevor sie das erste Byte der anderen
+/// erwartet -- ausgehend vor dem Lesen der Kennung, eingehend danach. Wird
+/// hier eifrig gelesen, oder faellt eines der beiden fuehrenden flush() weg,
+/// stehen wieder beide Seiten.
 struct LazyHandshakeReader {
     conn: Conn,
     transport_id: String,
     root: SecretKey,
     peer_is_alice: bool,
+    /// Zum Nachziehen des Fensters. Wenn wir selbst gewaehlt haben, ist die
+    /// hier erkannte Nummer der einzige Ort, an dem wir erfahren, wie weit
+    /// die Gegenseite gezaehlt hat.
+    store: Shared,
+    /// Der Wartende wird ueber seinen Handschlagschluessel nachgeschlagen,
+    /// nicht ueber die Stelle in `state.pending`: die verschiebt sich, wenn
+    /// der Benutzer einen anderen Wartenden streicht.
+    public_key: String,
     stream: Option<StreamReader<Conn>>,
 }
 
@@ -493,12 +521,25 @@ impl Read for LazyHandshakeReader {
             self.conn.read_exact(&mut tag)?;
             let period = current_time_period();
             let mut found = None;
+            // Der Fusspunkt je Abschnitt, genau wie in recognise_tag.
+            let base = {
+                let store = self.store.lock().unwrap();
+                store
+                    .state
+                    .pending
+                    .iter()
+                    .find(|p| p.public_key == self.public_key)
+                    .and_then(|p| p.transport(&self.transport_id))
+                    .map(|t| t.in_stream.clone())
+                    .unwrap_or_default()
+            };
             for p in [period.saturating_sub(1), period, period + 1] {
                 let keys =
                     derive_handshake_keys(&self.transport_id, &self.root, p, self.peer_is_alice);
-                for stream_number in 0..WINDOW {
+                let first = *base.get(&p.to_string()).unwrap_or(&0);
+                for stream_number in first..first + WINDOW {
                     if encode_tag(&keys.tag_key, PROTOCOL_VERSION, stream_number) == tag {
-                        found = Some((keys.header_key, stream_number));
+                        found = Some((keys.header_key, stream_number, p));
                         break;
                     }
                 }
@@ -506,8 +547,18 @@ impl Read for LazyHandshakeReader {
                     break;
                 }
             }
-            let (header_key, stream_number) =
+            let (header_key, stream_number, gesehen_in) =
                 found.ok_or_else(|| bad("the peer's handshake tag was not recognised"))?;
+            // Auch die antwortende Seite zaehlt bei jedem Versuch hoch, den
+            // gescheiterten eingeschlossen -- also nachziehen, sonst laeuft
+            // sie uns aus dem Fenster.
+            fenster_vermerken(
+                &self.store,
+                &self.public_key,
+                &self.transport_id,
+                gesehen_in,
+                stream_number,
+            );
             self.stream = Some(StreamReader::new(
                 self.conn.try_clone()?,
                 header_key,
@@ -941,6 +992,46 @@ impl Node {
         }
     }
 
+    /// Die naechste ausgehende Stromnummer fuer einen schwebenden Kontakt --
+    /// vergeben, weggeschrieben, dann erst benutzt.
+    ///
+    /// Warum ueberhaupt gezaehlt wird: die Marke am Stromanfang ist ein
+    /// BLAKE2b ueber Fassung und Stromnummer. Zweimal dieselbe Nummer heisst
+    /// zweimal dieselbe Marke -- fuer einen Lauscher der Beweis, dass zwei
+    /// Verbindungen zusammengehoeren, und fuer ein echtes Briar ein
+    /// verbrauchtes Los: es streicht die Marke beim Erkennen aus seiner
+    /// Tabelle (TransportKeyManagerImpl.java:430-437) und verwirft jeden
+    /// weiteren Versuch im selben Abschnitt still. Ein Abschnitt ist hier
+    /// gut einen Tag lang (30 s + 24 h) und der Taktgeber probiert jede
+    /// Minute -- ohne Zaehler traegt jeder Versuch eines ganzen Tages
+    /// dieselbe Marke.
+    ///
+    /// Erst wegschreiben, dann senden. Ein Absturz dazwischen laesst eine
+    /// Nummer unbenutzt liegen; eine Luecke stoert niemanden, eine doppelte
+    /// Nummer schon.
+    fn stromnummer_vergeben(
+        &self,
+        schwebend: &str,
+        transport_id: &str,
+        period: u64,
+    ) -> std::io::Result<u64> {
+        let mut store = self.store.lock().unwrap();
+        let nummer = {
+            let pending = store
+                .state
+                .pending
+                .iter_mut()
+                .find(|p| p.public_key == schwebend)
+                .ok_or_else(|| bad("pending contact vanished"))?;
+            let zustand = pending.transport_mut(transport_id);
+            let nummer = naechste_stromnummer(zustand, period);
+            stromnummer_vormerken(zustand, period, nummer);
+            nummer
+        };
+        store.save()?;
+        Ok(nummer)
+    }
+
     pub fn spawn_incoming(&self, conn: Conn, transport_id: &'static str, peer_ip: Option<String>) {
         let store = Arc::clone(&self.store);
         std::thread::spawn(move || {
@@ -970,23 +1061,47 @@ impl Node {
                 index,
                 header_key,
                 stream_number,
+                period: gesehen_in,
                 alice,
             }) => {
                 log(&format!("incoming handshake connection ({})", transport_id));
-                let root = {
+                let (root, schwebend) = {
                     let store = self.store.lock().unwrap();
                     let pending = store
                         .state
                         .pending
                         .get(index)
                         .ok_or_else(|| bad("pending contact vanished"))?;
-                    pending_keys(&store, &pending.public_key)
+                    let schwebend = pending.public_key.clone();
+                    let root = pending_keys(&store, &schwebend)
                         .ok_or_else(|| bad("no identity yet"))?
-                        .0
+                        .0;
+                    (root, schwebend)
                 };
-                let keys =
-                    derive_handshake_keys(transport_id, &root, current_time_period(), alice);
-                let writer = StreamWriter::new(conn.try_clone()?, &keys, 0);
+                // Die erkannte Nummer sagt, wie weit die Gegenseite gezaehlt
+                // hat. Das Fenster zieht nach, damit ihr naechster Versuch im
+                // selben Abschnitt nicht durchfaellt.
+                fenster_vermerken(
+                    &self.store,
+                    &schwebend,
+                    transport_id,
+                    gesehen_in,
+                    stream_number,
+                );
+                let period = current_time_period();
+                let keys = derive_handshake_keys(transport_id, &root, period, alice);
+                let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
+                let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
+                // Unseren Stromkopf hinaus, bevor wir zu lesen anfangen.
+                // Briar tut das an genau dieser Stelle
+                // (IncomingHandshakeConnection: "Flush the output stream to
+                // send the outgoing stream header"). Ohne das warten beide:
+                // die Gegenseite hat gewaehlt, unsere Kennung gelesen und
+                // wartet auf unseren Kopf -- wir warten auf ihren ersten
+                // Handschlagschritt. Das haelt bis zur Zeitgrenze, und weil
+                // die Rolle am Schluesselpaar haengt, bei diesem Gegenueber
+                // jedes Mal wieder.
+                writer.flush()?;
                 self.finish_handshake(
                     conn,
                     transport_id,
@@ -1031,30 +1146,39 @@ impl Node {
         transport_id: &str,
         address: &str,
     ) -> std::io::Result<()> {
-        let (alice, root) = {
+        let (alice, root, schwebend) = {
             let store = self.store.lock().unwrap();
             let pending = store
                 .state
                 .pending
                 .get(index)
                 .ok_or_else(|| bad("no such pending contact"))?;
-            let (root, alice) = pending_keys(&store, &pending.public_key)
-                .ok_or_else(|| bad("no identity yet"))?;
-            (alice, root)
+            let schwebend = pending.public_key.clone();
+            let (root, alice) =
+                pending_keys(&store, &schwebend).ok_or_else(|| bad("no identity yet"))?;
+            (alice, root, schwebend)
         };
         let conn = dial(transport_id, address, None)?;
-        let keys = derive_handshake_keys(transport_id, &root, current_time_period(), alice);
+        let period = current_time_period();
+        let keys = derive_handshake_keys(transport_id, &root, period, alice);
         let peer_ip = match &conn {
             Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
             Conn::Bluetooth(_) => None,
         };
-        let mut writer = StreamWriter::new(conn.try_clone()?, &keys, 0);
+        // Erst nach dem Waehlen vergeben: ein Versuch, der nicht einmal eine
+        // Verbindung bekommt, hat keine Marke auf die Leitung gelegt und darf
+        // darum keine Nummer verbrauchen. Der Treffpunkt wird jede Minute bis
+        // zu zwei Tage lang angewaehlt und meist ist niemand dran -- sonst
+        // waere das Fenster der Gegenseite binnen einer halben Stunde
+        // ueberholt.
+        let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
+        let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
         self.finish_handshake(conn, transport_id, index, writer, None, alice, peer_ip)
     }
 
     pub fn connect_pending(&self, index: usize, transport_id: &str) -> std::io::Result<()> {
-        let (address, alice, root) = {
+        let (address, alice, root, schwebend) = {
             let store = self.store.lock().unwrap();
             let pending = store
                 .state
@@ -1069,17 +1193,22 @@ impl Node {
                 pending.address.clone()
             }
             .ok_or_else(|| bad("no address for this pending contact"))?;
+            let schwebend = pending.public_key.clone();
             let (root, alice) =
-                pending_keys(&store, &pending.public_key).ok_or_else(|| bad("no identity yet"))?;
-            (address, alice, root)
+                pending_keys(&store, &schwebend).ok_or_else(|| bad("no identity yet"))?;
+            (address, alice, root, schwebend)
         };
         let conn = dial(transport_id, &address, None)?;
-        let keys = derive_handshake_keys(transport_id, &root, current_time_period(), alice);
+        let period = current_time_period();
+        let keys = derive_handshake_keys(transport_id, &root, period, alice);
         let peer_ip = match &conn {
             Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
             Conn::Bluetooth(_) => None,
         };
-        let mut writer = StreamWriter::new(conn.try_clone()?, &keys, 0);
+        // Auch hier erst nach dem Waehlen: ein fehlgeschlagener Anwahlversuch
+        // hat keine Marke gesendet.
+        let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
+        let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
         self.finish_handshake(conn, transport_id, index, writer, None, alice, peer_ip)
     }
@@ -1152,6 +1281,8 @@ impl Node {
                 transport_id: transport_id.to_string(),
                 root,
                 peer_is_alice: !alice,
+                store: Arc::clone(&self.store),
+                public_key: their_public_hex.clone(),
                 stream: None,
             }),
         };
@@ -1664,7 +1795,13 @@ impl Node {
             }
         }
 
-        let acked_now: Vec<String> = to_ack.iter().map(|id| to_hex(id)).collect();
+        // Menge statt Liste: ab jetzt laufen hier wirklich tausende Kennungen
+        // durch, und darunter stehen Schleifen, die fuer jede Nachricht der
+        // ganzen Geschichte "contains" rufen. Mit einer Liste waere das
+        // Geschichte mal Kennungen -- auf dem N9 Minuten unter dem
+        // Speicherschloss, ausgerechnet in der Runde, die endlich aufraeumt.
+        let acked_now: std::collections::BTreeSet<String> =
+            to_ack.iter().map(|id| to_hex(id)).collect();
         let mut new_messages = 0;
         {
             let mut store = self.store.lock().unwrap();
@@ -1686,7 +1823,8 @@ impl Node {
                         contact.to_request.push(hex);
                     }
                 }
-                let peer_acked: Vec<String> = acked_ids.iter().map(|id| to_hex(id)).collect();
+                let peer_acked: std::collections::BTreeSet<String> =
+                    acked_ids.iter().map(|id| to_hex(id)).collect();
                 for message in contact.outbox.iter_mut() {
                     if peer_acked.contains(&message.id) {
                         message.acked = true;
@@ -2043,7 +2181,7 @@ impl Node {
         let parsed = match groups::parse_body(group, timestamp, body) {
             Some(p) => p,
             None => {
-                log("a group message did not verify");
+                log("a group message did not verify, or its text was out of bounds");
                 return false;
             }
         };
@@ -2213,6 +2351,66 @@ pub fn stromnummer_vormerken(
             .unwrap_or(false)
     });
     zustand.out_stream = 0;
+}
+
+/// Das Fenster der empfangenden Seite nachziehen.
+///
+/// Briars `ReorderingWindow.setSeen` schiebt nach zwei Regeln
+/// (ReorderingWindow.java:61-64). Regel 1 -- so weit schieben, dass alles
+/// oberhalb der Fenstermitte unbenutzt ist -- uebernehmen wir: ohne sie
+/// bliebe der Fusspunkt auf null stehen, und sobald die Gegenseite in einem
+/// Abschnitt ueber 31 Handschlaege hinauskommt, faellt ihre Marke aus
+/// unserem Fenster.
+///
+/// Regel 2 -- so weit schieben, dass der Fusspunkt selbst unbenutzt ist --
+/// uebernehmen wir absichtlich NICHT. Sie verbraucht die Marke, und beim
+/// schwebenden Kontakt kann das nur schaden: ein geglueckter Handschlag
+/// nimmt den Wartenden aus dem Speicher, dieses Fenster sieht also
+/// ausschliesslich **gescheiterte** Versuche -- und eine Gegenseite mit der
+/// Fassung bis 0.26.0 schickt jeden davon wieder mit der Nummer 0. Wer die
+/// Marke verbraucht, sperrt genau die Wiederholung aus, auf die es ankommt.
+pub fn fenster_nachziehen(
+    zustand: &mut crate::store::TransportState,
+    period: u64,
+    gesehen: u64,
+) {
+    let abschnitt = period.to_string();
+    let alt = *zustand.in_stream.get(&abschnitt).unwrap_or(&0);
+    // Regel 1: die gesehene Nummer landet auf der Fenstermitte. Bei Nummer 0
+    // rechnet das 0 - 15 = 0 -- der Fusspunkt ruehrt sich nicht, und eine
+    // alte Gegenseite bleibt beliebig oft erkennbar.
+    let neu = alt.max(gesehen.saturating_sub(WINDOW / 2 - 1));
+    zustand.in_stream.insert(abschnitt, neu);
+    // Die Gegenseite haelt ohnehin nur voriger, jetziger und naechster.
+    zustand.in_stream.retain(|a, _| {
+        a.parse::<u64>()
+            .map(|p| p.max(period) - p.min(period) <= 1)
+            .unwrap_or(false)
+    });
+}
+
+/// Dasselbe fuer einen Wartenden im Speicher, samt Wegschreiben. Gebraucht an
+/// beiden Stellen, an denen eine Handschlagmarke erkannt wird -- bei der
+/// angenommenen und bei der selbst gewaehlten Verbindung.
+fn fenster_vermerken(
+    store: &Shared,
+    schwebend: &str,
+    transport_id: &str,
+    period: u64,
+    gesehen: u64,
+) {
+    let mut store = store.lock().unwrap();
+    if let Some(pending) = store
+        .state
+        .pending
+        .iter_mut()
+        .find(|p| p.public_key == schwebend)
+    {
+        fenster_nachziehen(pending.transport_mut(transport_id), period, gesehen);
+    }
+    // Ein missglueckter Schreibversuch darf den Handschlag nicht abbrechen:
+    // dann laeuft er mit dem alten Fusspunkt weiter, und der ist nie zu hoch.
+    let _ = store.save();
 }
 
 fn short_transport(transport_id: &str) -> &str {
@@ -2807,5 +3005,77 @@ mod stromnummer_tests {
         assert!(!z.out_streams.contains_key("100"));
         assert!(z.out_streams.contains_key("101"));
         assert!(z.out_streams.contains_key("102"));
+    }
+
+    #[test]
+    fn fenster_folgt_der_gegenseite() {
+        // Regel 1 aus Briars ReorderingWindow: die gesehene Nummer landet auf
+        // der Fenstermitte. Ohne das bliebe der Fusspunkt auf null, und ab
+        // Nummer 32 waere die Gegenseite in diesem Abschnitt stumm.
+        let mut z = TransportState::default();
+        fenster_nachziehen(&mut z, 100, 20);
+        assert_eq!(z.in_stream["100"], 5, "20 - (32/2 - 1)");
+        let fuss = z.in_stream["100"];
+        assert!(20 >= fuss && 20 < fuss + WINDOW, "die gesehene Nummer bleibt drin");
+        // Und der Fusspunkt geht nie zurueck.
+        fenster_nachziehen(&mut z, 100, 6);
+        assert_eq!(z.in_stream["100"], 5);
+    }
+
+    #[test]
+    fn alte_gegenseite_bleibt_erreichbar() {
+        // Eine Gegenseite mit der Fassung bis 0.26.0 schickt jeden Versuch
+        // mit der Nummer 0. Regel 2 (Marke verbrauchen) fehlt absichtlich --
+        // mit ihr waere der zweite Versuch nicht mehr zu erkennen, und das
+        // ist genau der Fall, der heute zwischen Jolla, N9 und N950 laeuft.
+        let mut z = TransportState::default();
+        for _ in 0..50 {
+            fenster_nachziehen(&mut z, 100, 0);
+            assert_eq!(z.in_stream["100"], 0);
+        }
+    }
+
+    #[test]
+    fn zaehler_und_fenster_laufen_im_takt() {
+        // Der eigentliche Beweis: was die eine Seite vergibt, muss die andere
+        // in ihrem Fenster finden -- 200 Versuche im selben Abschnitt.
+        let mut sender = TransportState::default();
+        let mut empfaenger = TransportState::default();
+        for _ in 0..200 {
+            let n = naechste_stromnummer(&sender, 100);
+            stromnummer_vormerken(&mut sender, 100, n);
+            let fuss = *empfaenger.in_stream.get("100").unwrap_or(&0);
+            assert!(
+                n >= fuss && n < fuss + WINDOW,
+                "Nummer {} liegt neben dem Fenster ab {}",
+                n,
+                fuss
+            );
+            fenster_nachziehen(&mut empfaenger, 100, n);
+        }
+    }
+
+    #[test]
+    fn schwebender_zaehlt_je_transport() {
+        // LAN, Bluetooth und Tor haben eigene Schluessel, also eigene Marken
+        // und eigene Zaehler -- ein Zaehler je Wartendem waere zu wenig.
+        use crate::store::PendingContact;
+        let mut p = PendingContact {
+            public_key: "aa".into(),
+            alias: String::new(),
+            address: None,
+            bluetooth: None,
+            onion: None,
+            added: 0,
+            last_error: None,
+            transports: std::collections::BTreeMap::new(),
+        };
+        for n in 0..3u64 {
+            let z = p.transport_mut(LAN_TRANSPORT_ID);
+            assert_eq!(naechste_stromnummer(z, 100), n);
+            stromnummer_vormerken(z, 100, n);
+        }
+        let z = p.transport_mut(BLUETOOTH_TRANSPORT_ID);
+        assert_eq!(naechste_stromnummer(z, 100), 0);
     }
 }

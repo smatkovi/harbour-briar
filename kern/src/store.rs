@@ -76,6 +76,28 @@ pub struct PendingContact {
     pub onion: Option<String>,
     pub added: u64,
     pub last_error: Option<String>,
+    /// Zustand je Transport. Gebraucht wird davon nur das Stromwerk:
+    /// `out_streams` (die naechste ausgehende Nummer je Zeitabschnitt) und
+    /// `in_stream` (der Fusspunkt unseres Fensters je Zeitabschnitt). Briar
+    /// fuehrt fuer einen schwebenden Kontakt denselben Schluesselsatz wie
+    /// fuer einen Kontakt, nur im Handschlagmodus, und zaehlt ueber denselben
+    /// Pfad hoch -- TransportKeyManagerImpl.java:366-385 nimmt ContactId
+    /// oder PendingContactId, einen Sonderweg fuer den Handschlag gibt es
+    /// dort nicht. Je Transport ein Eintrag, denn LAN, Bluetooth und Tor
+    /// haben eigene Schluessel und darum eigene Marken. Die uebrigen Felder
+    /// bleiben hier leer: die Adressen eines Wartenden stehen oben, einzeln.
+    #[serde(default)]
+    pub transports: BTreeMap<String, TransportState>,
+}
+
+impl PendingContact {
+    pub fn transport(&self, id: &str) -> Option<&TransportState> {
+        self.transports.get(id)
+    }
+
+    pub fn transport_mut(&mut self, id: &str) -> &mut TransportState {
+        self.transports.entry(id.to_string()).or_default()
+    }
 }
 
 /// A one-to-one message, as the interface shows it. A message may carry an

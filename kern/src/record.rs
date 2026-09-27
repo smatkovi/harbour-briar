@@ -29,13 +29,18 @@ pub fn write_record(out: &mut impl Write, r: &Record) -> std::io::Result<()> {
     // Gegenseite an. Die reisst daraufhin die Verbindung ab -- und weil der
     // Ausgangskorb Unquittiertes behaelt, stolpert jede weitere Verbindung an
     // derselben Nachricht. Der Kontakt waere dauerhaft unerreichbar.
-    if r.payload.len() > u16::MAX as usize {
+    //
+    // Die Grenze ist 48 KiB, nicht u16::MAX. Das Band dazwischen war die
+    // unangenehmste Stelle: der Kopf ist ehrlich, der Satz geht hinaus -- und
+    // erst die Gegenseite legt auf (RecordReaderImpl.java:38), mit demselben
+    // Ende wie oben, nur spaeter und schwerer zu finden.
+    if r.payload.len() > MAX_RECORD_PAYLOAD_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "Satzrumpf zu gross: {} von hoechstens {} Byte",
                 r.payload.len(),
-                u16::MAX
+                MAX_RECORD_PAYLOAD_LEN
             ),
         ));
     }

@@ -246,6 +246,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     onion,
                     added: now_ms(),
                     last_error: None,
+                    transports: BTreeMap::new(),
                 });
                 if let Err(e) = locked.save() {
                     return json!({"error": e.to_string()});
@@ -810,6 +811,15 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             let text = body["text"].as_str().unwrap_or("").trim().to_string();
             if text.is_empty() {
                 return json!({"error": "message is empty"});
+            }
+            // Dieselbe Falle wie bei /send, nur mit einer anderen Zahl: ein zu
+            // langer Beitrag reisst bei der Gegenseite nicht die Nachricht ab,
+            // sondern die Verbindung -- und weil der Ausgangskorb Unquittiertes
+            // behaelt, stolpert danach jede weitere Runde daran.
+            if text.len() > crate::sync::MAX_GROUP_POST_TEXT_LEN {
+                return json!({"error": format!(
+                    "der Beitrag ist {} Byte lang, erlaubt sind {}",
+                    text.len(), crate::sync::MAX_GROUP_POST_TEXT_LEN)});
             }
             let mut locked = store.lock().unwrap();
             let (author, seed) = match net::local_author(&locked) {
