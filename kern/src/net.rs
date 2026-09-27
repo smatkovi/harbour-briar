@@ -1254,6 +1254,20 @@ impl Node {
 
         let contact_id = {
             let mut store = self.store.lock().unwrap();
+            // Steht der Wartende ueberhaupt noch da? Der Benutzer kann ihn
+            // gestrichen haben, waehrend der Handschlag lief -- ohne diese
+            // Frage kaeme er gleich darauf als Kontakt zurueck, und das
+            // Streichen waere nicht verlaesslich. Bei einem Handschlag, den
+            // wir selbst angestossen haben, gilt dasselbe.
+            if !store
+                .state
+                .pending
+                .iter()
+                .any(|p| p.public_key == their_public_hex)
+            {
+                log("the waiting contact was removed while the handshake ran -- dropping it");
+                return Ok(());
+            }
             let id = store.state.next_contact_id;
             store.state.next_contact_id += 1;
             let name = if alias.is_empty() {

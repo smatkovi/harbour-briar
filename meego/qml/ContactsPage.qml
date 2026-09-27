@@ -72,6 +72,23 @@ Page {
         acceptButtonText: "OK"
     }
 
+    // Lange auf einen Wartenden tippen fragt hier nach. Ohne das Streichen
+    // veroeffentlicht er zwei Tage lang jede Minute einen Treffpunkt, auch
+    // wenn niemand mehr kommt.
+    property string streichSchluessel: ""
+
+    QueryDialog {
+        id: streichen
+        titleText: fenster.tr("removeWaiting")
+        message: fenster.tr("removeWaitingAsk")
+        acceptButtonText: fenster.tr("removeWaiting")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.removePending(seite.streichSchluessel, function(antwort) {
+            if (!antwort.error)
+                fenster.zustand = antwort
+        })
+    }
+
     Column {
         id: kopf
         anchors { top: parent.top; left: parent.left; right: parent.right; margins: 16 }
@@ -172,18 +189,28 @@ Page {
 
             Repeater {
                 model: fenster.zustand.pending
-                delegate: Label {
-                    width: liste.width - 32
-                    x: 16
+                delegate: Item {
+                    width: liste.width
                     height: 56
-                    verticalAlignment: Text.AlignVCenter
-                    color: "#a0a0a0"
-                    font.pixelSize: 20
-                    elide: Text.ElideRight
-                    text: (modelData.alias.length > 0 ? modelData.alias : "?")
-                          + " – " + fenster.tr("waiting")
-                          + (modelData.address ? " (" + modelData.address + ")" : "")
-                          + (modelData.bluetooth ? " (BT)" : "")
+                    Label {
+                        width: liste.width - 32
+                        x: 16
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: "#a0a0a0"
+                        font.pixelSize: 20
+                        elide: Text.ElideRight
+                        text: (modelData.alias.length > 0 ? modelData.alias : "?")
+                              + " – " + fenster.tr("waiting")
+                              + (modelData.address ? " (" + modelData.address + ")" : "")
+                              + (modelData.bluetooth ? " (BT)" : "")
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onPressAndHold: {
+                            seite.streichSchluessel = modelData.publicKey
+                            streichen.open()
+                        }
+                    }
                 }
             }
 

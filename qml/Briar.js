@@ -218,6 +218,12 @@ function poll(callback) {
     request("POST", "/poll", {}, callback)
 }
 
+// Einen Wartenden streichen. Er hat noch keine Nummer -- die bekommt er
+// erst mit dem Handschlag --, also geht es ueber seinen Schluessel.
+function removePending(publicKey, callback) {
+    request("POST", "/pending/remove", { publicKey: publicKey }, callback)
+}
+
 function removeContact(contact, callback) {
     request("POST", "/remove", { contact: contact }, callback)
 }

@@ -434,8 +434,43 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             json!({"ok": true})
         }
 
+        // Einen wartenden Kontakt streichen -- eigener Weg, nicht /remove: dort
+        // steht eine Kontaktnummer, hier der oeffentliche Schluessel, denn
+        // eine Nummer bekommt ein Wartender erst mit dem Handschlag.
+        ("POST", "/pending/remove") => {
+            let public_key = body["publicKey"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if public_key.is_empty() {
+                return json!({"error": "no publicKey given"});
+            }
+            let mut locked = store.lock().unwrap();
+            let vorher = locked.state.pending.len();
+            locked.state.pending.retain(|p| p.public_key != public_key);
+            let entfernt = locked.state.pending.len() < vorher;
+            if entfernt {
+                let _ = locked.save();
+            }
+            drop(locked);
+            // Den Treffpunkt raeumt run_rendezvous von selbst ab: es leitet
+            // sein Soll in jeder Runde neu aus den Wartenden ab und nimmt
+            // herunter, was daraus verschwunden ist.
+            //
+            // Kein Fehler, wenn nichts da war: dann ist der Handschlag
+            // wahrscheinlich gerade geglueckt, und der Eintrag steht schon
+            // als Kontakt in derselben Antwort.
+            let mut antwort = status(&store);
+            antwort["removed"] = json!(entfernt);
+            antwort
+        }
+
         ("POST", "/remove") => {
-            let contact_id = body["contact"].as_u64().unwrap_or(0) as u32;
+            let contact_id = match body["contact"].as_u64() {
+                Some(id) => id as u32,
+                None => return json!({"error": "no contact given"}),
+            };
             let mut locked = store.lock().unwrap();
             locked.state.contacts.retain(|c| c.id != contact_id);
             for group in locked.state.groups.iter_mut() {

@@ -79,6 +79,22 @@ Page {
                               + (modelData.bluetooth ? " (BT " + modelData.bluetooth + ")" : "")
                     }
                     onClicked: Briar.poll(function() { app.refresh() })
+
+                    // Ein Wartender laesst sich auch wieder streichen --
+                    // sonst veroeffentlicht er zwei Tage lang jede Minute
+                    // einen Treffpunkt, auch wenn niemand mehr kommt.
+                    menu: ContextMenu {
+                        MenuItem {
+                            text: app.tr("removeWaiting")
+                            onClicked: remorseAction(app.tr("removeWaiting"), function() {
+                                Briar.removePending(modelData.publicKey,
+                                                    function(answer) {
+                                    if (!answer.error)
+                                        app.status = answer
+                                })
+                            })
+                        }
+                    }
                 }
             }
         }
