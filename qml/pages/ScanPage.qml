@@ -4,9 +4,10 @@ import Amber.QrFilter 1.0
 import Sailfish.Silica 1.0
 import "../Briar.js" as Briar
 
-// Photographs the other device's QR code and reads the link out of it.
-// A picture, not a live scan: one tap is enough, and it works the same way
-// on the N9, where QML gets no camera frames at all.
+// Liest den QR-Code der Gegenseite laufend aus dem Sucherbild -- kein Foto,
+// kein Ausloesen. Der Filter gehoert zu Sailfish (qr-filter-qml-plugin) und
+// ist derselbe, den die Kamera-App benutzt; deren Fund laesst sich nicht
+// abgreifen, sie gibt ihn nicht heraus.
 Page {
     id: page
     allowedOrientations: Orientation.Portrait
@@ -14,35 +15,17 @@ Page {
     property string message: app.tr("scanLiveHint")
     property bool busy: false
 
+    // Wie das Sucherbild gedreht wird. Der Sensor sitzt quer im Geraet, und
+    // wie weit, ist von Geraet zu Geraet verschieden; `camera.orientation`
+    // meldet es nicht ueberall verlaesslich. Darum ein Vorgabewert, den der
+    // Knopf unten weiterdreht -- einmal tippen, bis es aufrecht steht.
+    // Das Erkennen beruehrt das ohnehin nicht: der Filter liest den Code in
+    // jeder Lage, die Drehung ist fuers Auge.
+    property int drehung: -90
+
     Camera {
         id: camera
-        captureMode: Camera.CaptureStillImage
         focus.focusMode: Camera.FocusContinuous
-        imageCapture {
-            onImageSaved: {
-                page.busy = false
-                var text = QrCode.decode(path)
-                if (!text) {
-                    page.message = app.tr("scanNothing")
-                    return
-                }
-                var found = Briar.qrParse(text)
-                if (!found.link) {
-                    page.message = app.tr("scanNothing")
-                    return
-                }
-                pageStack.replace(Qt.resolvedUrl("AddContactPage.qml"), {
-                    "prefillLink": found.link,
-                    "prefillAddress": found.address,
-                    "prefillBluetooth": found.bluetooth,
-                    "prefillOnion": found.onion
-                })
-            }
-            onCaptureFailed: {
-                page.busy = false
-                page.message = app.tr("scanFailed")
-            }
-        }
     }
 
     VideoOutput {
@@ -51,16 +34,7 @@ Page {
         height: parent.height - footer.height
         source: camera
         fillMode: VideoOutput.PreserveAspectFit
-        // Die Seite steht im Hochformat, der Sensor sitzt quer. camera.orientation
-        // laesst sich auf diesem Geraet nicht auslesen (der Kamera-Stack
-        // braucht ein echtes Fenster, headless stuerzt er ab), also steht hier
-        // ein fester Wert. Das Erkennen beruehrt das ohnehin nicht -- der
-        // Filter unten liest den Code in jeder Lage; die Drehung ist fuers Auge.
-        orientation: 90
-
-        // Liest den Code laufend aus dem Sucherbild. Das Modul gehoert zu
-        // Sailfish (qr-filter-qml-plugin) und ist dasselbe, das die
-        // Kamera-App benutzt -- kein Foto, kein Knopf, kein Umweg.
+        orientation: page.drehung
         filters: [ qrLeser ]
     }
 
@@ -75,8 +49,10 @@ Page {
             qrLeser.clearResult()
             var found = Briar.qrParse(result)
             if (!found || !found.link) {
+                // Ein Code, aber keiner von Briar -- weiterschauen statt
+                // stehenbleiben.
+                page.message = app.tr("scanNotBriar")
                 page.busy = false
-                page.message = app.tr("scanNothing")
                 return
             }
             pageStack.replace(Qt.resolvedUrl("AddContactPage.qml"), {
@@ -105,13 +81,8 @@ Page {
 
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: page.busy ? app.tr("scanning") : app.tr("scanTake")
-            enabled: !page.busy
-            onClicked: {
-                page.busy = true
-                page.message = app.tr("scanning")
-                camera.imageCapture.capture()
-            }
+            text: app.tr("turnPicture")
+            onClicked: page.drehung = (page.drehung + 90) % 360
         }
     }
 }
