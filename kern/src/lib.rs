@@ -18,6 +18,7 @@ pub mod btprofile;
 pub mod crypto;
 pub mod exchange;
 pub mod groups;
+pub mod introduction;
 pub mod handshake;
 pub mod ids;
 pub mod net;

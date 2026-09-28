@@ -339,3 +339,79 @@ fn links_match() {
         v["link_pending_id"]
     );
 }
+
+/// Das Vorstellen (introduction), Ingrid stellt Anna und Bert vor -- gegen
+/// die 30 `intro_*`-Werte aus Vectors9.java.
+#[test]
+fn intro_wie_bei_briar() {
+    use briarkern::groups::Author;
+    use briarkern::introduction as intro;
+    use std::collections::BTreeMap;
+    let v = vectors();
+    let pubkey = |start: u8| -> Vec<u8> { (0..32u8).map(|i| start + i).collect() };
+    let ingrid = briarkern::ids::author_id("Ingrid", &pubkey(0x50));
+    let anna = briarkern::ids::author_id("Anna", &pubkey(0x60));
+    let bert = briarkern::ids::author_id("Bert", &pubkey(0x70));
+    assert_eq!(to_hex(&ingrid), v["intro_author_ingrid"]);
+    assert_eq!(to_hex(&anna), v["intro_author_anna"]);
+    assert_eq!(to_hex(&bert), v["intro_author_bert"]);
+    assert_eq!(to_hex(&intro::contact_group(&anna, &bert)), v["intro_contact_group"]);
+
+    let sid = intro::session_id(&ingrid, &anna, &bert);
+    assert_eq!(to_hex(&sid), v["intro_session_id"]);
+    assert_eq!(to_hex(&intro::session_id(&ingrid, &bert, &anna)), v["intro_session_id_bob_view"]);
+    let alice = intro::ist_alice(&anna, &bert);
+    assert_eq!(alice, v["intro_anna_is_alice"] == "01");
+
+    let priv_a = key(&v, "intro_eph_priv_anna");
+    let priv_b = key(&v, "intro_eph_priv_bert");
+    let pub_a = briarkern::crypto::agreement_public_key(&priv_a);
+    let pub_b = briarkern::crypto::agreement_public_key(&priv_b);
+    assert_eq!(to_hex(&pub_a), v["intro_eph_pub_anna"]);
+    assert_eq!(to_hex(&pub_b), v["intro_eph_pub_bert"]);
+
+    let master = intro::master_key(&priv_a, &pub_a, &pub_b, alice).unwrap();
+    assert_eq!(to_hex(&master), v["intro_master_anna_view"]);
+    assert_eq!(to_hex(&intro::master_key(&priv_b, &pub_b, &pub_a, !alice).unwrap()), v["intro_master_bert_view"]);
+    let alice_mac = intro::mac_key(&master, true);
+    let bob_mac = intro::mac_key(&master, false);
+    assert_eq!(to_hex(&alice_mac), v["intro_mac_key_alice"]);
+    assert_eq!(to_hex(&bob_mac), v["intro_mac_key_bob"]);
+
+    let mut lan = BTreeMap::new();
+    lan.insert("ipPorts".to_string(), "10.0.0.1:7327".to_string());
+    let mut props_a: intro::Adressen = BTreeMap::new();
+    props_a.insert("org.briarproject.bramble.lan".to_string(), lan);
+    let mut bt = BTreeMap::new();
+    bt.insert("address".to_string(), "00:11:22:33:44:55".to_string());
+    let mut props_b: intro::Adressen = BTreeMap::new();
+    props_b.insert("org.briarproject.bramble.bluetooth".to_string(), bt);
+    let (ts_a, ts_b) = (1_700_000_000_000u64, 1_700_000_001_000u64);
+    let anna_mac = if alice { &alice_mac } else { &bob_mac };
+    let seite_a = intro::Seite { author_id: &anna, accept_timestamp: ts_a, ephemeral_public: &pub_a, adressen: &props_a };
+    let seite_b = intro::Seite { author_id: &bert, accept_timestamp: ts_b, ephemeral_public: &pub_b, adressen: &props_b };
+    let mac = intro::auth_mac(anna_mac, &ingrid, &seite_a, &seite_b);
+    assert_eq!(to_hex(&mac), v["intro_auth_mac_anna"]);
+    // Bert prueft mit vertauschten Seiten.
+    assert!(intro::auth_mac_stimmt(&mac, anna_mac, &ingrid, &seite_b, &seite_a));
+    assert_eq!(to_hex(&intro::auth_nonce(anna_mac)), v["intro_auth_nonce_anna"]);
+    let seed = key(&v, "intro_sig_seed_anna");
+    let sig = intro::auth_signature(anna_mac, &seed);
+    assert_eq!(to_hex(&sig), v["intro_auth_sig_anna"]);
+    assert!(intro::auth_signature_stimmt(&sig, anna_mac, &briarkern::crypto::signature_public_key(&seed)));
+    assert_eq!(to_hex(&intro::activate_mac(anna_mac)), v["intro_activate_mac_anna"]);
+
+    let bert_author = Author { name: "Bert".to_string(), public_key: pubkey(0x70) };
+    let prev: [u8; 32] = { let mut k = [0u8; 32]; for i in 0..32u8 { k[i as usize] = 0x22 + i; } k };
+    assert_eq!(to_hex(&intro::request_body(None, &bert_author, Some("hallo"), None)), v["intro_body_request"]);
+    assert_eq!(to_hex(&intro::request_body(Some(&prev), &bert_author, None, None)), v["intro_body_request_prev_notext"]);
+    assert_eq!(to_hex(&intro::request_body(None, &bert_author, Some("hallo"), Some(60000))), v["intro_body_request_timer"]);
+    assert_eq!(to_hex(&intro::accept_body(&sid, Some(&prev), &pub_a, ts_a, &props_a, None)), v["intro_body_accept"]);
+    assert_eq!(to_hex(&intro::decline_body(&sid, Some(&prev), None)), v["intro_body_decline"]);
+    assert_eq!(to_hex(&intro::auth_body(&sid, &prev, &mac, &sig)), v["intro_body_auth"]);
+    assert_eq!(to_hex(&intro::activate_body(&sid, &prev, &intro::activate_mac(anna_mac))), v["intro_body_activate"]);
+    assert_eq!(to_hex(&intro::abort_body(&sid, Some(&prev))), v["intro_body_abort"]);
+    let g: [u8; 32] = { let mut k = [0u8; 32]; for i in 0..32u8 { k[i as usize] = 0x11 + i; } k };
+    let body = intro::request_body(None, &bert_author, Some("hallo"), None);
+    assert_eq!(to_hex(&briarkern::ids::message_id(&g, 1_700_000_002_000, &body)), v["intro_msg_id_request"]);
+}

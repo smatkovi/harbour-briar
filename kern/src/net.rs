@@ -5496,8 +5496,10 @@ pub static BQP_GEGENUEBER: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex:
 /// Zeile darueber angelegt worden war. Im Protokoll stand beides in
 /// derselben Sekunde:
 ///
-///     BQP: Kontakt 1 nebeneinander angelegt
-///     BQP: gescheitert: der Lauf wurde beendet
+/// ```text
+/// BQP: Kontakt 1 nebeneinander angelegt
+/// BQP: gescheitert: der Lauf wurde beendet
+/// ```
 ///
 /// und die Oberflaeche sagte "hat nicht geklappt", obwohl es geklappt hatte.
 pub static BQP_ERGEBNIS: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);

@@ -14,6 +14,7 @@ public class Dump {
 		org.briarproject.bramble.rendezvous.Vectors6.dump(out);
 		org.briarproject.bramble.plugin.tor.Vectors7.dump(out);
 		org.briarproject.bramble.keyagreement.Vectors8.dump(out);
+		org.briarproject.briar.introduction.Vectors9.dump(out);
 		for (Map.Entry<String, String> e : out.entrySet())
 			System.out.println(e.getKey() + "=" + e.getValue());
 	}

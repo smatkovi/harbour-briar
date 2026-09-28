@@ -28,6 +28,9 @@ Page {
     // 0 = zeigen und suchen, 1 = gelesen, warten, 2 = fertig, 3 = gescheitert
     property int lage: 0
     property int kontakteVorher: 0
+    /// Der Kontakt, den das Treffen ergeben hat -- fuer den Knopf danach.
+    property int treffKontakt: 0
+    property string treffName: ""
     property bool wartetAufFoto: false
 
     tools: ToolBarLayout {
@@ -155,7 +158,9 @@ Page {
                 for (var i = 0; i < fenster.zustand.contacts.length; ++i) {
                     if (fenster.zustand.contacts[i].id === nr) {
                         seite.lage = 2
-                        seite.meldung = fenster.tr("meetDone") + fenster.zustand.contacts[i].name
+                        seite.treffKontakt = nr
+                        seite.treffName = fenster.zustand.contacts[i].name
+                        seite.meldung = fenster.tr("meetDone") + seite.treffName
                         return
                     }
                 }
@@ -192,6 +197,23 @@ Page {
                 font.pixelSize: 20
                 color: seite.lage === 3 ? "#ff6666" : "#a0d0ff"
                 text: seite.meldung
+            }
+
+
+            // Nach dem Treffen: der eine sinnvolle naechste Schritt.
+
+            Button {
+
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                visible: seite.lage === 2 && seite.treffKontakt > 0
+
+                text: fenster.tr("meetOpenChat")
+
+                onClicked: pageStack.replace(Qt.resolvedUrl("ChatPage.qml"),
+
+                                             { kontakt: seite.treffKontakt, name: seite.treffName })
+
             }
 
             Image {

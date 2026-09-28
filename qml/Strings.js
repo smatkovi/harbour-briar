@@ -137,6 +137,7 @@ var table = {
     meetFailed:       { de: "Es hat nicht geklappt. Noch einmal versuchen.",
                         en: "That did not work. Try again." },
     meetAgain:        { de: "Noch einmal",                  en: "Try again" },
+    meetOpenChat:     { de: "Zum Gespräch",                 en: "Open the chat" },
     meetSameNetwork:  { de: "Beide Geräte müssen im selben WLAN sein — ein Hotspot ohne Internet reicht.",
                         en: "Both devices must be on the same Wi-Fi — a hotspot without internet is enough." },
     scanIsMeetCode:   { de: "Das ist ein Code zum persönlichen Treffen.",

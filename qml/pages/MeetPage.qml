@@ -36,6 +36,9 @@ Page {
     property bool grosseAufnahme: false
     property int fehlschlaege: 0
     property int kontakteVorher: 0
+    /// Der Kontakt, den das Treffen ergeben hat -- fuer den Knopf danach.
+    property int treffKontakt: 0
+    property string treffName: ""
 
     function starten() {
         page.lage = 0
@@ -208,7 +211,9 @@ Page {
                 for (var i = 0; i < app.status.contacts.length; ++i) {
                     if (app.status.contacts[i].id === nr) {
                         page.lage = 2
-                        page.meldung = app.tr("meetDone") + app.status.contacts[i].name
+                        page.treffKontakt = nr
+                        page.treffName = app.status.contacts[i].name
+                        page.meldung = app.tr("meetDone") + page.treffName
                         return
                     }
                 }
@@ -267,6 +272,25 @@ Page {
                 font.pixelSize: Theme.fontSizeSmall
                 color: page.lage === 3 ? Theme.errorColor : Theme.highlightColor
                 text: page.meldung
+            }
+
+
+            // Nach dem Treffen: der eine sinnvolle naechste Schritt, statt die
+
+            // Frage offenzulassen, was mit "Steht:" nun anzufangen ist.
+
+            Button {
+
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                visible: page.lage === 2 && page.treffKontakt > 0
+
+                text: app.tr("meetOpenChat")
+
+                onClicked: pageStack.replace(Qt.resolvedUrl("ChatPage.qml"),
+
+                                             {"contactId": page.treffKontakt, "contactName": page.treffName})
+
             }
 
             Label {
