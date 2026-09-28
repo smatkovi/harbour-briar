@@ -128,8 +128,10 @@ Page {
         // nachgemessen.
         Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
-            width: 400
-            height: sucher.laeuft ? 300 : 0
+            // Hochkant, weil das Bild nach der Drehung hochkant ist -- in
+            // einem querliegenden Kasten bliebe nur ein schmaler Streifen.
+            width: 360
+            height: sucher.laeuft ? 400 : 0
             visible: height > 0
             color: "black"
 

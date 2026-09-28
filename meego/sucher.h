@@ -51,10 +51,19 @@ class Sucher : public QDeclarativeItem
     /// Wonach gesucht wird: "" heisst jeder Code, "bqp" nur ein
     /// Treffen-Code. Die Seite entscheidet das, nicht diese Klasse.
     Q_PROPERTY(QString sucheNach READ sucheNach WRITE setSucheNach NOTIFY sucheNachChanged)
+    /// Um wie viel das Bild beim Zeichnen zu drehen ist. Der Bildaufnehmer
+    /// sitzt quer zum Schirm: ohne Drehung steht das Sucherbild am N9 um 90
+    /// Grad gegen den Uhrzeigersinn verdreht. Gedreht wird nur beim Malen --
+    /// quirc bekommt das ungedrehte Feld, und das ist ihm einerlei, weil ein
+    /// QR-Code in jeder Lage zu lesen ist. Eine Eigenschaft und keine
+    /// Konstante, damit sich die Richtung am Geraet richtigstellen laesst,
+    /// ohne neu zu bauen.
+    Q_PROPERTY(int drehung READ drehung WRITE setDrehung NOTIFY drehungChanged)
 
 public:
     explicit Sucher(QDeclarativeItem *parent = 0)
-        : QDeclarativeItem(parent), m_pipeline(0), m_sink(0), m_gefunden(false)
+        : QDeclarativeItem(parent), m_pipeline(0), m_sink(0), m_drehung(90),
+          m_gefunden(false)
     {
         setFlag(QGraphicsItem::ItemHasNoContents, false);
     }
@@ -62,6 +71,14 @@ public:
     ~Sucher() { anhalten(); }
 
     bool laeuft() const { return m_pipeline != 0; }
+    int drehung() const { return m_drehung; }
+    void setDrehung(int grad)
+    {
+        if (m_drehung == grad) return;
+        m_drehung = grad;
+        emit drehungChanged();
+        update();
+    }
     QString sucheNach() const { return m_sucheNach; }
     void setSucheNach(const QString &s)
     {
@@ -149,15 +166,32 @@ public:
             return;
         }
         // Seitenverhaeltnis wahren, Rest schwarz -- ein verzerrter Code ist
-        // schwerer zu treffen.
+        // schwerer zu treffen. Die Drehung macht der Maler; das Bild selbst
+        // wird nicht angefasst.
         const QRectF ziel = boundingRect();
-        QSizeF passend = QSizeF(bild.size());
-        passend.scale(ziel.size(), Qt::KeepAspectRatio);
-        const QRectF hin(ziel.x() + (ziel.width() - passend.width()) / 2,
-                         ziel.y() + (ziel.height() - passend.height()) / 2,
-                         passend.width(), passend.height());
         maler->fillRect(ziel, Qt::black);
-        maler->drawImage(hin, bild);
+
+        // Nach einer Vierteldrehung sind Breite und Hoehe vertauscht -- das
+        // muss in die Einpassung, sonst steht das Bild ueber den Rand.
+        QSizeF quelle = QSizeF(bild.size());
+        const bool quer = (m_drehung % 180) != 0;
+        if (quer)
+            quelle.transpose();
+        QSizeF passend = quelle;
+        passend.scale(ziel.size(), Qt::KeepAspectRatio);
+
+        maler->save();
+        maler->translate(ziel.center());
+        maler->rotate(m_drehung);
+        // Im gedrehten Bezugssystem wieder zurueckvertauscht: was hier breit
+        // ist, erscheint auf dem Schirm hoch.
+        const QSizeF innen = quer
+                ? QSizeF(passend.height(), passend.width())
+                : passend;
+        maler->drawImage(QRectF(-innen.width() / 2, -innen.height() / 2,
+                                innen.width(), innen.height()),
+                         bild);
+        maler->restore();
     }
 
 signals:
@@ -166,6 +200,7 @@ signals:
     void codeGelesen(const QString &hex);
     void laeuftChanged();
     void sucheNachChanged();
+    void drehungChanged();
 
 private slots:
     /// Im Oberflaechenfaden: nur neu zeichnen.
@@ -253,6 +288,7 @@ private:
     QImage m_bild;
     QMutex m_sperre;
     QString m_sucheNach;
+    int m_drehung;
     volatile bool m_gefunden;
 };
 

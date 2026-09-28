@@ -97,6 +97,9 @@ fn main() {
     if let Some(port) = lan_port {
         store.state.listen_port = port;
     }
+    // Ab hier schreibt das Protokoll auch neben den Zustand. Vorher geht
+    // es nicht: erst hier steht fest, wo der Zustand liegt.
+    net::log_datei_setzen(&state_path);
     net::log(&format!("state in {}", state_path.display()));
     let shared = Arc::new(Mutex::new(store));
 

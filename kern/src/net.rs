@@ -72,9 +72,49 @@ const RUHE: Duration = Duration::from_millis(1500);
 
 pub type Shared = Arc<Mutex<Store>>;
 
+/// Wohin das Protokoll ausser auf die Standardausgabe noch geht.
+///
+/// Auf dem N9 starte ich den Dienst von Hand mit einer Umleitung, auf der
+/// Jolla startet ihn die App -- und dort landet die Ausgabe nirgends. Als der
+/// Handschlag beim Treffen nicht zustande kam, war deshalb nur die eine
+/// Haelfte der Geschichte zu sehen. Seitdem schreibt der Dienst neben den
+/// Zustand.
+static LOGDATEI: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Hoechstgroesse, bevor umgehaengt wird. Klein genug fuer ein N9 mit vollem
+/// Wurzelverzeichnis, gross genug fuer einen ganzen Abend.
+const LOG_MAX: u64 = 256 * 1024;
+
+/// Sagt dem Protokoll, wohin es schreiben soll. Einmal beim Hochfahren.
+pub fn log_datei_setzen(neben: &std::path::Path) {
+    let mut pfad = neben.to_path_buf();
+    pfad.set_file_name("briard.log");
+    *LOGDATEI.lock().unwrap() = Some(pfad);
+}
+
 pub fn log(message: &str) {
-    println!("[{}] {}", now_ms() / 1000, message);
+    let zeile = format!("[{}] {}", now_ms() / 1000, message);
+    println!("{}", zeile);
     let _ = std::io::stdout().flush();
+    let pfad = match LOGDATEI.lock().unwrap().clone() {
+        Some(p) => p,
+        None => return,
+    };
+    // Umhaengen statt anwachsen lassen: eine Datei, die niemand begrenzt,
+    // fuellt am N9 irgendwann die Wurzel.
+    if std::fs::metadata(&pfad).map(|m| m.len()).unwrap_or(0) > LOG_MAX {
+        let mut alt = pfad.clone();
+        alt.set_extension("log.1");
+        let _ = std::fs::rename(&pfad, &alt);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&pfad)
+    {
+        let _ = writeln!(f, "{}", zeile);
+    }
 }
 
 /// A connection, over whichever transport carries it. Both are sockets, and
@@ -2746,6 +2786,38 @@ impl Node {
     /// Sichtbarkeit prueft.
     ///
     /// Geschickt wird es einmal: danach steht die Sitzung auf Beigetreten.
+    /// Die Beziehung in dieser Gruppe zeigen -- Briars "Kontakte zeigen".
+    ///
+    /// Es ist nichts weiter als ein JOIN in der Einladungsgruppe dieses
+    /// Kontakts; bei Briar macht `revealRelationship` genau das
+    /// (GroupInvitationManagerImpl:414 -> peerEngine.onJoinAction). Was es
+    /// bewirkt, steht am Zustandswerk der PEER-Rolle: NEITHER_JOINED ist
+    /// unsichtbar, LOCAL_JOINED sichtbar, BOTH_JOINED geteilt. Erst geteilt
+    /// tauschen die beiden die Gruppe unmittelbar aus statt ueber den, der
+    /// eingeladen hat.
+    ///
+    /// Bei uns aendert es an der Zustellung nichts -- wir schicken Beitraege
+    /// ohnehin an jeden Kontakt, der Mitglied ist. Es zaehlt gegenueber einem
+    /// echten Briar, das sich daran haelt.
+    pub fn beziehung_zeigen(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        group_hex: &str,
+    ) -> Result<(), &'static str> {
+        zeigbarkeit(store, group_hex, contact_id)?;
+        self.peer_join_schicken(store, contact_id, group_hex);
+        // peer_join_schicken haelt dieselben Riegel noch einmal; hat es
+        // trotzdem geschwiegen, soll die Oberflaeche nichts Falsches melden.
+        match store
+            .sitzung(group_hex, contact_id)
+            .and_then(|s| s.letzte_eigene.as_ref())
+        {
+            Some(_) => Ok(()),
+            None => Err("das JOIN ging nicht hinaus"),
+        }
+    }
+
     fn peer_join_schicken(&self, store: &mut Store, contact_id: u32, group_hex: &str) {
         use crate::store::Sitzungszustand;
         let (unsere, ihre) = match (store.identity(), store.contact(contact_id)) {
@@ -4716,17 +4788,43 @@ impl Node {
         let lauscher = std::net::TcpListener::bind(("0.0.0.0", 0))?;
         let port = lauscher.local_addr()?.port();
 
-        // Die Beschreiber: unsere LAN-Adresse mit dem fluechtigen Port, und die
-        // Bluetooth-Adresse, falls es eine gibt.
+        // Die Beschreiber: JEDE unserer WLAN-Adressen mit dem fluechtigen Port,
+        // und die Bluetooth-Adresse, falls es eine gibt.
+        //
+        // Warum alle und nicht eine: der Lauscher haengt an 0.0.0.0, ist also
+        // unter jeder von ihnen zu erreichen. Frueher stand hier "die erste
+        // Adresse, die sich lesen laesst" -- und wenn ein Geraet in zwei
+        // Netzen steht (etwa ein Mobilfunknetz und der eigene Hotspot), war
+        // das reihum die falsche. Die Gegenseite meldete dann "no reachable
+        // address", obwohl beide Geraete nebeneinander lagen. Genau so ist es
+        // zwischen Jolla und N9 passiert.
+        //
+        // Briar legt die Beschreiber in eine HashMap nach Verkehrsweg
+        // (KeyAgreementConnector:122), dort gewinnt also der LETZTE. Unser
+        // eigener Anwaehler probiert alle. Mehrere zu nennen ist damit nie
+        // schlechter als einer und fuer zwei eigene Geraete deutlich besser.
         let mut beschreiber: Vec<crate::bdf::Bdf> = Vec::new();
-        if let Some(ip) = local_ips().into_iter().find_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        let mut genannte: Vec<String> = Vec::new();
+        for ip in local_ips()
+            .into_iter()
+            .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
         {
+            genannte.push(ip.to_string());
             beschreiber.push(crate::bdf::Bdf::List(vec![
                 crate::bdf::Bdf::Int(crate::bqp::TRANSPORT_LAN),
                 crate::bdf::Bdf::Raw(ip.octets().to_vec()),
                 crate::bdf::Bdf::Int(port as i64),
             ]));
         }
+        log(&format!(
+            "BQP: im Code stehen {} ({})",
+            if genannte.is_empty() {
+                "keine WLAN-Adresse".to_string()
+            } else {
+                genannte.join(", ")
+            },
+            port
+        ));
         let verpflichtung = crate::bqp::commitment(&oeffentlich);
         let fertig = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kontakt = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -5002,6 +5100,53 @@ impl Node {
     }
 }
 
+/// Ob sich einem Kontakt gegenueber die Beziehung in dieser Gruppe zeigen
+/// laesst, und wenn nicht, warum.
+///
+/// Briar fuehrt je (Kontakt, Gruppe) eine Sitzung in einer von drei Rollen:
+/// CREATOR, wenn wir die Gruppe angelegt haben -- nur die Erstellerin laedt
+/// ein, also gilt das gegenueber jedem Mitglied --, INVITEE, wenn dieser
+/// Kontakt uns eingeladen hat, und sonst PEER. Nur in der PEER-Rolle gibt es
+/// etwas zu zeigen: in den anderen beiden ist das JOIN schon Teil der
+/// Einladung, und ein zweites gabelte die Kette. Briar selbst laesst
+/// `onJoinAction` nur aus NEITHER_JOINED zu (PeerProtocolEngine).
+pub fn zeigbarkeit(
+    store: &Store,
+    group_hex: &str,
+    contact_id: u32,
+) -> Result<(), &'static str> {
+    let unsere = store
+        .identity()
+        .map(|i| i.author_id.clone())
+        .ok_or("keine eigene Kennung")?;
+    let kontakt = store.contact(contact_id).ok_or("kein solcher Kontakt")?;
+    let gruppe = store.group(group_hex).ok_or("keine solche Gruppe")?;
+    if !gruppe.joined {
+        return Err("wir sind selbst noch nicht beigetreten");
+    }
+    if gruppe.aufgeloest {
+        return Err("die Gruppe ist aufgeloest");
+    }
+    if gruppe.creator_author_id == unsere {
+        return Err("wir haben die Gruppe angelegt -- da wird eingeladen, nicht gezeigt");
+    }
+    if gruppe.invited_by == Some(contact_id) {
+        return Err("dieser Kontakt hat uns eingeladen -- da ist nichts zu zeigen");
+    }
+    if !gruppe.member_names.contains_key(&kontakt.author_id) {
+        return Err("dieser Kontakt ist nicht in der Gruppe");
+    }
+    if gruppe
+        .einladungen
+        .get(&contact_id)
+        .and_then(|s| s.letzte_eigene.as_ref())
+        .is_some()
+    {
+        return Err("schon gezeigt");
+    }
+    Ok(())
+}
+
 /// Eine Bluetooth-Adresse in die sechs Bytes, die Briar in den Beschreiber
 /// legt (`macToBytes`). Hohe Stelle zuerst, wie in der Schreibweise.
 fn mac_zu_bytes(mac: &str) -> Option<Vec<u8>> {
@@ -5071,13 +5216,13 @@ impl Node {
         // scannt, wartet damit einfach, bis die Gegenseite ihren Code zeigt.
         // Ohne das muesste der Benutzer noch einmal scannen.
         let mut letzter = bad("keine Adresse im Code");
-        let adresse = payload.lan();
+        let adressen = payload.lan_alle();
         // Die Kennung des Dienstes der Gegenseite kommt aus IHRER
         // Verpflichtung -- Briar macht es genauso
         // (AbstractBluetoothPlugin.createKeyAgreementConnection:464).
         let bt_mac = payload.bluetooth();
         let bt_uuid = crate::bqp::bt_uuid(&payload.commitment);
-        if adresse.is_none() && bt_mac.is_none() {
+        if adressen.is_empty() && bt_mac.is_none() {
             return Err(letzter);
         }
         let bis = std::time::Instant::now() + Duration::from_secs(60);
@@ -5100,7 +5245,9 @@ impl Node {
                     Err(e) => letzter = e,
                 }
             }
-            if let Some(adresse) = adresse.as_deref() {
+            // Jede genannte Adresse durchprobieren: steht das Geraet in zwei
+            // Netzen, ist nur eine davon von hier aus erreichbar.
+            for adresse in &adressen {
                 match dial(LAN_TRANSPORT_ID, adresse, None) {
                     Ok(strom @ Conn::Tcp(_)) => {
                         return self.bqp_durchfuehren(

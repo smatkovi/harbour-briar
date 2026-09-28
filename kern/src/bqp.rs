@@ -92,8 +92,25 @@ pub struct Payload {
 }
 
 impl Payload {
-    /// Die LAN-Adresse aus den Beschreibern, als `ip:port`.
+    /// Die erste WLAN-Adresse. Nur noch fuer Aufrufer, die eine einzige
+    /// wollen; zum Anwaehlen ist `lan_alle()` richtig.
     pub fn lan(&self) -> Option<String> {
+        self.lan_alle().into_iter().next()
+    }
+
+    /// Alle WLAN-Adressen aus den Beschreibern, als `ip:port`.
+    ///
+    /// Mehrere sind erlaubt und kommen vor: ein Geraet, das in zwei Netzen
+    /// steht, lauscht auf 0.0.0.0 und ist unter jeder erreichbar -- aber von
+    /// der Gegenseite aus meist nur unter einer. Wer nur die erste probiert,
+    /// meldet "no reachable address", obwohl die Geraete nebeneinander liegen.
+    ///
+    /// Briar selbst nennt eine (LanTcpPlugin.createKeyAgreementListener) und
+    /// behaelt beim Lesen die letzte je Verkehrsweg
+    /// (KeyAgreementConnector:122) -- mehrere zu nennen schadet ihm also
+    /// nicht, und mehrere zu lesen kostet uns nichts.
+    pub fn lan_alle(&self) -> Vec<String> {
+        let mut gefunden = Vec::new();
         for d in &self.descriptors {
             // Weiterschauen statt aufgeben: ein Beschreiber, mit dem wir
             // nichts anfangen koennen, darf die folgenden nicht verdecken.
@@ -121,12 +138,12 @@ impl Payload {
             if !(1..=65535).contains(&port) {
                 continue;
             }
-            return Some(match ip {
+            gefunden.push(match ip {
                 std::net::IpAddr::V4(v4) => format!("{}:{}", v4, port),
                 std::net::IpAddr::V6(v6) => format!("[{}]:{}", v6, port),
             });
         }
-        None
+        gefunden
     }
 
     /// Die Bluetooth-Adresse aus den Beschreibern, in Grossbuchstaben.
@@ -662,5 +679,55 @@ mod bluetooth_beschreiber_tests {
         let b = bt_uuid(&[2u8; 16]);
         assert_ne!(a, b);
         assert_eq!(a, bt_uuid(&[1u8; 16]));
+    }
+}
+
+#[cfg(test)]
+mod mehrere_adressen_tests {
+    use super::*;
+    use crate::bdf::Bdf;
+
+    fn lan(ip: [u8; 4], port: i64) -> Bdf {
+        Bdf::List(vec![
+            Bdf::Int(TRANSPORT_LAN),
+            Bdf::Raw(ip.to_vec()),
+            Bdf::Int(port),
+        ])
+    }
+
+    /// Ein Geraet in zwei Netzen nennt beide. Wer nur die erste probiert,
+    /// meldet "no reachable address", obwohl die Geraete nebeneinander
+    /// liegen -- genau so ist es zwischen Jolla und N9 passiert.
+    #[test]
+    fn alle_adressen_kommen_heraus() {
+        let roh = encode(&Payload {
+            commitment: vec![3u8; 16],
+            descriptors: vec![
+                lan([10, 156, 40, 213], 32951),
+                lan([172, 28, 172, 1], 32951),
+            ],
+        });
+        let p = parse(&roh).unwrap();
+        assert_eq!(
+            p.lan_alle(),
+            vec!["10.156.40.213:32951", "172.28.172.1:32951"]
+        );
+        // lan() bleibt die erste -- Aufrufer, die eine wollen, bekommen eine.
+        assert_eq!(p.lan().as_deref(), Some("10.156.40.213:32951"));
+    }
+
+    /// Ein Bluetooth-Beschreiber dazwischen darf keine Adresse verdecken.
+    #[test]
+    fn bluetooth_dazwischen_stoert_nicht() {
+        let roh = encode(&Payload {
+            commitment: vec![3u8; 16],
+            descriptors: vec![
+                lan([10, 0, 0, 1], 7327),
+                Bdf::List(vec![Bdf::Int(TRANSPORT_BLUETOOTH)]),
+                lan([192, 168, 1, 5], 7327),
+            ],
+        });
+        let p = parse(&roh).unwrap();
+        assert_eq!(p.lan_alle(), vec!["10.0.0.1:7327", "192.168.1.5:7327"]);
     }
 }

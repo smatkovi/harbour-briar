@@ -191,8 +191,9 @@ Page {
             // darauf), bleibt es bei den beiden Knoepfen darunter.
             Rectangle {
                 anchors.horizontalCenter: parent.horizontalCenter
-                width: 400
-                height: sucher.laeuft ? 300 : 0
+                // Hochkant, weil das Bild nach der Drehung hochkant ist.
+                width: 360
+                height: sucher.laeuft ? 420 : 0
                 visible: height > 0
                 color: "black"
 
