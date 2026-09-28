@@ -113,6 +113,25 @@ for ARCH in $ARCHES; do
 
     echo "== tor ($ARCH)"
     unpack "$TOR" "$ARCH" && cd "$TOR-$ARCH"
+    # Der eine Eingriff in Tors Quelltext, und der einzige Hebel, der am
+    # Arbeitsspeicher wirklich etwas bewegt. Nach dem Bootstrap haelt Tor
+    # alle Mikrodeskriptoren 30 Minuten lang im Heap, bevor es sie in die
+    # Datei cached-microdescs schreibt und von da an nur noch einblendet
+    # (mmap, vom Kernel verdraengbar). Am N9 mit 1 GB heisst das 30 Minuten
+    # zu 60 MB statt 22 MB anonym -- und weil Tor dort selten so lange
+    # laeuft, bei jedem Start. Mit 120 s statt 30 Minuten, gemessen am
+    # armv7-Binary (arch, 28.09.2026): anonym 60,0 -> 22,6 MB, RSS
+    # 64,8 -> 44,3 MB, ab zwei Minuten nach dem Bootstrap. Ueber die
+    # Leitung geht dadurch nichts anders: die Deskriptoren liegen ohnehin
+    # ab Empfang im Journal cached-microdescs.new, nur der Heap wird
+    # frueher frei. Die torrc kennt dafuer keinen Schalter.
+    #
+    # Die Wache darunter: schlaegt sed ins Leere, weil eine neue Tor-Fassung
+    # die Zeile anders schreibt, bricht der Bau ab, statt still ein
+    # ungepatchtes Tor zu liefern.
+    sed -i 's/CLEAN_CACHES_INTERVAL (30\*60)/CLEAN_CACHES_INTERVAL 120/' src/core/mainloop/mainloop.c
+    grep -qx '#define CLEAN_CACHES_INTERVAL 120' src/core/mainloop/mainloop.c \
+        || { echo "CLEAN_CACHES_INTERVAL nicht gefunden -- Tor-Quelltext geaendert?" >&2; exit 1; }
     # Cross builds cannot run the target's binaries, so the two answers
     # configure would work out by running something are given here.
     ./configure --host="$TRIPLE" --prefix="$PREFIX" \

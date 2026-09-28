@@ -12,12 +12,24 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::time::Duration;
 
 pub const VIRTUAL_PORT: u16 = 80;
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// Briar's own Tor listens here; a system Tor uses the usual 9050/9051.
 const CANDIDATES: [(u16, u16); 2] = [(9051, 9050), (59051, 59050)];
+/// Unterhalb dieser Grenze warnt der Dienst vor dem Start: der
+/// Verzeichniscache misst rund 40 MB, und beim Neuschreiben liegt er kurz
+/// doppelt da. Nur eine Warnung, kein Riegel -- ein Riegel bei 100 MB haette
+/// Tor am N9 nach der ersten vollen Sitzung ausgesperrt (nachgerechnet am
+/// 29.09.2026: 145 MB frei, 40 MB Cache, der Rest schwindet von selbst).
+const PLATZ_WARNUNG_MB: u64 = 100;
+/// Bekommt Tor beim Start mit auf den Weg: stirbt der Dienst, bevor er
+/// TAKEOWNERSHIP senden konnte, merkt Tor es an der fehlenden Prozessnummer
+/// und beendet sich selbst (es sieht alle 15 s nach). Danach wird die Angabe
+/// wieder abgestellt, wie Briars AbstractTorWrapper es haelt.
+const EIGENTUEMER: &str = "__OwningControllerProcess";
 
 pub struct Tor {
     pub control_port: u16,
@@ -40,18 +52,162 @@ impl Drop for Tor {
 }
 
 /// Finds a running Tor and authenticates to its control port.
+///
+/// Uebernimmt es NICHT: `connect` ruft auch der Waehler fuer jeden
+/// ausgehenden Aufbau (net::dial) und laesst die Verbindung gleich wieder
+/// fallen. Tor stirbt nach TAKEOWNERSHIP mit genau der Verbindung, die es
+/// gesandt hat -- saesse die Uebernahme hier, toetete jeder Aufbau Tor.
 pub fn connect() -> Option<Tor> {
     for (control_port, socks_port) in CANDIDATES {
-        if let Ok(control) = open_control(control_port) {
-            return Some(Tor {
-                control_port,
-                socks_port,
-                control,
-                child: None,
-            });
+        if let Ok(tor) = connect_to(control_port, socks_port) {
+            return Some(tor);
         }
     }
     None
+}
+
+/// Verbindet sich mit dem Tor auf dem genannten Steuerport. Getrennt von
+/// `connect`, damit ein Pruefstand eine Attrappe auf einem eigenen Port
+/// unterschieben kann.
+pub fn connect_to(control_port: u16, socks_port: u16) -> std::io::Result<Tor> {
+    let control = open_control(control_port)?;
+    Ok(Tor {
+        control_port,
+        socks_port,
+        control,
+        child: None,
+    })
+}
+
+/// Die torrc, die der Dienst fuer sein eigenes Tor schreibt.
+///
+/// Speicherseitig ist daran nichts mehr zu holen: alle Schalter zusammen
+/// bringen 0 MB (gemessen 28./29.09.2026, Jolla und arch/i486). Der Heap
+/// besteht aus Konsens und Mikrodeskriptoren, und den verkleinert nur der
+/// Bau-Patch in tools/build-tor.sh. MaxMemInQueues ist eine Notbremse gegen
+/// Lastspitzen, im Leerlauf ohne Wirkung: 64 MB ist der kleinste Wert, den
+/// Tor ohne Warnung nimmt (MIN_UNWARNED_CLIENT_MB), statt der Vorgabe von
+/// 768 MB, die es sich am N9 aus dem Arbeitsspeicher ableitet.
+pub fn torrc_text(socks_port: u16, control_port: u16, tor_dir: &Path) -> String {
+    format!(
+        "SocksPort 127.0.0.1:{}\nControlPort 127.0.0.1:{}\nCookieAuthentication 0\n\
+         DataDirectory {}\nAvoidDiskWrites 1\nClientOnly 1\nMaxMemInQueues 64 MB\n",
+        socks_port,
+        control_port,
+        tor_dir.display()
+    )
+}
+
+/// Freier Platz unter `pfad` in MB; None, wenn das Dateisystem nicht
+/// antwortet oder der Pfad fehlt.
+pub fn freier_platz_mb(pfad: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(pfad.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // Sicher: `c` ist eine gueltige C-Zeichenkette, `s` ein beschreibbarer
+    // Puffer der richtigen Groesse.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    // Die Feldbreiten unterscheiden sich zwischen den drei musl-Zielen:
+    // erst auf u64 heben, dann rechnen.
+    Some((s.f_bavail as u64).saturating_mul(s.f_frsize as u64) / (1024 * 1024))
+}
+
+/// Was auf unserem eigenen Steuerport vorgefunden wurde, als der Dienst kam.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Vorgefunden {
+    /// Liest unsere torrc, und kein lebender Dienst ist sein Elternprozess:
+    /// ein Tor, das ein frueherer Dienst zurueckliess.
+    Waise,
+    /// Liest unsere torrc, und ein anderer laufender Dienst haelt es --
+    /// eine aeltere Fassung ohne Instanzsperre. Nur mitbenutzen.
+    Lebendig,
+    /// Liest eine andere torrc oder nennt weder Datei noch Prozessnummer:
+    /// nicht unseres. Nur mitbenutzen.
+    Fremd,
+}
+
+/// Ordnet ein Tor ein, das schon auf unserem Steuerport laeuft.
+///
+/// Warum das noetig ist und nicht einfach TAKEOWNERSHIP: Tor nimmt jede
+/// Steuerverbindung als Eigentuemer an, die es verlangt, und stirbt, sobald
+/// EINE davon schliesst. Haengt noch ein anderer Dienst daran (die App hat
+/// einen gestartet, dann schaltete der Benutzer den Hintergrunddienst ein --
+/// systemctl --now startete den zweiten), naehme ein blindes TAKEOWNERSHIP
+/// dem ersten sein Tor weg, und beim ersten fehlgeschlagenen ADD_ONION
+/// (550, der Schluessel ist ja schon angemeldet) fiele die Verbindung und
+/// Tor mit ihr -- minuetlich, mit Onion-Dienst dauerhaft weg. Gefunden in
+/// der Gegenpruefung von 0.38.0, bevor es auf ein Geraet kam.
+///
+/// Eine Waise entsteht nur in dem Fenster zwischen dem Start von Tor und
+/// dem TAKEOWNERSHIP -- etwa wenn die App den Dienst bei einer
+/// Aktualisierung genau dann beendet. Seit 0.38.0 schliesst
+/// `__OwningControllerProcess` dieses Fenster; was heute noch steht, stammt
+/// aus frueheren Fassungen (Jolla, 28.09.2026: 58 MB, die niemand freigab).
+pub fn einordnen(tor: &mut Tor, tor_dir: &Path) -> Vorgefunden {
+    let unsere = match std::fs::canonicalize(tor_dir.join("torrc")) {
+        Ok(p) => p,
+        // Ohne eigene torrc gibt es nichts, was unseres sein koennte.
+        Err(_) => return Vorgefunden::Fremd,
+    };
+    let seine = match tor.konfigurationsdatei() {
+        Some(pfad) => std::fs::canonicalize(&pfad).unwrap_or_else(|_| pfad.into()),
+        None => return Vorgefunden::Fremd,
+    };
+    if seine != unsere {
+        return Vorgefunden::Fremd;
+    }
+    let pid = match tor.prozessnummer() {
+        Some(pid) => pid,
+        None => return Vorgefunden::Fremd,
+    };
+    match elternprozess(pid).map(|eltern| ist_dienst(&prozessname(eltern))) {
+        // Elternprozess ist ein laufender Dienst: ihm gehoert es.
+        Some(true) => Vorgefunden::Lebendig,
+        // Elternprozess ist init, ein Subreaper (systemd --user) oder sonst
+        // etwas: der Dienst, der es startete, ist weg.
+        Some(false) => Vorgefunden::Waise,
+        // /proc gibt nichts her: dann lieber nicht toeten, was wir nicht
+        // beurteilen koennen.
+        None => Vorgefunden::Fremd,
+    }
+}
+
+/// Ob ein Prozessname (aus /proc/<pid>/comm, auf 15 Zeichen gekuerzt)
+/// einer unserer Dienste ist: /usr/bin/harbour-briar-briard auf Sailfish,
+/// /opt/briar/bin/briard auf Harmattan.
+pub fn ist_dienst(name: &str) -> bool {
+    name == "briard" || name.starts_with("harbour-briar-b")
+}
+
+/// Der Elternprozess laut /proc/<pid>/stat -- das vierte Feld, hinter dem
+/// eingeklammerten Namen, der selbst Leerzeichen enthalten darf.
+pub fn elternprozess(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Der Name aus /proc/<pid>/comm; leer, wenn es den Prozess nicht gibt.
+pub fn prozessname(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Wartet, bis auf dem Port niemand mehr antwortet -- nach dem Beenden einer
+/// Waise, bevor das eigene Tor denselben Port nimmt. Ohne das scheiterte der
+/// neue Start am noch belegten Steuerport, und der Aufseher braeuchte einen
+/// zweiten Anlauf.
+fn warten_bis_frei(port: u16) -> bool {
+    for _ in 0..40 {
+        if TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
 }
 
 /// Where a Tor shipped with this port would be. Neither device can install
@@ -64,11 +220,7 @@ const BUNDLED: [&str; 3] = [
 
 /// Starts the bundled Tor if none is running, and waits for its control
 /// port. Returns the connection, or None when there is no Tor at all.
-pub fn connect_or_start(data_dir: &std::path::Path) -> Option<Tor> {
-    if let Some(tor) = connect() {
-        return Some(tor);
-    }
-    let binary = BUNDLED.iter().find(|path| std::path::Path::new(path).exists())?;
+pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
     let tor_dir = data_dir.join("tor");
     if std::fs::create_dir_all(&tor_dir).is_err() {
         return None;
@@ -79,23 +231,71 @@ pub fn connect_or_start(data_dir: &std::path::Path) -> Option<Tor> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tor_dir, std::fs::Permissions::from_mode(0o700));
     }
+    // Die torrc VOR dem Umsehen schreiben: `einordnen` vergleicht dagegen,
+    // und nach "Konto loeschen" (raeumt tor/ weg) stuende sonst eine Waise
+    // ohne Datei da, die als fremd durchginge und bis zum Neustart des
+    // Geraets weiterliefe. Der Inhalt haengt nur an Ports und Verzeichnis;
+    // ein laufendes Tor liest die Datei nicht noch einmal.
     let (control_port, socks_port) = CANDIDATES[1];
     let torrc = tor_dir.join("torrc");
-    let _ = std::fs::write(
-        &torrc,
-        format!(
-            "SocksPort 127.0.0.1:{}\nControlPort 127.0.0.1:{}\nCookieAuthentication 0\n\
-             DataDirectory {}\nAvoidDiskWrites 1\nClientOnly 1\n",
-            socks_port,
-            control_port,
-            tor_dir.display()
-        ),
-    );
+    let _ = std::fs::write(&torrc, torrc_text(socks_port, control_port, &tor_dir));
+    if let Some(mut tor) = connect() {
+        // Der System-Tor auf 9051 bleibt, was er ist. Nur auf unserem
+        // eigenen Port kann ein zurueckgelassenes Tor stehen.
+        if tor.control_port != CANDIDATES[1].0 {
+            return Some(tor);
+        }
+        match einordnen(&mut tor, &tor_dir) {
+            Vorgefunden::Waise => {
+                // Nicht weiterbetreiben: es ist das alte Programm mit der
+                // alten torrc (der laufende Prozess behaelt seine Datei, auch
+                // wenn das Paket sie ersetzt hat), also ohne den Bau-Patch
+                // und ohne Notbremse. Beenden und frisch starten.
+                let port = tor.control_port;
+                crate::net::log("Tor: ein zurueckgelassenes Tor gefunden -- wird beendet und neu gestartet");
+                if !tor.beenden() {
+                    crate::net::log("Tor: die Waise nahm TAKEOWNERSHIP nicht an");
+                }
+                if !warten_bis_frei(port) {
+                    crate::net::log("Tor: die Waise gibt den Steuerport nicht frei");
+                    return None;
+                }
+            }
+            Vorgefunden::Lebendig => {
+                crate::net::log("Tor: ein anderer Dienst haelt das Tor auf unserem Port -- nur mitbenutzt");
+                return Some(tor);
+            }
+            Vorgefunden::Fremd => {
+                crate::net::log(&format!(
+                    "Tor auf Port {} ist nicht unseres -- nur mitbenutzt",
+                    tor.control_port
+                ));
+                return Some(tor);
+            }
+        }
+    }
+    let binary = BUNDLED.iter().find(|path| Path::new(path).exists())?;
+    // Wird die Platte knapp, scheitert spaeter das Neuschreiben des
+    // Verzeichniscaches, und Tor haelt die Mikrodeskriptoren im Heap statt in
+    // der Datei -- am N9 der Unterschied zwischen 22 und 60 MB. Gestartet
+    // wird trotzdem; wer hier riegelte, sperrte Tor am N9 dauerhaft aus.
+    if let Some(mb) = freier_platz_mb(&tor_dir) {
+        if mb < PLATZ_WARNUNG_MB {
+            crate::net::log(&format!(
+                "Tor: nur {} MB frei unter {} -- der Verzeichniscache braucht rund 40 MB \
+                 und beim Neuschreiben kurz das Doppelte",
+                mb,
+                tor_dir.display()
+            ));
+        }
+    }
     let log = std::fs::File::create(tor_dir.join("tor.log")).ok()?;
     let errors = log.try_clone().ok()?;
     let mut child = std::process::Command::new(binary)
         .arg("-f")
         .arg(&torrc)
+        .arg(EIGENTUEMER)
+        .arg(std::process::id().to_string())
         .stdout(log)
         .stderr(errors)
         .spawn()
@@ -104,17 +304,34 @@ pub fn connect_or_start(data_dir: &std::path::Path) -> Option<Tor> {
     // comes up long before that.
     for _ in 0..30 {
         std::thread::sleep(Duration::from_secs(1));
-        if let Ok(mut control) = open_control(control_port) {
-            // Our Tor, so it may die with us: after TAKEOWNERSHIP it shuts
-            // itself down when this control connection closes. That covers
-            // the case where the daemon is killed and Drop never runs.
-            let _ = command(&mut control, "TAKEOWNERSHIP\r\n");
-            return Some(Tor {
+        if let Ok(control) = open_control(control_port) {
+            let mut tor = Tor {
                 control_port,
                 socks_port,
                 control,
-                child: Some(child),
-            });
+                child: None,
+            };
+            // Ist das auch unser Kind? Tor oeffnet seine Ports, bevor es das
+            // Datenverzeichnis sperrt: war der Steuerport schon belegt, ist
+            // unser Kind laengst wieder gestorben, und hier antwortet das Tor
+            // eines anderen -- das darf nicht unseres werden.
+            if tor.prozessnummer() != Some(child.id()) {
+                crate::net::log(&format!(
+                    "Tor auf Port {} ist nicht das gestartete Kind -- nur mitbenutzt",
+                    control_port
+                ));
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(tor);
+            }
+            tor.child = Some(child);
+            // Our Tor, so it may die with us: after TAKEOWNERSHIP it shuts
+            // itself down when this control connection closes. That covers
+            // the case where the daemon is killed and Drop never runs.
+            if let Err(e) = tor.uebernehmen() {
+                crate::net::log(&format!("Tor: TAKEOWNERSHIP abgelehnt: {}", e));
+            }
+            return Some(tor);
         }
     }
     let _ = child.kill();
@@ -195,6 +412,62 @@ impl Tor {
             Ok((code, _)) => code == 250,
             Err(_) => false,
         }
+    }
+
+    /// Macht dieses Tor zu unserem: nach TAKEOWNERSHIP beendet es sich,
+    /// sobald diese Steuerverbindung schliesst. Danach wird die
+    /// Prozessueberwachung vom Start (`__OwningControllerProcess`) wieder
+    /// abgestellt, wie Briar es tut -- die Verbindung reicht als Band, und
+    /// Tor muss nicht mehr alle 15 s nachsehen. Auf einem Tor, das ohne die
+    /// Angabe gestartet wurde, ist das RESETCONF ein Leerlauf (250 OK).
+    pub fn uebernehmen(&mut self) -> std::io::Result<()> {
+        let (code, lines) = command(&mut self.control, "TAKEOWNERSHIP\r\n")?;
+        if code != 250 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Tor refused TAKEOWNERSHIP: {:?}", lines),
+            ));
+        }
+        let _ = command(&mut self.control, &format!("RESETCONF {}\r\n", EIGENTUEMER));
+        Ok(())
+    }
+
+    /// Welche torrc dieses Tor liest. So unterscheidet der Dienst sein
+    /// eigenes, zurueckgelassenes Tor von einem fremden auf demselben Port.
+    /// Tor nennt den Pfad, wie er hinter -f stand, mit dem damaligen
+    /// Arbeitsverzeichnis davor -- nicht aufgeloest; das tut `einordnen`.
+    pub fn konfigurationsdatei(&mut self) -> Option<String> {
+        self.getinfo("config-file")
+    }
+
+    /// Die Prozessnummer dieses Tor -- so erkennt der Dienst sein eigenes
+    /// Kind und den Elternprozess einer Waise.
+    pub fn prozessnummer(&mut self) -> Option<u32> {
+        self.getinfo("process/pid")?.parse().ok()
+    }
+
+    fn getinfo(&mut self, schluessel: &str) -> Option<String> {
+        let (code, lines) =
+            command(&mut self.control, &format!("GETINFO {}\r\n", schluessel)).ok()?;
+        if code != 250 {
+            return None;
+        }
+        let praefix = format!("{}=", schluessel);
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(praefix.as_str()).map(|s| s.to_string()))
+    }
+
+    /// Beendet ein Tor, das niemandem mehr gehoert: TAKEOWNERSHIP, dann die
+    /// Verbindung schliessen -- Tor nimmt das als Verlust seines Eigentuemers
+    /// und beendet sich sauber (SIGTERM an sich selbst). Gibt zurueck, ob Tor
+    /// die Uebernahme angenommen hat; ohne sie bleibt es stehen.
+    pub fn beenden(mut self) -> bool {
+        let angenommen = command(&mut self.control, "TAKEOWNERSHIP\r\n")
+            .map(|(code, _)| code == 250)
+            .unwrap_or(false);
+        drop(self);
+        angenommen
     }
 
     /// Raeumt einen mit `publish` angemeldeten Dienst wieder ab.
