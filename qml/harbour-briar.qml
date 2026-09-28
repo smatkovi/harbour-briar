@@ -61,6 +61,18 @@ ApplicationWindow {
                           { "objectName": "unlockPage" })
     }
 
+    // Der EINE Weg von der Entsperrseite herunter. Sie kommt per replace()
+    // auf den Stapel, der ist danach eine Seite tief -- und pop() tut bei
+    // Tiefe 1 nichts. Genau so blieb die Seite mit "wird geprueft" stehen,
+    // waehrend der Dienst laengst offen war. Also nicht pop(), sondern die
+    // Startseite ausdruecklich an ihre Stelle setzen.
+    function entsperrt() {
+        app.locked = false
+        app.lastError = ""
+        pageStack.replace(Qt.resolvedUrl("pages/MainPage.qml"))
+        app.refresh()
+    }
+
     function refresh() {
         Briar.status(function(answer) {
             if (answer.locked) {

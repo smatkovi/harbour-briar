@@ -64,6 +64,15 @@ PageStackWindow {
         }
     }
 
+    // Der eine Weg von der Entsperrseite herunter -- siehe harbour-briar.qml:
+    // sie kommt per replace() herein, pop() tut bei Tiefe 1 nichts.
+    function entsperrt() {
+        fenster.gesperrt = false
+        fenster.fehler = ""
+        pageStack.replace(kontakteSeite)
+        fenster.aktualisieren()
+    }
+
     function entsperrseiteZeigen() {
         if (pageStack.currentPage
                 && pageStack.currentPage.objectName === "entsperren")

@@ -58,9 +58,7 @@ Page {
                     page.message = app.tr("unlockWrong")
                     return
                 }
-                app.locked = false
-                app.refresh()
-                pageStack.pop()
+                app.entsperrt()
             })
         }
         onFehlgeschlagen: {
@@ -125,9 +123,7 @@ Page {
                     return
                 }
                 app.sperrMarke = ""
-                app.locked = false
-                app.refresh()
-                pageStack.pop()
+                app.entsperrt()
             })
         }
         onAborted: page.message = app.tr("lockedHint")
@@ -164,9 +160,7 @@ Page {
                 // Ohne das schiebt die naechste Auffrischung die Seite
                 // gleich wieder davor -- der Dienst ist offen, die App
                 // glaubt aber weiter, sie sei gesperrt.
-                app.locked = false
-                app.refresh()
-                pageStack.pop()
+                app.entsperrt()
             })
         }
     }
@@ -201,9 +195,7 @@ Page {
             }
             // Der Dienst faehrt jetzt hoch; die Oberflaeche holt sich den
             // Zustand beim naechsten Durchlauf von selbst.
-            app.locked = false
-            app.refresh()
-            pageStack.pop()
+            app.entsperrt()
         })
     }
 

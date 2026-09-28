@@ -50,9 +50,7 @@ Page {
                 wache.stop()
                 seite.laeuft = false
                 fenster.entsperrtGerade = false
-                fenster.gesperrt = false
-                fenster.aktualisieren()
-                pageStack.pop()
+            fenster.entsperrt()
             })
         }
     }
@@ -77,9 +75,7 @@ Page {
                 feld.text = ""
                 return
             }
-            fenster.gesperrt = false
-            fenster.aktualisieren()
-            pageStack.pop()
+            fenster.entsperrt()
         })
     }
 
