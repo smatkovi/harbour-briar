@@ -146,15 +146,16 @@ Page {
         when: page.leser !== null
     }
 
-    // Der Filter hat etwas gelesen. ZXing gibt Text; ein BQP-Rumpf ist binaer
-    // und wird bei Briar ueber ISO-8859-1 abgebildet -- diesen Weg zurueck.
-    // Steht ein Zeichen ueber 255 darin, hat der Leser die Bytes verdorben;
-    // dann schweigen wir und lassen den Fotoweg ran, der sie roh liest.
+    // Der Filter hat etwas gelesen. ZXing schreibt nicht druckbare Bytes als
+    // Namen aus; Briar.zxingZuHex rechnet das zurueck. Hier gilt der strenge
+    // Riegel: eine Verpflichtung, die durch die Rueckrechnung verdorben
+    // wurde, darf nicht in einen Handschlag gehen -- der Fotoweg darunter
+    // liest die Bytes roh und kommt ohne Rueckrechnung aus.
     function ausFilter(text) {
         if (page.lage !== 0 || !text)
             return
-        var hex = Briar.textZuHex(text)
-        if (hex === null || !Briar.istBqp(hex)) {
+        var hex = Briar.zxingZuHex(text)
+        if (hex === null || !Briar.istBqpStreng(hex)) {
             if (page.leser)
                 page.leser.clearResult()
             return

@@ -329,6 +329,77 @@ function bqpStop(callback) {
 
 // Ein gelesener Code, als Hex. Das erste Byte sagt, was es ist: 0x04 ist ein
 // BQP-Rumpf (Briars Fassung 4), alles andere ist Schrift -- unser Link.
+/// Was ZXing zurueckgibt, in rohe Bytes zurueckrechnen.
+///
+/// Der Filter der Kamera-App liefert einen QString, und ZXing schreibt darin
+/// nicht druckbare Bytes als lesbare Namen aus -- nachgemessen am eigenen
+/// BQP-Code ueber den zxing-daemon:
+///
+///   0x04 -> "<EOT>"   (C0-Steuerzeichen beim Namen genannt)
+///   0x82 -> "<U+82>"  (0x80..0x9F, in Latin-1 die C1-Steuerzeichen)
+///
+/// Beides laesst sich umkehren. Der Beweis war der eigene Treffen-Code: 36
+/// Bytes, und sie zerlegen sich restlos in Kennzeichen, 16-Byte-Verpflichtung
+/// und einen WLAN-Beschreiber mit der richtigen Adresse und dem richtigen
+/// Port. Ohne diese Umkehr kaeme aus dem schnellen Leser fuer BQP nur Unsinn.
+///
+/// Eine Unschaerfe bleibt und soll hier stehen: enthielte die Nutzlast selbst
+/// die Zeichen "<EOT>", waere sie von einem echten 0x04 nicht zu
+/// unterscheiden. Bei einer Verpflichtung aus Zufallsbytes ist das sehr
+/// unwahrscheinlich, und wenn es doch geschieht, passt die Verpflichtung
+/// nicht zum Schluessel und der Handschlag bricht ab -- also nichts
+/// Gefaehrliches, nur ein Versuch, der nichts wird.
+function zxingZuHex(text) {
+    if (!text)
+        return ""
+    var namen = { NUL: 0, SOH: 1, STX: 2, ETX: 3, EOT: 4, ENQ: 5, ACK: 6,
+                  BEL: 7, BS: 8, HT: 9, LF: 10, VT: 11, FF: 12, CR: 13,
+                  SO: 14, SI: 15, DLE: 16, DC1: 17, DC2: 18, DC3: 19,
+                  DC4: 20, NAK: 21, SYN: 22, ETB: 23, CAN: 24, EM: 25,
+                  SUB: 26, ESC: 27, FS: 28, GS: 29, RS: 30, US: 31, DEL: 127 }
+    var hex = ""
+    var i = 0
+    while (i < text.length) {
+        var wert = -1
+        var weiter = 1
+        if (text.charAt(i) === "<") {
+            var zu = text.indexOf(">", i + 1)
+            if (zu > i && zu - i <= 9) {
+                var innen = text.substring(i + 1, zu)
+                if (innen.substring(0, 2) === "U+") {
+                    var z = parseInt(innen.substring(2), 16)
+                    if (!isNaN(z) && z >= 0 && z <= 255) {
+                        wert = z
+                        weiter = zu - i + 1
+                    }
+                } else if (namen.hasOwnProperty(innen)) {
+                    wert = namen[innen]
+                    weiter = zu - i + 1
+                }
+            }
+        }
+        if (wert < 0) {
+            wert = text.charCodeAt(i)
+            // Ueber 255 heisst: der Leser hat die Bytes als etwas anderes
+            // gedeutet, und dann ist hier nichts mehr zu retten.
+            if (wert > 255)
+                return null
+        }
+        hex += (wert < 16 ? "0" : "") + wert.toString(16)
+        i += weiter
+    }
+    return hex
+}
+
+/// Der strenge Riegel fuer den schnellen Leser: Kennzeichen, Listenanfang,
+/// und eine Verpflichtung von genau 16 rohen Bytes. Ein Code, den die
+/// Rueckrechnung oben verdorben haette, faellt hier fast sicher durch. Der
+/// Fotoweg benutzt weiter istBqp() -- der liest die Bytes roh und braucht
+/// keinen Riegel.
+function istBqpStreng(hex) {
+    return !!hex && hex.length > 40 && hex.substring(0, 8) === "04605110"
+}
+
 function istBqp(hex) {
     return !!hex && hex.length > 2 && hex.substring(0, 2) === "04"
 }

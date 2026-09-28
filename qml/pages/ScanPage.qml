@@ -131,16 +131,24 @@ Page {
         }
     }
 
-    // Der Filter hat etwas gelesen. ZXing gibt Text zurueck; ein BQP-Rumpf ist
-    // aber binaer, und Briar bildet ihn auf Android ueber ISO-8859-1 ab. Genau
-    // diesen Weg gehen wir zurueck. Steht darin ein Zeichen ueber 255, hat der
-    // Leser die Bytes als etwas anderes gedeutet -- dann ist hier nichts zu
-    // holen, und der Fotoweg macht es richtig.
+    // Der Filter hat etwas gelesen. ZXing gibt Text zurueck und schreibt darin
+    // nicht druckbare Bytes als Namen aus ("<EOT>" fuer 0x04, "<U+82>" fuer
+    // 0x82); Briar.zxingZuHex rechnet das zurueck -- nachgemessen am eigenen
+    // Treffen-Code, siehe den Kommentar dort.
     function ausFilter(text) {
         if (page.fertig || !text)
             return
-        var hex = Briar.textZuHex(text)
+        var hex = Briar.zxingZuHex(text)
         if (hex === null) {
+            // Der Leser hat die Bytes als etwas anderes gedeutet. Ab jetzt
+            // macht es der Fotoweg, der sie roh liest.
+            vorsprung.stop()
+            return
+        }
+        // Sieht es nach einem Treffen-Code aus, haelt es aber dem strengen
+        // Riegel nicht stand, ist die Rueckrechnung schiefgegangen. Dann
+        // lieber gar nichts, als mit einer falschen Verpflichtung anfangen.
+        if (Briar.istBqp(hex) && !Briar.istBqpStreng(hex)) {
             vorsprung.stop()
             return
         }
