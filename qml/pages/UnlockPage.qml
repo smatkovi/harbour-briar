@@ -91,7 +91,11 @@ Page {
         Briar.unlock(feld.text, function(answer) {
             page.busy = false
             if (answer.error) {
-                page.message = app.tr("unlockWrong")
+                // Ein ausbleibender Dienst ist kein falsches Passwort -- wer
+                // das verwechselt, loescht am Ende sein Konto.
+                page.message = answer.error.indexOf("antwortet nicht") >= 0
+                               ? app.tr("unlockNoAnswer")
+                               : app.tr("unlockWrong")
                 feld.text = ""
                 feld.forceActiveFocus()
                 return

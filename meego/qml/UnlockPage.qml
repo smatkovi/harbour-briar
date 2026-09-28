@@ -12,15 +12,34 @@ Page {
     // Kein Zurueck-Knopf: dahinter ist nichts, solange gesperrt ist.
     tools: ToolBarLayout { }
 
+    // Qt 4.7 kennt kein xhr.timeout, darum haelt hier ein Zeitgeber die Wacht.
+    // Bleibt die Antwort aus, war der Knopf sonst fuer immer tot: "laeuft"
+    // blieb auf true, und jedes weitere Tippen lief in die Sperre oben in
+    // versuchen(). Genau so stand das N9 nach dem Neustart des Dienstes still.
+    Timer {
+        id: wache
+        interval: 90000
+        onTriggered: {
+            if (!seite.laeuft)
+                return
+            seite.laeuft = false
+            seite.meldung = fenster.tr("unlockNoAnswer")
+        }
+    }
+
     function versuchen() {
         if (seite.laeuft || feld.text.length === 0)
             return
         seite.laeuft = true
         seite.meldung = fenster.tr("unlockWorking")
+        wache.restart()
         Briar.unlock(feld.text, function(antwort) {
+            wache.stop()
             seite.laeuft = false
             if (antwort.error) {
-                seite.meldung = fenster.tr("unlockWrong")
+                seite.meldung = antwort.error.indexOf("antwortet nicht") >= 0
+                                ? fenster.tr("unlockNoAnswer")
+                                : fenster.tr("unlockWrong")
                 feld.text = ""
                 return
             }

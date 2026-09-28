@@ -40,6 +40,8 @@ DISTFILES += \
     qml/pages/AddContactPage.qml \
     qml/pages/LinkPage.qml \
     qml/pages/ScanPage.qml \
+    qml/pages/QrLive.qml \
+    qml/pages/MeetPage.qml \
     qml/pages/AboutPage.qml \
     qml/pages/UnlockPage.qml \
     qml/pages/PasswordPage.qml \

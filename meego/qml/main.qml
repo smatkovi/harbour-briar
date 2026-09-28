@@ -101,9 +101,19 @@ PageStackWindow {
         aktualisieren()
     }
 
+    // Der Takt, in dem die Oberflaeche den Dienst fragt.
+    //
+    // Frueher hing das allein an Qt.application.active. Am N9 stand die Liste
+    // damit still: es liefen zwei Oberflaechen-Prozesse, in sechs Sekunden
+    // ging keine einzige Anfrage an den Dienst -- und ein Kontakt, den der
+    // Dienst laengst hatte, tauchte nie auf. Wovon Harmattan die Kennzeichnung
+    // genau abhaengig macht, ist nicht festzustellen; also haengt der Takt
+    // nicht mehr allein daran. Im Vordergrund alle drei Sekunden, sonst alle
+    // fuenfzehn -- das kostet fast nichts und die Liste kann nicht mehr
+    // einfrieren.
     Timer {
-        interval: 3000
-        running: Qt.application.active
+        interval: Qt.application.active ? 3000 : 15000
+        running: true
         repeat: true
         onTriggered: fenster.aktualisieren()
     }

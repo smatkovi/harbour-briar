@@ -6,6 +6,12 @@ import "Strings.js" as Strings
 Page {
     id: seite
 
+    // Zurueck aus dem Treffen oder aus einem Gespraech: sofort nachfragen,
+    // nicht erst beim naechsten Takt. Sonst steht ein frisch angelegter
+    // Kontakt bis zu drei Sekunden nicht da -- und das sieht aus, als waere
+    // er gar nicht angelegt worden.
+    onStatusChanged: if (status === PageStatus.Active) fenster.aktualisieren()
+
     tools: ToolBarLayout {
         ToolIcon {
             platformIconId: "toolbar-refresh"

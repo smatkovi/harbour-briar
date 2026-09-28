@@ -161,16 +161,35 @@ private:
         QImage image(pfad);
         if (image.isNull())
             return QByteArray();
-        const int widths[3] = { 1280, 1600, 800 };
-        for (int i = 0; i < 3; ++i) {
+        // Dieselbe Breite nie zweimal. Bisher liefen bei einem Bild, das
+        // ohnehin schmaler ist als die erste Stufe, drei gleiche Durchgaenge
+        // -- und der vierte auf dem Original noch einmal derselbe. Vier
+        // identische quirc-Laeufe ueber dasselbe Bild kosten das Vierfache und
+        // finden nichts, was der erste nicht gefunden haette. Die Stufen
+        // selbst bleiben, es faellt nur das Doppelte weg.
+        const int stufen[3] = { 1280, 1600, 800 };
+        int schon[4] = { 0, 0, 0, 0 };
+        int anzahl = 0;
+        for (int i = 0; i < 4; ++i) {
+            // Der letzte Durchgang ist das unverkleinerte Bild.
+            const int breite = (i < 3) ? qMin(stufen[i], image.width())
+                                       : image.width();
+            bool doppelt = false;
+            for (int j = 0; j < anzahl; ++j) {
+                if (schon[j] == breite)
+                    doppelt = true;
+            }
+            if (doppelt)
+                continue;
+            schon[anzahl++] = breite;
             QImage scaled = image;
-            if (image.width() > widths[i])
-                scaled = image.scaledToWidth(widths[i], Qt::SmoothTransformation);
+            if (breite < image.width())
+                scaled = image.scaledToWidth(breite, Qt::SmoothTransformation);
             const QByteArray roh = decodeImage(scaled);
             if (!roh.isEmpty())
                 return roh;
         }
-        return decodeImage(image);
+        return QByteArray();
     }
 
     static QString cacheDir()

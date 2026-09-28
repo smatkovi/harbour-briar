@@ -44,10 +44,32 @@ function stringify(value) {
     return "{" + parts.join(",") + "}"
 }
 
+// Wie lange auf eine Antwort gewartet wird, bevor der Rueckruf mit einem
+// Fehler kommt. Grosszuegig, weil das Aufsperren am N9 einen scrypt-Lauf ueber
+// 16 MB kostet -- aber eben nicht unbegrenzt: ohne Grenze bleibt eine Seite,
+// die auf den Rueckruf wartet, fuer immer im "wird geprueft" stehen, und der
+// Knopf laesst sich nicht mehr druecken. Genau das ist am N9 passiert.
+var ZEITGRENZE = 90000
+
 function request(method, path, body, callback) {
     var xhr = new XMLHttpRequest()
+    // Der Rueckruf muss genau einmal kommen -- auch wenn Zeitgrenze und
+    // Antwort sich ueberholen.
+    var erledigt = false
+    function fertig(antwort) {
+        if (erledigt)
+            return
+        erledigt = true
+        callback(antwort)
+    }
     xhr.open(method, base + path)
     xhr.setRequestHeader("Content-Type", "application/json")
+    // Qt 5 kennt beides; Qt 4.7 (Harmattan) ignoriert es stillschweigend,
+    // dort haengt die Zeitgrenze am Zeitgeber der jeweiligen Seite.
+    xhr.timeout = ZEITGRENZE
+    xhr.ontimeout = function() {
+        fertig({ error: "der Dienst antwortet nicht" })
+    }
     xhr.onreadystatechange = function() {
         if (xhr.readyState !== 4)
             return
@@ -58,10 +80,10 @@ function request(method, path, body, callback) {
             } catch (e) {
                 answer = { error: "the daemon sent nonsense: " + xhr.responseText }
             }
-            callback(answer)
+            fertig(answer)
         } else {
             // status 0 means the daemon is not up yet
-            callback({ error: xhr.status === 0
+            fertig({ error: xhr.status === 0
                       ? "der Dienst antwortet nicht"
                       : "Fehler " + xhr.status })
         }
@@ -313,6 +335,26 @@ function istBqp(hex) {
 
 // Hex zu Schrift. Der Leser gibt immer Bytes zurueck; wer Schrift erwartet,
 // setzt sie hier zusammen. Mehr als ASCII steht in unseren Links nicht.
+/// Der Rueckweg: Text zu Hex, Zeichen fuer Zeichen nach ISO-8859-1.
+///
+/// Genau die Abbildung, die Briar auf Android benutzt: ZXing liest einen
+/// QR-Code im Byte-Modus ohne ECI als ISO-8859-1, jedes Byte wird ein
+/// Zeichen. Steht ein Zeichen ueber 255, hat der Leser die Bytes als etwas
+/// anderes gedeutet und dabei verdorben -- dann ist hier nichts zu retten,
+/// und wir geben null zurueck, statt Unsinn weiterzureichen.
+function textZuHex(text) {
+    if (!text)
+        return ""
+    var hex = ""
+    for (var i = 0; i < text.length; ++i) {
+        var c = text.charCodeAt(i)
+        if (c > 255)
+            return null
+        hex += (c < 16 ? "0" : "") + c.toString(16)
+    }
+    return hex
+}
+
 function hexZuText(hex) {
     if (!hex)
         return ""

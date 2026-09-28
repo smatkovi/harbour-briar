@@ -588,9 +588,11 @@ fn enabled() -> bool {
     true
 }
 
-/// Whether Tor starts by itself. A Tor process costs some 30 MB, which is
-/// a lot on Harmattan (armv7) and nothing much on the Jolla, so there the
-/// user switches it on when they want it -- the help page says so.
+/// Whether Tor starts by itself. A Tor process costs some 66 MB (measured on
+/// the Jolla), which is a lot on Harmattan (armv7) and bearable on the Jolla,
+/// so on Harmattan the user switches it on when they want it. The switch
+/// works live: the supervisor in main.rs picks it up within five seconds,
+/// no restart. The help page says so.
 pub fn tor_default() -> bool {
     !cfg!(target_arch = "arm")
 }

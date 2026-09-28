@@ -29,6 +29,12 @@ Page {
     property string meldung: app.tr("meetScanning")
     property bool busy: false
     property int zaehler: 0
+    /// Der Filter der Kamera-App (ZXing), oder null, wo das Paket fehlt.
+    /// Siehe den Kommentarblock in ScanPage.qml -- hier gilt er genauso.
+    property var leser: null
+    /// Notausgang, falls die Kamera die kleine Aufnahmegroesse nicht mag.
+    property bool grosseAufnahme: false
+    property int fehlschlaege: 0
     property int kontakteVorher: 0
 
     function starten() {
@@ -108,9 +114,52 @@ Page {
         focus.focusMode: Camera.FocusContinuous
 
         imageCapture {
+            // Ohne das schiesst die Jolla in voller Sensoraufloesung -- acht
+            // Millionen Bildpunkte fuer einen Code, der in ein Briefmarkenfeld
+            // passt. Siehe ScanPage.qml.
+            resolution: page.grosseAufnahme ? Qt.size(-1, -1) : Qt.size(1280, 960)
             onImageSaved: page.lesen(path)
-            onCaptureFailed: page.busy = false
+            onCaptureFailed: {
+                page.busy = false
+                page.fehlschlaege++
+                if (page.fehlschlaege >= 2)
+                    page.grosseAufnahme = true
+            }
         }
+    }
+
+    // Der schnelle Leser, wenn es ihn gibt. Er haengt im Videostrom und
+    // braucht kein Foto; der Fotoweg darunter bleibt trotzdem stehen.
+    Component.onCompleted: {
+        var bauplan = Qt.createComponent(Qt.resolvedUrl("QrLive.qml"))
+        if (bauplan.status !== Component.Ready)
+            return
+        page.leser = bauplan.createObject(page)
+        if (page.leser)
+            page.leser.decodeFinished.connect(page.ausFilter)
+    }
+
+    Binding {
+        target: page.leser
+        property: "active"
+        value: page.status === PageStatus.Active && page.lage === 0
+        when: page.leser !== null
+    }
+
+    // Der Filter hat etwas gelesen. ZXing gibt Text; ein BQP-Rumpf ist binaer
+    // und wird bei Briar ueber ISO-8859-1 abgebildet -- diesen Weg zurueck.
+    // Steht ein Zeichen ueber 255 darin, hat der Leser die Bytes verdorben;
+    // dann schweigen wir und lassen den Fotoweg ran, der sie roh liest.
+    function ausFilter(text) {
+        if (page.lage !== 0 || !text)
+            return
+        var hex = Briar.textZuHex(text)
+        if (hex === null || !Briar.istBqp(hex)) {
+            if (page.leser)
+                page.leser.clearResult()
+            return
+        }
+        page.uebergeben(hex)
     }
 
     Timer {
@@ -185,6 +234,7 @@ Page {
                     anchors.fill: parent
                     source: camera
                     fillMode: VideoOutput.PreserveAspectFit
+                    filters: page.leser ? [ page.leser ] : []
                 }
             }
 
