@@ -22,6 +22,47 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_INTERVAL_MAX: Duration = Duration::from_secs(600);
 const POLL_BACKOFF: f64 = 1.2;
 
+/// Haelt eine Dateisperre neben der state.json, solange der Prozess lebt.
+/// Blockierend: wer sie nicht bekommt, wartet, statt sich zu beenden -- so
+/// springt der Hintergrunddienst ein, sobald der von der App gestartete
+/// Dienst geht, ohne dass systemd ihn neu anstossen muesste. Die Datei wird
+/// absichtlich nie geschlossen; O_CLOEXEC (Vorgabe von File) sorgt dafuer,
+/// dass ein gestartetes Tor die Sperre nicht erbt und ueber unser Ende
+/// hinaus haelt.
+fn instanzsperre(state_path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    let mut pfad = state_path.to_path_buf();
+    pfad.set_file_name("briard.lock");
+    let datei = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&pfad)
+        // Gehoert die Datei root (ein Start per devel-su bei der Fehlersuche
+        // hinterlaesst sie so), reicht Lesen: flock sperrt auch einen nur
+        // lesend geoeffneten Deskriptor. Nur .read + .create ginge nicht --
+        // Anlegen verlangt Schreibrecht, std lehnt das ab.
+        .or_else(|_| std::fs::OpenOptions::new().read(true).open(&pfad));
+    let datei = match datei {
+        Ok(d) => d,
+        Err(e) => {
+            net::log(&format!("no instance lock at {}: {} -- running unlocked", pfad.display(), e));
+            return;
+        }
+    };
+    let fd = datei.as_raw_fd();
+    // Sicher: fd gehoert der offenen Datei, die unten nie geschlossen wird.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        net::log("another briard holds this state -- waiting until it goes");
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            net::log("the instance lock failed -- running unlocked");
+            return;
+        }
+        net::log("the other briard is gone -- taking over");
+    }
+    std::mem::forget(datei);
+}
+
 fn default_state_path() -> PathBuf {
     if let Ok(dir) = std::env::var("BRIAR_STATE_DIR") {
         return PathBuf::from(dir).join("state.json");
@@ -86,6 +127,15 @@ fn main() {
     // ist verschluesselt" und "entsperrt" in der Datei -- also gerade das,
     // wonach man sucht.
     net::log_datei_setzen(&state_path);
+
+    // Genau ein Dienst je Speicher. Ein zweiter -- die App hat einen
+    // gestartet, dann schaltet der Benutzer den Hintergrunddienst ein, und
+    // systemctl --now startet noch einen -- wartet hier, bis der erste geht,
+    // und uebernimmt dann. Ohne das schrieben beide dieselbe state.json und
+    // stritten sich um Tor: der zweite haette (0.38.0, in der Gegenpruefung
+    // gefunden) das Tor des ersten uebernommen und bei jedem abgelehnten
+    // ADD_ONION mit in den Tod gerissen, minuetlich.
+    instanzsperre(&state_path);
 
     let mut store = if Store::ist_verschluesselt(&state_path) {
         briarkern::entsperren::warten(&state_path, api_port, DEFAULT_PORT)
