@@ -41,6 +41,7 @@ DISTFILES += \
     qml/pages/LinkPage.qml \
     qml/pages/ScanPage.qml \
     qml/pages/QrLive.qml \
+    qml/pages/RevealPage.qml \
     qml/pages/MeetPage.qml \
     qml/pages/AboutPage.qml \
     qml/pages/UnlockPage.qml \

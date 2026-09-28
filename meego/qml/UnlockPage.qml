@@ -23,6 +23,7 @@ Page {
             if (!seite.laeuft)
                 return
             seite.laeuft = false
+            fenster.entsperrtGerade = false
             seite.meldung = fenster.tr("unlockNoAnswer")
         }
     }
@@ -31,11 +32,13 @@ Page {
         if (seite.laeuft || feld.text.length === 0)
             return
         seite.laeuft = true
+        fenster.entsperrtGerade = true
         seite.meldung = fenster.tr("unlockWorking")
         wache.restart()
         Briar.unlock(feld.text, function(antwort) {
             wache.stop()
             seite.laeuft = false
+            fenster.entsperrtGerade = false
             if (antwort.error) {
                 seite.meldung = antwort.error.indexOf("antwortet nicht") >= 0
                                 ? fenster.tr("unlockNoAnswer")

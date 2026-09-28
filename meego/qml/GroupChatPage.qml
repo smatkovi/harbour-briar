@@ -12,12 +12,15 @@ Page {
     property bool aufgeloest: false
     property variant nachrichten: []
     property variant mitglieder: []
+    /// Wem gegenueber sich die Beziehung in dieser Gruppe noch zeigen laesst.
+    property variant zeigbar: []
 
     function neuLaden() {
         Briar.groupMessages(gruppe, function(antwort) {
             if (!antwort.error) {
                 seite.nachrichten = antwort.messages
                 seite.mitglieder = antwort.members
+                seite.zeigbar = antwort.revealable ? antwort.revealable : []
                 seite.aufgeloest = antwort.dissolved ? true : false
             }
         })
@@ -62,6 +65,15 @@ Page {
                 width: 300
                 elide: Text.ElideRight
             }
+        }
+        // Nur wenn es wirklich jemanden gibt -- ein Knopf, der immer auf eine
+        // leere Liste fuehrt, hilft niemandem.
+        ToolIcon {
+            platformIconId: "toolbar-share"
+            visible: seite.zeigbar.length > 0
+            onClicked: pageStack.push(Qt.resolvedUrl("RevealPage.qml"),
+                                      { gruppe: seite.gruppe, name: seite.name,
+                                        kandidaten: seite.zeigbar })
         }
         ToolIcon {
             platformIconId: "toolbar-add"

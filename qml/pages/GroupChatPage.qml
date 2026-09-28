@@ -13,12 +13,16 @@ Page {
     property bool dissolved: false
     property var messages: []
     property var members: []
+    /// Wem gegenueber sich die Beziehung in dieser Gruppe noch zeigen laesst
+    /// -- der Dienst entscheidet das, nicht diese Seite.
+    property var zeigbar: []
 
     function reload() {
         Briar.groupMessages(groupId, function(answer) {
             if (!answer.error) {
                 page.messages = answer.messages
                 page.members = answer.members
+                page.zeigbar = answer.revealable ? answer.revealable : []
                 page.dissolved = !!answer.dissolved
             }
         })
@@ -57,6 +61,17 @@ Page {
         }
 
         PullDownMenu {
+            MenuItem {
+                // Nur wenn es wirklich jemanden gibt -- ein Eintrag, der immer
+                // auf eine leere Liste fuehrt, hilft niemandem.
+                visible: page.zeigbar.length > 0
+                text: app.tr("revealAction")
+                onClicked: pageStack.push(Qt.resolvedUrl("RevealPage.qml"), {
+                    groupId: page.groupId,
+                    groupName: page.groupName,
+                    kandidaten: page.zeigbar
+                })
+            }
             MenuItem {
                 visible: page.isCreator
                 text: app.tr("invite")

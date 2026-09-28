@@ -400,6 +400,12 @@ function istBqpStreng(hex) {
     return !!hex && hex.length > 40 && hex.substring(0, 8) === "04605110"
 }
 
+/// Die Beziehung in einer Gruppe zeigen -- Briars "Kontakte zeigen".
+/// Wem gegenueber das geht, sagt der Dienst mit der Gruppe ("revealable").
+function reveal(group, contact, callback) {
+    request("POST", "/group/reveal", { group: group, contact: contact }, callback)
+}
+
 function istBqp(hex) {
     return !!hex && hex.length > 2 && hex.substring(0, 2) === "04"
 }

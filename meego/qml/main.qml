@@ -111,9 +111,13 @@ PageStackWindow {
     // nicht mehr allein daran. Im Vordergrund alle drei Sekunden, sonst alle
     // fuenfzehn -- das kostet fast nichts und die Liste kann nicht mehr
     // einfrieren.
+    /// Laeuft gerade ein Entsperrversuch? Dann ruht die Abfrage: sie brachte
+    /// in dieser Zeit nichts, kam dem Entsperren aber in die Quere.
+    property bool entsperrtGerade: false
+
     Timer {
         interval: Qt.application.active ? 3000 : 15000
-        running: true
+        running: !fenster.entsperrtGerade
         repeat: true
         onTriggered: fenster.aktualisieren()
     }

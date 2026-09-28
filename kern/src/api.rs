@@ -1369,8 +1369,40 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
         ("GET", "/group/messages") => {
             let group_hex = query_value(query, "group").unwrap_or_default();
             let locked = store.lock().unwrap();
+            // Wem gegenueber sich die Beziehung in dieser Gruppe noch zeigen
+            // laesst -- Briars "Kontakte zeigen". Die Regeln stehen in
+            // net::zeigbarkeit; hier wird nur gefragt.
+            let kontaktnummern: Vec<u32> = locked.state.contacts.iter().map(|c| c.id).collect();
+            let zeigbar: Vec<Value> = kontaktnummern
+                .iter()
+                .filter(|id| net::zeigbarkeit(&locked, &group_hex, **id).is_ok())
+                .filter_map(|id| {
+                    locked
+                        .contact(*id)
+                        .map(|c| json!({"id": c.id, "name": c.name}))
+                })
+                .collect();
+            // Und wem gegenueber es schon geschehen ist: eine eigene
+            // Nachricht in einer Sitzung, in der wir weder eingeladen haben
+            // noch eingeladen wurden.
+            let gezeigt: Vec<Value> = kontaktnummern
+                .iter()
+                .filter(|id| {
+                    matches!(
+                        net::zeigbarkeit(&locked, &group_hex, **id),
+                        Err("schon gezeigt")
+                    )
+                })
+                .filter_map(|id| {
+                    locked
+                        .contact(*id)
+                        .map(|c| json!({"id": c.id, "name": c.name}))
+                })
+                .collect();
             match locked.group(&group_hex) {
                 Some(group) => json!({
+                    "revealable": zeigbar,
+                    "revealed": gezeigt,
                     "group": group.id,
                     "name": group.name,
                     "joined": group.joined,
@@ -1385,6 +1417,31 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     "members": group.member_names.values().collect::<Vec<&String>>(),
                 }),
                 None => json!({"error": "no such group"}),
+            }
+        }
+
+        // Die Beziehung in einer Gruppe zeigen -- Briars "Kontakte zeigen".
+        // Es ist ein JOIN in der Einladungsgruppe dieses Kontakts, mehr nicht;
+        // was es bewirkt, steht bei Node::beziehung_zeigen.
+        ("POST", "/group/reveal") => {
+            let group_hex = body["group"].as_str().unwrap_or("").to_string();
+            let kontakt = body["contact"].as_u64().unwrap_or(0) as u32;
+            let mut locked = store.lock().unwrap();
+            let node = Node::new(Arc::clone(&store));
+            match node.beziehung_zeigen(&mut locked, kontakt, &group_hex) {
+                Ok(()) => {
+                    let _ = locked.save();
+                    drop(locked);
+                    // Gleich hinausschicken, nicht erst beim naechsten
+                    // Abgleich -- sonst sieht es aus, als sei nichts geschehen.
+                    let node_store = Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        let node = Node::new(node_store);
+                        let _ = node.reach_contact(kontakt);
+                    });
+                    json!({"ok": true})
+                }
+                Err(grund) => json!({"error": grund}),
             }
         }
 
@@ -1983,5 +2040,161 @@ mod zeitstempel_tests {
         );
         assert_eq!(locked.state.contacts[0].loesch_stempel, nachricht.timestamp);
         assert_eq!(nachricht.loesch_dauer, Some(60_000));
+    }
+}
+
+#[cfg(test)]
+mod zeigen_tests {
+    use super::*;
+    use crate::store::{Contact, Einladungssitzung, PrivateGroup, Sitzungszustand};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    const EINLADENDE: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const MITGLIED: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const FREMDE: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+    const GRUPPE: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn kontakt(id: u32, name: &str, autor: &str) -> Contact {
+        Contact {
+            id,
+            name: name.to_string(),
+            author_id: autor.to_string(),
+            signature_public: autor.to_string(),
+            handshake_public: Some(autor.to_string()),
+            master_key: autor.to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        }
+    }
+
+    /// Wir sind eingeladen worden von Kontakt 1. Kontakt 2 ist auch in der
+    /// Gruppe, hat uns aber nicht eingeladen -- das ist die PEER-Rolle, und
+    /// nur dort gibt es etwas zu zeigen. Kontakt 3 ist gar nicht drin.
+    /// Je Pruefung eine eigene Datei: sie laufen nebeneinander, und drei
+    /// Pruefungen auf demselben Pfad loeschen einander die Datei unter den
+    /// Fuessen weg.
+    fn speicher(wer: &str) -> Shared {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-zeigen-{}.json", wer));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        store.state.contacts.push(kontakt(1, "Einladende", EINLADENDE));
+        store.state.contacts.push(kontakt(2, "Mitglied", MITGLIED));
+        store.state.contacts.push(kontakt(3, "Fremde", FREMDE));
+
+        let mut einladungen = BTreeMap::new();
+        einladungen.insert(
+            1u32,
+            Einladungssitzung {
+                letzte_eigene: Some("aa01".to_string()),
+                letzte_fremde: Some("ff01".to_string()),
+                eigener_zeitstempel: 1_700_000_000_000,
+                einladungs_zeitstempel: 1_700_000_000_000,
+                zustand: Sitzungszustand::Beigetreten,
+            },
+        );
+        let mut mitglieder = BTreeMap::new();
+        mitglieder.insert(EINLADENDE.to_string(), "Einladende".to_string());
+        mitglieder.insert(MITGLIED.to_string(), "Mitglied".to_string());
+
+        store.state.groups.push(PrivateGroup {
+            id: GRUPPE.to_string(),
+            name: "Testgruppe".to_string(),
+            salt: "44".to_string(),
+            creator_name: "Einladende".to_string(),
+            creator_public: EINLADENDE.to_string(),
+            creator_author_id: EINLADENDE.to_string(),
+            joined: true,
+            invited_by: Some(1),
+            invite_timestamp: Some(1_700_000_000_000),
+            invite_signature: None,
+            member_names: mitglieder,
+            last_read: 0,
+            messages: Vec::new(),
+            our_previous: Some("aa02".to_string()),
+            einladungen,
+            einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
+            contacts: vec![1, 2],
+        });
+        Arc::new(Mutex::new(store))
+    }
+
+    #[test]
+    fn nur_die_peer_rolle_laesst_sich_zeigen() {
+        let store = speicher("rolle");
+        let locked = store.lock().unwrap();
+        // Kontakt 1 hat uns eingeladen -- das laeuft ueber die INVITEE-Rolle.
+        assert!(net::zeigbarkeit(&locked, GRUPPE, 1).is_err());
+        // Kontakt 2 ist Mitglied, ohne dass einer den anderen eingeladen hat.
+        assert_eq!(net::zeigbarkeit(&locked, GRUPPE, 2), Ok(()));
+        // Kontakt 3 ist gar nicht in der Gruppe.
+        assert!(net::zeigbarkeit(&locked, GRUPPE, 3).is_err());
+    }
+
+    #[test]
+    fn die_liste_nennt_genau_den_einen() {
+        let store = speicher("liste");
+        let antwort = handle(
+            Arc::clone(&store),
+            "GET",
+            "/group/messages",
+            &format!("group={}", GRUPPE),
+            &json!({}),
+        );
+        let zeigbar = antwort["revealable"].as_array().unwrap();
+        assert_eq!(zeigbar.len(), 1, "{}", antwort);
+        assert_eq!(zeigbar[0]["id"], 2);
+        assert!(antwort["revealed"].as_array().unwrap().is_empty());
+    }
+
+    /// Nach dem Zeigen liegt eine eigene Nachricht in der Sitzung -- und ein
+    /// zweites Mal geht nicht mehr, sonst gabelte es die Kette.
+    #[test]
+    fn zeigen_schickt_ein_join_und_zaehlt_danach_als_gezeigt() {
+        let store = speicher("join");
+        let antwort = handle(
+            Arc::clone(&store),
+            "POST",
+            "/group/reveal",
+            "",
+            &json!({"group": GRUPPE, "contact": 2}),
+        );
+        assert!(antwort.get("error").is_none(), "{}", antwort);
+
+        let locked = store.lock().unwrap();
+        let sitzung = locked.sitzung(GRUPPE, 2).expect("die Sitzung steht");
+        assert!(
+            sitzung.letzte_eigene.is_some(),
+            "das JOIN muss in der Sitzung stehen"
+        );
+        assert!(
+            locked
+                .state
+                .contacts
+                .iter()
+                .any(|c| c.id == 2 && !c.outbox.is_empty()),
+            "das JOIN muss in der Ausgangspost liegen"
+        );
+        assert_eq!(net::zeigbarkeit(&locked, GRUPPE, 2), Err("schon gezeigt"));
     }
 }
