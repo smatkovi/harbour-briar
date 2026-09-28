@@ -111,6 +111,17 @@ Page {
                 onClicked: pageStack.push(Qt.resolvedUrl("PasswordPage.qml"))
             }
             MenuItem {
+                // Zusperren wie Briars Bildschirmsperre: der Dienst laeuft
+                // weiter und nimmt Nachrichten an, die App zeigt nichts mehr.
+                text: app.tr("lockNow")
+                onClicked: Briar.lock(function(answer) {
+                    if (answer.error)
+                        app.lastError = app.tr("lockNeedsPassword")
+                    else
+                        app.refresh()
+                })
+            }
+            MenuItem {
                 text: app.tr("about")
                 onClicked: pageStack.push(Qt.resolvedUrl("AboutPage.qml"))
             }

@@ -448,6 +448,11 @@ pub struct State {
     /// Briar bricht die Sitzung ab, statt die Gruppe zu teilen.
     #[serde(default)]
     pub verlassene_einladungen: BTreeMap<String, BTreeMap<u32, Einladungssitzung>>,
+    /// Nach wie vielen Minuten ohne Regung die Oberflaeche von selbst zusperrt.
+    /// 0 heisst nie -- wie bei Briar, wo die Sperre erst eingeschaltet werden
+    /// muss.
+    #[serde(default)]
+    pub sperre_nach_minuten: u64,
     /// Attachment identifier -> the file it was written to
     #[serde(default)]
     pub attachments: BTreeMap<String, Attachment>,
@@ -534,6 +539,17 @@ impl Store {
     /// Liegt der Speicher gerade verschluesselt vor?
     pub fn verschluesselt(&self) -> bool {
         self.siegel.is_some()
+    }
+
+    /// Stimmt dieses Passwort? Gebraucht beim Aufsperren der Oberflaeche --
+    /// dort ist der Speicher schon offen, es geht nur um die Frage, ob der
+    /// davorsteht, der es darf. Ohne Passwort gibt es keine Sperre und damit
+    /// auch nichts zu pruefen.
+    pub fn passwort_stimmt(&self, passwort: &str) -> bool {
+        match &self.siegel {
+            Some(siegel) => siegel.stimmt(passwort),
+            None => false,
+        }
     }
 }
 
@@ -882,6 +898,15 @@ impl Store {
 
     pub fn attachment(&self, id: &str) -> Option<&Attachment> {
         self.state.attachments.get(id)
+    }
+
+    /// Einen Anhang samt Datei wegraeumen. Gebraucht beim Loeschen einer
+    /// Nachricht: bliebe die Datei liegen, waere das Bild noch da, das man
+    /// gerade weghaben wollte.
+    pub fn anhang_loeschen(&mut self, id: &str) {
+        if let Some(anhang) = self.state.attachments.remove(id) {
+            let _ = std::fs::remove_file(&anhang.path);
+        }
     }
 
     /// Queues a message for delivery to one contact.

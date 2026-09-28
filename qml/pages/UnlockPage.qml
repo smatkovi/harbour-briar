@@ -67,6 +67,51 @@ Page {
             enabled: !page.busy && feld.text.length > 0
             onClicked: page.versuchen()
         }
+
+        // Der einzige Weg heraus, wenn das Passwort weg ist. Es gibt keinen
+        // anderen: ohne Passwort ist die Datei nicht zu oeffnen, und ein
+        // Hintertuerchen waere genau das, was hier niemand will. Briar bietet
+        // an derselben Stelle dasselbe an.
+        Label {
+            x: Theme.horizontalPageMargin
+            width: parent.width - 2 * Theme.horizontalPageMargin
+            wrapMode: Text.Wrap
+            color: Theme.secondaryColor
+            font.pixelSize: Theme.fontSizeExtraSmall
+            text: app.tr("forgotPassword")
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: app.tr("deleteAccount")
+            enabled: !page.busy
+            onClicked: loeschen.open()
+        }
+    }
+
+    Dialog {
+        id: loeschen
+        canAccept: true
+        Column {
+            width: parent.width
+            spacing: Theme.paddingLarge
+            DialogHeader { acceptText: app.tr("deleteAccount") }
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                color: Theme.errorColor
+                text: app.tr("deleteAccountAsk")
+            }
+        }
+        onAccepted: Briar.deleteAccount(function() {
+            // Der Dienst beendet sich dabei; die Oberflaeche startet ihn neu
+            // und findet dann ein leeres Geraet vor.
+            app.locked = false
+            Daemon.ensureRunning()
+            app.refresh()
+            pageStack.replace(Qt.resolvedUrl("MainPage.qml"))
+        })
     }
 
     Component.onCompleted: feld.forceActiveFocus()

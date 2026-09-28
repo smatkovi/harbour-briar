@@ -67,5 +67,39 @@ Page {
             enabled: !seite.laeuft && feld.text.length > 0
             onClicked: seite.versuchen()
         }
+
+        // Der einzige Weg heraus, wenn das Passwort weg ist -- ohne es ist die
+        // Datei nicht zu oeffnen, und ein Hintertuerchen waere genau das, was
+        // hier niemand will.
+        Label {
+            width: parent.width
+            wrapMode: Text.Wrap
+            font.pixelSize: 18
+            color: "#a0a0a0"
+            text: fenster.tr("forgotPassword")
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: fenster.tr("deleteAccount")
+            enabled: !seite.laeuft
+            onClicked: kontoLoeschen.open()
+        }
+    }
+
+    QueryDialog {
+        id: kontoLoeschen
+        titleText: fenster.tr("deleteAccount")
+        message: fenster.tr("deleteAccountAsk")
+        acceptButtonText: fenster.tr("deleteAccount")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.deleteAccount(function() {
+            // Der Dienst beendet sich dabei; wir starten ihn neu und finden
+            // dann ein leeres Geraet vor.
+            fenster.gesperrt = false
+            dienst.starten()
+            fenster.aktualisieren()
+            pageStack.replace(Qt.resolvedUrl("ContactsPage.qml"))
+        })
     }
 }

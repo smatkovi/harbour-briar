@@ -103,6 +103,9 @@ fn main() {
     let api_store = Arc::clone(&shared);
     std::thread::spawn(move || briarkern::api::run(api_store, api_port));
 
+    // Die Sperre nach Zeit -- sie schaut nach, ob lange nichts kam.
+    briarkern::api::sperrwaechter(Arc::clone(&shared));
+
     // Replying straight from the notification: lipstick calls us on the
     // session bus, and we hand the text to our own interface.
     #[cfg(feature = "sfos")]

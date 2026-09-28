@@ -101,6 +101,9 @@ Page {
         onTriggered: page.reload()
     }
 
+    // Eine Bedenkzeit fuer beides -- Loeschen ist hier endgueltig.
+    RemorsePopup { id: entfernen }
+
     SilicaListView {
         id: view
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: input.top }
@@ -108,6 +111,15 @@ Page {
         clip: true
         header: PageHeader { title: page.contactName }
         onCountChanged: positionViewAtEnd()
+
+        PullDownMenu {
+            MenuItem {
+                text: app.tr("deleteAllMessages")
+                onClicked: entfernen.execute(app.tr("deleteAllMessages"), function() {
+                    Briar.deleteAllMessages(page.contactId, function() { page.reload() })
+                })
+            }
+        }
 
         delegate: Item {
             width: view.width
@@ -147,12 +159,22 @@ Page {
                     // Datenordner, der auf 0700 steht.
                     MouseArea {
                         anchors.fill: parent
-                        enabled: !!modelData.attachmentPath
-                        onClicked: pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
-                            "pfad": modelData.attachmentPath,
-                            "typ": "" + modelData.attachmentType,
-                            "groesse": modelData.attachmentSize || 0
-                        })
+                        onClicked: {
+                            if (modelData.attachmentPath)
+                                pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
+                                    "pfad": modelData.attachmentPath,
+                                    "typ": "" + modelData.attachmentType,
+                                    "groesse": modelData.attachmentSize || 0
+                                })
+                        }
+                        // Halten loescht sie -- nur hier, die Gegenseite
+                        // behaelt ihre Kopie. Mit Bedenkzeit, denn zurueck
+                        // geht es nicht.
+                        onPressAndHold: entfernen.execute(
+                            app.tr("deleteMessage"), function() {
+                                Briar.deleteMessage(page.contactId, modelData.id,
+                                                    function() { page.reload() })
+                            })
                     }
 
                     Image {

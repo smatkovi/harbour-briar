@@ -109,9 +109,170 @@ fn spawn_poll(store: &Shared) {
     });
 }
 
+/// Die Oberflaeche ist zugesperrt. Das ist Briars Bildschirmsperre, nicht das
+/// Siegel des Speichers: der Schluessel bleibt im Dienst, der Abgleich laeuft
+/// weiter und Nachrichten kommen an -- nur herzeigen tut die App nichts mehr,
+/// bis das Passwort wieder da ist. Genau so haelt es Briar (pref_key_lock).
+///
+/// Absichtlich nicht gespeichert: nach einem Neustart des Dienstes ist der
+/// Speicher ohnehin versiegelt, und dann fragt entsperren.rs.
+static GESPERRT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Wann zuletzt etwas ueber die Schnittstelle kam -- fuer die Sperre nach Zeit.
+static LETZTE_REGUNG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn ist_gesperrt() -> bool {
+    GESPERRT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn sperren() {
+    GESPERRT.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::net::log("die Oberflaeche ist zugesperrt");
+}
+
+fn regung_vermerken() {
+    LETZTE_REGUNG.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Der Waechter fuer die Sperre nach Zeit. Er schaut jede halbe Minute nach;
+/// genauer muss es nicht sein, und haeufiger waere auf dem N9 Strom fuer
+/// nichts.
+pub fn sperrwaechter(store: Shared) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        let frist = {
+            let locked = match store.lock() {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            locked.state.sperre_nach_minuten
+        };
+        if frist == 0 || ist_gesperrt() {
+            continue;
+        }
+        let zuletzt = LETZTE_REGUNG.load(std::sync::atomic::Ordering::Relaxed);
+        if zuletzt > 0 && now_ms().saturating_sub(zuletzt) > frist * 60_000 {
+            sperren();
+        }
+    });
+}
+
+/// Alles loeschen, was zu diesem Konto gehoert, und den Dienst beenden.
+///
+/// Beim naechsten Start findet er keine Datei und faengt bei null an -- ohne
+/// Passwort, ohne Kontakte. Das ist auch der Weg heraus, wenn jemand sein
+/// Passwort vergessen hat: dort gibt es sonst keinen.
+pub fn konto_loeschen(pfad: &std::path::Path) {
+    let ordner = pfad.parent().map(|p| p.to_path_buf());
+    let _ = std::fs::remove_file(pfad);
+    if let Some(ordner) = ordner {
+        let _ = std::fs::remove_dir_all(ordner.join("attachments"));
+        let _ = std::fs::remove_dir_all(ordner.join("tor"));
+    }
+    crate::net::log("das Konto wurde geloescht -- der Dienst beendet sich");
+    // Nicht bloss den Speicher leeren: die Schluessel liegen auch im
+    // Arbeitsspeicher, und der Tor-Dienst laeuft noch. Ein Ende raeumt beides.
+    std::process::exit(0);
+}
+
 fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) -> Value {
+    regung_vermerken();
+    // Solange zugesperrt ist, geht nur das Noetigste: nachsehen, aufsperren,
+    // und das Konto loeschen (fuer den Fall eines vergessenen Passworts).
+    if ist_gesperrt()
+        && !matches!(
+            (method, path),
+            ("GET", "/status") | ("POST", "/unlock") | ("POST", "/account/delete")
+        )
+    {
+        return json!({"error": "gesperrt", "locked": true});
+    }
     match (method, path) {
         ("GET", "/status") => status(&store),
+
+        // Zusperren wie Briars Bildschirmsperre: der Abgleich laeuft weiter,
+        // die Oberflaeche zeigt nichts mehr.
+        ("POST", "/lock") => {
+            let verschluesselt = store.lock().unwrap().verschluesselt();
+            if !verschluesselt {
+                // Ohne Passwort waere die Sperre eine Tuer ohne Schloss: jeder
+                // Aufruf von /unlock ohne Passwort wuerde sie oeffnen.
+                return json!({"error": "set a password first"});
+            }
+            sperren();
+            json!({"ok": true, "locked": true})
+        }
+
+        // Aufsperren, wenn nur die Oberflaeche zu ist. Ist der Speicher selbst
+        // versiegelt, laeuft dieser Dienst gar nicht -- dann antwortet
+        // entsperren.rs auf denselben Weg.
+        ("POST", "/unlock") => {
+            let passwort = body["password"].as_str().unwrap_or("");
+            let stimmt = {
+                let locked = store.lock().unwrap();
+                locked.passwort_stimmt(passwort)
+            };
+            if !stimmt {
+                return json!({"error": "falsches Passwort"});
+            }
+            GESPERRT.store(false, std::sync::atomic::Ordering::Relaxed);
+            regung_vermerken();
+            crate::net::log("aufgesperrt");
+            json!({"ok": true, "locked": false})
+        }
+
+        // Wie lange ohne Regung, bis von selbst zugesperrt wird. 0 heisst nie.
+        ("POST", "/lockafter") => {
+            let minuten = body["minutes"].as_u64().unwrap_or(0);
+            let mut locked = store.lock().unwrap();
+            locked.state.sperre_nach_minuten = minuten;
+            let _ = locked.save();
+            json!({"ok": true, "minutes": minuten})
+        }
+
+        // Nachrichten loeschen -- eine einzelne oder das ganze Gespraech.
+        // Rein oertlich: die Gegenseite behaelt ihre Kopie, wie bei Briar
+        // ("delete messages" loescht nur hier). Der Anhang geht mit, sonst
+        // bliebe das Bild auf der Platte, das man gerade weghaben wollte.
+        ("POST", "/message/delete") => {
+            let contact_id = body["contact"].as_u64().unwrap_or(0) as u32;
+            let alle = body["all"].as_bool().unwrap_or(false);
+            let kennung = body["id"].as_str().unwrap_or("").to_string();
+            let mut locked = store.lock().unwrap();
+            let betroffen: Vec<(String, Option<String>)> = match locked.contact(contact_id) {
+                Some(c) => c
+                    .messages
+                    .iter()
+                    .filter(|m| alle || m.id == kennung)
+                    .map(|m| (m.id.clone(), m.attachment.clone()))
+                    .collect(),
+                None => return json!({"error": "no such contact"}),
+            };
+            if betroffen.is_empty() {
+                return json!({"error": "no such message"});
+            }
+            let ids: std::collections::BTreeSet<String> =
+                betroffen.iter().map(|(id, _)| id.clone()).collect();
+            // Erst die Anhaenge, dann die Eintraege: nach dem Streichen wuesste
+            // niemand mehr, welche Datei gemeint war.
+            for (_, anhang) in &betroffen {
+                if let Some(anhang) = anhang {
+                    locked.anhang_loeschen(anhang);
+                }
+            }
+            if let Some(c) = locked.contact_mut(contact_id) {
+                c.messages.retain(|m| !ids.contains(&m.id));
+                // Was noch nicht hinaus ist, geht auch nicht mehr hinaus.
+                c.outbox.retain(|m| !ids.contains(&m.id));
+            }
+            let _ = locked.save();
+            json!({"ok": true, "removed": ids.len()})
+        }
+
+        ("POST", "/account/delete") => {
+            let pfad = store.lock().unwrap().path.clone();
+            konto_loeschen(&pfad);
+            json!({"ok": true})
+        }
 
         // Die vier Wege der Nachrichtenbrücke (siehe unten).
         ("GET", "/chats") => {
@@ -1264,8 +1425,9 @@ fn status(store: &Shared) -> Value {
         // briar://-Link und damit den QR-Code -- stuende hier nur eine
         // Adresse, waere jede Kopplung wieder an ein einziges Netz genagelt.
         "lanAddress": lan_addresses,
-        "locked": false,
+        "locked": ist_gesperrt(),
         "encrypted": locked.verschluesselt(),
+        "lockAfter": locked.state.sperre_nach_minuten,
         "tor": locked.state.tor,
         "onion": locked.state.tor_onion,
         "revision": locked.state.revision,

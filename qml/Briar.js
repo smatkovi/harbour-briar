@@ -92,6 +92,30 @@ function unlock(password, callback) {
     request("POST", "/unlock", { password: password }, callback)
 }
 
+/** Zusperren wie Briars Bildschirmsperre: der Abgleich laeuft weiter. */
+function lock(callback) {
+    request("POST", "/lock", {}, callback)
+}
+
+/** Nach wie vielen Minuten ohne Regung von selbst zugesperrt wird, 0 = nie. */
+function lockAfter(minutes, callback) {
+    request("POST", "/lockafter", { minutes: minutes }, callback)
+}
+
+/** Alles loeschen und von vorn anfangen. Auch der Weg bei vergessenem Passwort. */
+function deleteAccount(callback) {
+    request("POST", "/account/delete", {}, callback)
+}
+
+/** Eine Nachricht oder das ganze Gespraech loeschen -- nur hier, nicht drueben. */
+function deleteMessage(contact, id, callback) {
+    request("POST", "/message/delete", { contact: contact, id: id }, callback)
+}
+
+function deleteAllMessages(contact, callback) {
+    request("POST", "/message/delete", { contact: contact, all: true }, callback)
+}
+
 // Briars Staerkemass, eins zu eins: die Zahl der VERSCHIEDENEN Zeichen
 // geteilt durch zwoelf, gedeckelt bei 1 (PasswordStrengthEstimatorImpl,
 // STRONG_UNIQUE_CHARS = 12). Die Schwellen dort: 0 keins, 0,25 schwach,

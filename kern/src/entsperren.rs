@@ -84,6 +84,13 @@ fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Stor
                 None,
             ),
         }
+    } else if verb == "POST" && weg.starts_with("/account/delete") {
+        // Der Weg heraus, wenn das Passwort weg ist. Es gibt keinen anderen:
+        // ohne Passwort ist die Datei nicht zu oeffnen, und ein Hintertuerchen
+        // waere genau das, was hier niemand will.
+        crate::net::log("Konto wird geloescht (Passwort vergessen)");
+        crate::api::konto_loeschen(pfad);
+        (200, "{\"ok\":true}".to_string(), None)
     } else if verb == "GET" && weg.starts_with("/status") {
         // Genau so viel, dass die Oberflaeche weiss, was sie fragen muss.
         (200, "{\"locked\":true,\"running\":true}".to_string(), None)

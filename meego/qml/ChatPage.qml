@@ -50,6 +50,38 @@ Page {
         onTriggered: seite.neuLaden()
     }
 
+    property string loeschKennung: ""
+
+    QueryDialog {
+        id: einzelneLoeschen
+        titleText: fenster.tr("deleteMessage")
+        message: fenster.tr("deleteMessagesAsk")
+        acceptButtonText: fenster.tr("deleteMessage")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.deleteMessage(seite.kontakt, seite.loeschKennung,
+                                        function() { seite.neuLaden() })
+    }
+
+    QueryDialog {
+        id: alleLoeschen
+        titleText: fenster.tr("deleteAllMessages")
+        message: fenster.tr("deleteMessagesAsk")
+        acceptButtonText: fenster.tr("deleteAllMessages")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.deleteAllMessages(seite.kontakt,
+                                            function() { seite.neuLaden() })
+    }
+
+    Menu {
+        id: gespraechsMenue
+        MenuLayout {
+            MenuItem {
+                text: fenster.tr("deleteAllMessages")
+                onClicked: alleLoeschen.open()
+            }
+        }
+    }
+
     tools: ToolBarLayout {
         ToolIcon {
             platformIconId: "toolbar-back"
@@ -64,6 +96,10 @@ Page {
         ToolIcon {
             platformIconId: "toolbar-refresh"
             onClicked: Briar.connectContact(seite.kontakt, "", "", function() { seite.neuLaden() })
+        }
+        ToolIcon {
+            platformIconId: "toolbar-view-menu"
+            onClicked: gespraechsMenue.open()
         }
     }
 
@@ -105,13 +141,22 @@ Page {
                     // wie empfangene. Die Datei bleibt dabei im Datenordner.
                     MouseArea {
                         anchors.fill: parent
-                        enabled: modelData.attachmentPath !== undefined
-                                 && modelData.attachmentPath !== null
-                        onClicked: pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
-                            "pfad": modelData.attachmentPath,
-                            "typ": "" + modelData.attachmentType,
-                            "groesse": modelData.attachmentSize ? modelData.attachmentSize : 0
-                        })
+                        onClicked: {
+                            if (modelData.attachmentPath !== undefined
+                                    && modelData.attachmentPath !== null)
+                                pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
+                                    "pfad": modelData.attachmentPath,
+                                    "typ": "" + modelData.attachmentType,
+                                    "groesse": modelData.attachmentSize
+                                               ? modelData.attachmentSize : 0
+                                })
+                        }
+                        // Halten loescht sie -- nur hier, die Gegenseite
+                        // behaelt ihre Kopie.
+                        onPressAndHold: {
+                            seite.loeschKennung = modelData.id
+                            einzelneLoeschen.open()
+                        }
                     }
 
                     Image {
