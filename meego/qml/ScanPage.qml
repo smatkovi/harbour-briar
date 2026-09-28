@@ -27,7 +27,11 @@ Page {
     // Zurueck aus der Kamera-App oder aus MeeScan: erst die Zwischenablage
     // (MeeScan legt den Code dort ab), dann das frische Foto.
     onStatusChanged: {
-        if (status !== PageStatus.Active) return
+        if (status !== PageStatus.Active) {
+            sucher.anhalten()
+            return
+        }
+        sucher.starten()
         if (seite.wartetAufFoto) {
             seite.wartetAufFoto = false
             seite.lesen()
@@ -103,13 +107,6 @@ Page {
         }
         seite.meldung = fenster.tr("scanNotBriar")
         sucher.weitersuchen()
-    }
-
-    onStatusChanged: {
-        if (status === PageStatus.Active)
-            sucher.starten()
-        else
-            sucher.anhalten()
     }
 
     Column {

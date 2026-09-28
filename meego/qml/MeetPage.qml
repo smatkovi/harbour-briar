@@ -42,10 +42,18 @@ Page {
     }
 
     Component.onCompleted: seite.starten()
-    Component.onDestruction: Briar.bqpStop(function() {})
+    Component.onDestruction: {
+        sucher.anhalten()
+        Briar.bqpStop(function() {})
+    }
 
     onStatusChanged: {
-        if (status !== PageStatus.Active) return
+        if (status !== PageStatus.Active) {
+            sucher.anhalten()
+            return
+        }
+        if (seite.lage === 0)
+            sucher.starten()
         if (seite.wartetAufFoto) {
             seite.wartetAufFoto = false
             seite.lesen()
@@ -124,15 +132,6 @@ Page {
         running: seite.status === PageStatus.Active && seite.lage < 2
         onTriggered: fenster.aktualisieren()
     }
-
-    onStatusChanged: {
-        if (status === PageStatus.Active && seite.lage === 0)
-            sucher.starten()
-        else
-            sucher.anhalten()
-    }
-
-    Component.onDestruction: sucher.anhalten()
 
     onLageChanged: if (seite.lage !== 0) sucher.anhalten()
 
