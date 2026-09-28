@@ -1733,6 +1733,12 @@ fn status(store: &Shared) -> Value {
         // N9 und N950 haben keinen Zeitdienst; eine leere Pufferbatterie
         // setzt sie auf 1970.
         "clockWrong": net::uhr_steht_falsch(),
+        // Der Kontakt, den das letzte Treffen angelegt oder wiedererkannt
+        // hat -- 0 heisst keiner. Die Treffen-Seite las den Erfolg bisher
+        // nur am Wachsen der Kontaktliste ab; trifft man einen, den man
+        // schon hat, waechst da nichts, und die Seite blieb auf "Gelesen"
+        // stehen, obwohl beide Dienste "Kontakt 1 steht" meldeten.
+        "bqpContact": net::BQP_ERGEBNIS.lock().unwrap().unwrap_or(0),
         // Welche Fassung hier wirklich laeuft. Das Paket zu lesen sagt nur,
         // was auf der Platte liegt -- der Dienst ueberlebt eine
         // Aktualisierung, wenn ihn niemand beendet.

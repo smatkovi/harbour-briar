@@ -198,6 +198,21 @@ Page {
             // statt "hat nicht geklappt" stehenzulassen.
             if (page.lage === 2)
                 return
+            // Zuerst der Dienst selbst: er nennt den Kontakt des letzten
+            // geglueckten Treffens -- auch einen, den es schon gab. Der Zaehler
+            // darunter waechst dann nicht, und genau daran blieb die Seite
+            // frueher auf "Gelesen" stehen, waehrend beide Dienste laengst
+            // "Kontakt 1 steht" meldeten.
+            var nr = app.status.bqpContact
+            if (nr > 0 && app.status.contacts) {
+                for (var i = 0; i < app.status.contacts.length; ++i) {
+                    if (app.status.contacts[i].id === nr) {
+                        page.lage = 2
+                        page.meldung = app.tr("meetDone") + app.status.contacts[i].name
+                        return
+                    }
+                }
+            }
             var jetzt = app.status.contacts ? app.status.contacts.length : 0
             if (jetzt > page.kontakteVorher) {
                 page.lage = 2

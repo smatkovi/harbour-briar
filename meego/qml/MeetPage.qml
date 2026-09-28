@@ -145,6 +145,21 @@ Page {
             // Sekunde im Protokoll -- und dann soll die Seite das sagen,
             // statt "hat nicht geklappt" stehenzulassen.
             if (seite.lage === 2) return
+            // Zuerst der Dienst selbst: er nennt den Kontakt des letzten
+            // geglueckten Treffens -- auch einen, den es schon gab. Der Zaehler
+            // darunter waechst dann nicht, und genau daran blieb die Seite
+            // frueher auf "Gelesen" stehen, waehrend beide Dienste laengst
+            // "Kontakt 1 steht" meldeten.
+            var nr = fenster.zustand.bqpContact
+            if (nr > 0 && fenster.zustand.contacts) {
+                for (var i = 0; i < fenster.zustand.contacts.length; ++i) {
+                    if (fenster.zustand.contacts[i].id === nr) {
+                        seite.lage = 2
+                        seite.meldung = fenster.tr("meetDone") + fenster.zustand.contacts[i].name
+                        return
+                    }
+                }
+            }
             var jetzt = fenster.zustand.contacts
                     ? fenster.zustand.contacts.length : 0
             if (jetzt > seite.kontakteVorher) {
