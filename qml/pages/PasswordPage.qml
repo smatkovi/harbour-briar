@@ -34,6 +34,15 @@ Page {
                 return
             }
             page.erfolg = true
+            // Ins Geraeteschloss legen oder wieder herausnehmen -- was der
+            // Schalter sagt. Bei aufgehobenem Passwort immer heraus.
+            if (Schluesselbund.verfuegbar) {
+                if (answer.encrypted && imTelefon.checked)
+                    Schluesselbund.merken(eins.text)
+                else
+                    Schluesselbund.vergessen()
+                app.schluesselbundDa = answer.encrypted && imTelefon.checked
+            }
             alt.text = ""
             eins.text = ""
             zwei.text = ""
@@ -105,6 +114,17 @@ Page {
                 color: page.erfolg ? Theme.highlightColor : Theme.errorColor
                 font.pixelSize: Theme.fontSizeMedium
                 text: page.message
+            }
+
+            // Das Geraeteschloss als Schluesselbund -- nur wo es das gibt.
+            // Danach genuegt der Fingerabdruck, auch nach einem Neustart des
+            // Dienstes, denn dort liegt das Passwort selbst.
+            TextSwitch {
+                id: imTelefon
+                visible: Schluesselbund.verfuegbar
+                text: app.tr("keepInDevice")
+                description: app.tr("keepInDeviceHint")
+                checked: app.schluesselbundDa
             }
 
             Button {

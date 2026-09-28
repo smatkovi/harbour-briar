@@ -1,5 +1,5 @@
 TARGET = harbour-briar
-CONFIG += sailfishapp c++11
+CONFIG += sailfishapp c++11 link_pkgconfig
 QT += core gui qml quick network
 LIBS += -lsailfishapp
 
@@ -8,7 +8,12 @@ SOURCES += src/harbour-briar.cpp \
     src/quirc/decode.c \
     src/quirc/identify.c \
     src/quirc/version_db.c
-HEADERS += src/imageprep.h src/qrcode.h src/qrencode.h src/quirc/quirc.h
+HEADERS += src/imageprep.h src/qrcode.h src/qrencode.h src/quirc/quirc.h \
+    src/tresorsecrets.h
+
+# Das Geraeteschloss als Schluesselbund (Sailfish Secrets). Nur an der Jolla --
+# die MeeGo-Oberflaeche baut mit meego/briar.pro und sieht diese Datei nicht.
+PKGCONFIG += sailfishsecrets
 
 DISTFILES += \
     qml/harbour-briar.qml \

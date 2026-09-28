@@ -19,6 +19,9 @@ ApplicationWindow {
     /// Die Marke vom Zusperren -- damit sperrt der Fingerabdruck wieder auf,
     /// ohne dass das Passwort irgendwo liegt. Nur im Arbeitsspeicher.
     property string sperrMarke: ""
+    /// Liegt das Passwort im Geraeteschloss? Dann genuegt der Finger, auch nach
+    /// einem Neustart des Dienstes.
+    property bool schluesselbundDa: false
 
     // Every label goes through this, so one comma expression ties all of
     // them to languageRevision -- otherwise the texts would only change on
@@ -88,6 +91,11 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        // Ob wirklich etwas hinterlegt ist, fragen wir NICHT nach: das Holen
+        // loeste die Geraetepruefung aus, und niemand will beim Start einen
+        // Fingerabdruck, ohne danach gefragt zu haben. Der Knopf auf der
+        // Sperrseite versucht es dann einfach.
+        app.schluesselbundDa = Schluesselbund.verfuegbar
         // English until the daemon says otherwise -- see toggleLanguage.
         app.refresh()
     }

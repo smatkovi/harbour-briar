@@ -97,7 +97,14 @@ pub fn message(key: &str, summary: &str, body: &str, argument: &str, group: bool
     // type=input is what makes lipstick draw a text field instead of a button
     hints.insert("x-nemo-remote-action-type-reply", Value::from("input"));
 
-    let actions: Vec<&str> = vec!["default", "", "reply", reply_label];
+    // Ohne Beschriftung keine Antwortzeile: so sieht die Meldung bei
+    // zugesperrter Oberflaeche aus -- sie sagt, dass etwas kam, und laesst
+    // niemanden an der Sperre vorbeischreiben.
+    let actions: Vec<&str> = if reply_label.is_empty() {
+        vec!["default", ""]
+    } else {
+        vec!["default", "", "reply", reply_label]
+    };
     let answer = connection.call_method(
         Some("org.freedesktop.Notifications"),
         "/org/freedesktop/Notifications",

@@ -25,8 +25,15 @@ Page {
     // einmalige Marke und gibt sie nach geglueckter Pruefung zurueck. Die Marke
     // liegt nur im Arbeitsspeicher; nach einem Neustart des Dienstes ist der
     // Speicher ohnehin versiegelt, und dann hilft nur das Passwort.
-    property bool mitTelefonMoeglich: app.sperrMarke.length > 0
-                                      && pruefer.availableMethods !== 0
+    // Zwei Wege mit dem Telefon:
+    //  * die Marke -- nur wenn diese App gerade selbst zugesperrt hat,
+    //  * der Schluesselbund -- auch nach einem Neustart, wenn das Passwort dort
+    //    hinterlegt ist. Der zweite fragt beim Herausgeben selbst nach dem
+    //    Fingerabdruck (DeviceLockVerifyLock), der erste braucht die Pruefung
+    //    von uns.
+    property bool mitTelefonMoeglich: (app.sperrMarke.length > 0
+                                       && pruefer.availableMethods !== 0)
+                                      || app.schluesselbundDa
 
     Authenticator {
         id: pruefer
@@ -111,7 +118,31 @@ Page {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.tr("unlockWithDevice")
                 enabled: !page.busy
-                onClicked: pruefer.authenticate("briar-unlock")
+                onClicked: {
+                    if (app.sperrMarke.length > 0 && pruefer.availableMethods !== 0) {
+                        pruefer.authenticate("briar-unlock")
+                        return
+                    }
+                    // Aus dem Schluesselbund: das Herausgeben fragt selbst nach
+                    // Fingerabdruck oder Code.
+                    page.busy = true
+                    var passwort = Schluesselbund.holen()
+                    if (!passwort) {
+                        page.busy = false
+                        page.message = app.tr("unlockWrong")
+                        return
+                    }
+                    Briar.unlock(passwort, function(answer) {
+                        page.busy = false
+                        if (answer.error) {
+                            page.message = app.tr("unlockWrong")
+                            return
+                        }
+                        app.locked = false
+                        app.refresh()
+                        pageStack.pop()
+                    })
+                }
             }
             Label {
                 x: Theme.horizontalPageMargin

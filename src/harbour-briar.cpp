@@ -18,6 +18,7 @@
 
 #include "imageprep.h"
 #include "qrcode.h"
+#include "tresorsecrets.h"
 
 namespace {
 
@@ -95,9 +96,14 @@ int main(int argc, char *argv[])
     ImagePrep imagePrep;
     Daemon daemon;
     QrCode qrCode;
+    TresorSecrets schluesselbund;
     view->rootContext()->setContextProperty(QStringLiteral("ImagePrep"), &imagePrep);
     view->rootContext()->setContextProperty(QStringLiteral("Daemon"), &daemon);
     view->rootContext()->setContextProperty(QStringLiteral("QrCode"), &qrCode);
+    // Das Geraeteschloss als Schluesselbund: damit sperrt der Fingerabdruck
+    // auch einen versiegelten Dienst auf, so wie Briar es auf Android haelt.
+    view->rootContext()->setContextProperty(QStringLiteral("Schluesselbund"),
+                                            &schluesselbund);
     view->setSource(SailfishApp::pathTo(QStringLiteral("qml/harbour-briar.qml")));
     view->show();
     return app->exec();

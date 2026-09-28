@@ -44,6 +44,12 @@ Page {
                     page.message = Briar.klartext(zweite.error)
                     return
                 }
+                // Gleich ins Geraeteschloss, wenn gewuenscht: dann genuegt
+                // kuenftig der Fingerabdruck.
+                if (Schluesselbund.verfuegbar && imTelefon.checked) {
+                    Schluesselbund.merken(eins.text)
+                    app.schluesselbundDa = true
+                }
                 app.refresh()
                 pageStack.pop()
             })
@@ -55,6 +61,14 @@ Page {
         spacing: Theme.paddingLarge
 
         PageHeader { title: app.tr("setupPassword") }
+
+        TextSwitch {
+            id: imTelefon
+            visible: Schluesselbund.verfuegbar
+            text: app.tr("keepInDevice")
+            description: app.tr("keepInDeviceHint")
+            checked: true
+        }
 
         Label {
             x: Theme.horizontalPageMargin

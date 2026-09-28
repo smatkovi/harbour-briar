@@ -62,6 +62,7 @@ static bool dienstAntwortet()
 #include "dienst.h"
 #include "../src/qrcode.h"
 #include "kamera.h"
+#include "geraeteschloss.h"
 
 static void dienstStarten();
 
@@ -102,6 +103,7 @@ int main(int argc, char *argv[])
     // Reihenfolge, und die Engine haelt beim Abbau noch eine
     // Kontext-Eigenschaft darauf.
     Kamera kamera;
+    Geraeteschloss geraeteschloss;
 
     QDeclarativeView view;
     // Qt 4.7's QML has no Qt.locale(), so the interface gets the system's
@@ -116,6 +118,9 @@ int main(int argc, char *argv[])
     // nicht auf, er faellt aus -- Connections greift dann still auf das
     // Elternobjekt zurueck.
     view.rootContext()->setContextProperty(QLatin1String("kamera"), &kamera);
+    // Das Geraeteschloss: sperrt das Telefon zu, sperrt Briar mit.
+    view.rootContext()->setContextProperty(QLatin1String("geraeteschloss"),
+                                           &geraeteschloss);
     view.setResizeMode(QDeclarativeView::SizeRootObjectToView);
     view.setSource(QUrl::fromLocalFile(QLatin1String("/opt/briar/qml/main.qml")));
     view.showFullScreen();

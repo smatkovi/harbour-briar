@@ -439,10 +439,17 @@ fn local_properties(
 /// else this does nothing, and the interface shows the message as before.
 #[cfg(feature = "sfos")]
 fn notify_chat(key: String, summary: String, body: String, group: bool) {
-    // Off the sync thread: the notification talks to lipstick over D-Bus,
-    // and a slow answer must not hold up the connection.
+    // Zugesperrt heisst zugesperrt: dann steht in der Meldung, DASS etwas kam,
+    // aber nicht was und von wem -- und die Antwortzeile in der Meldung faellt
+    // weg, sonst schriebe man an der Sperre vorbei. Briar auf Android haelt es
+    // ebenso (die Meldung wird bei aktiver Sperre entschaerft).
+    let gesperrt = crate::api::ist_gesperrt();
     std::thread::spawn(move || {
-        crate::notify::message(&key, &summary, &body, &key, group, "Antworten");
+        if gesperrt {
+            crate::notify::message("briar-gesperrt", "Briar", "Neue Nachricht", "", group, "");
+        } else {
+            crate::notify::message(&key, &summary, &body, &key, group, "Antworten");
+        }
     });
 }
 

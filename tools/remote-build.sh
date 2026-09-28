@@ -53,14 +53,16 @@ fi
 QTINC=$SYSROOT/usr/include/qt4
 CXXFLAGS="--sysroot=$SYSROOT -std=gnu++17 -O2 -Wall -Wno-register \
  -Wno-deprecated-declarations -DQT_NO_DEBUG -I$QTINC"
-for m in QtCore QtGui QtNetwork QtScript QtDeclarative; do
+for m in QtCore QtGui QtNetwork QtScript QtDeclarative QtDBus; do
     CXXFLAGS="$CXXFLAGS -I$QTINC/$m"
 done
 LDFLAGS="--sysroot=$SYSROOT -static-libstdc++ -static-libgcc -Wl,-O1 \
  -Wl,--as-needed -Wl,--exclude-libs,ALL -Wl,--dynamic-linker=/lib/ld-linux.so.3"
 # -lutil liefert forkpty: MeeScan puffert seine Ausgabe, wenn sie nicht an
 # einem Endgeraet haengt, und dann kommt bis zum Programmende nichts an.
-LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtGui -lQtCore -lpthread -lutil"
+# QtDBus: das Geraeteschloss von Harmattan haengt am Systembus
+# (com.nokia.devicelock), und daran fuehrt Briar seine eigene Sperre.
+LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtDBus -lQtGui -lQtCore -lpthread -lutil"
 
 cd "$OUT"
 # ImagePrep is a QObject, so it needs moc. The simulator Qt's moc produces
@@ -76,6 +78,8 @@ $MOC "$SRC/src/qrcode.h" -o moc_qrcode.cpp
 $CXX $CXXFLAGS -I"$SRC/src" -c moc_qrcode.cpp -o moc_qrcode.o
 $MOC "$SRC/meego/kamera.h" -o moc_kamera.cpp
 $CXX $CXXFLAGS -I"$SRC/src" -I"$SRC/meego" -c moc_kamera.cpp -o moc_kamera.o
+$MOC "$SRC/meego/geraeteschloss.h" -o moc_geraeteschloss.cpp
+$CXX $CXXFLAGS -I"$SRC/meego" -c moc_geraeteschloss.cpp -o moc_geraeteschloss.o
 QUIRCOBJS=""
 for q in quirc decode identify version_db; do
     $CC --sysroot=$SYSROOT -O2 -std=gnu99 -I"$SRC/src/quirc" \
@@ -84,5 +88,5 @@ for q in quirc decode identify version_db; do
 done
 $CXX $CXXFLAGS -c "$SRC/meego/main.cpp" -o main.o
 $CXX $LDFLAGS -o briar main.o moc_imageprep.o moc_dienst.o moc_qrcode.o \
- moc_kamera.o $QUIRCOBJS $LIBS
+ moc_kamera.o moc_geraeteschloss.o $QUIRCOBJS $LIBS
 echo "== briar (Harmattan interface): $(stat -c %s briar) B"

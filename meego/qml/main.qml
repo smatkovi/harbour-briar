@@ -36,6 +36,33 @@ PageStackWindow {
 
     // Meldet der Dienst "locked", steht die Entsperrseite vor allem anderen.
     property bool gesperrt: false
+    /// Die Marke vom Zusperren: mit ihr geht Briar wieder auf, sobald das
+    /// Telefon aufgesperrt wird -- ohne dass das Passwort irgendwo liegt.
+    property string sperrMarke: ""
+
+    // Das Geraeteschloss fuehrt Briars Sperre. Sperrt das Telefon zu, sperrt
+    // Briar mit; sperrt es auf, geht auch Briar wieder auf. Ist gar kein
+    // Sperrcode eingestellt -- Harmattan erlaubt das --, meldet der Dienst nie
+    // eine Sperre, und es bleibt beim Briar-Passwort nach dem Neustart.
+    Connections {
+        target: geraeteschloss
+        onGesperrtChanged: {
+            if (geraeteschloss.gesperrt) {
+                Briar.lock(function(antwort) {
+                    if (!antwort.error)
+                        fenster.sperrMarke = antwort.token ? antwort.token : ""
+                })
+            } else if (fenster.sperrMarke.length > 0) {
+                Briar.unlock2(fenster.sperrMarke, function(antwort) {
+                    if (!antwort.error) {
+                        fenster.sperrMarke = ""
+                        fenster.gesperrt = false
+                        fenster.aktualisieren()
+                    }
+                })
+            }
+        }
+    }
 
     function entsperrseiteZeigen() {
         if (pageStack.currentPage

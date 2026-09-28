@@ -12,6 +12,9 @@ BuildRequires:  pkgconfig(Qt5Qml)
 BuildRequires:  pkgconfig(Qt5Quick)
 BuildRequires:  pkgconfig(Qt5Gui)
 BuildRequires:  pkgconfig(Qt5Network)
+# Das Geraeteschloss als Schluesselbund: darin liegt das Kontopasswort, damit
+# der Fingerabdruck auch einen versiegelten Dienst aufsperrt.
+BuildRequires:  pkgconfig(sailfishsecrets)
 BuildRequires:  desktop-file-utils
 
 %description
