@@ -43,7 +43,13 @@ Page {
     Connections {
         target: Schluesselbund
         onGefunden: {
+            // Auch hier die Nachfrage: der Schluesselbund und das
+            // Geraeteschloss gehen nicht ueber versuchen(), und genau dort
+            // blieb die Seite auf "wird geprueft" stehen.
+            page.busy = true
+            nachfrage.restart()
             Briar.unlock(passwort, function(answer) {
+                nachfrage.stop()
                 page.busy = false
                 if (answer.error) {
                     page.message = app.tr("unlockWrong")
@@ -55,6 +61,7 @@ Page {
             })
         }
         onFehlgeschlagen: {
+            nachfrage.stop()
             page.busy = false
             // Kein Vorwurf und kein Raetsel: es bleibt das Passwort. Gemerkt
             // wird der Fehlschlag trotzdem -- glueckt gleich das Tippen, legen
@@ -64,11 +71,47 @@ Page {
         }
     }
 
+    /// Sobald die Seite steht und im Schluesselbund etwas liegt: gleich nach
+    /// Fingerabdruck oder Sperrcode fragen. Glueckt das, wird das Passwort
+    /// ohne weitere Rueckfrage geholt und die App geht von selbst auf -- ein
+    /// Schritt statt dreier (Knopf, Fingerabdruck, "Erlauben").
+    Component.onCompleted: {
+        // Das Tippen bleibt immer moeglich: der Fokus geht ins Feld, auch
+        // wenn daneben nach dem Fingerabdruck gefragt wird. Wer die Abfrage
+        // wegwischt, gibt einfach das Passwort ein.
+        feld.forceActiveFocus()
+        if (app.schluesselbundDa && pruefer.availableMethods !== 0)
+            vonSelbst.start()
+    }
+
+    Timer {
+        id: vonSelbst
+        interval: 250
+        // Dieselbe kurze Kennung wie beim Knopf weiter unten. Ein ganzer
+        // uebersetzter Satz ist kein Pruefcode -- damit kam die Abfrage
+        // des Geraeteschlosses gar nicht erst.
+        onTriggered: pruefer.authenticate("briar-unlock")
+    }
+
     Authenticator {
         id: pruefer
         onAuthenticated: {
             page.busy = true
+            nachfrage.restart()
+            // Ohne Marke gibt es nichts aufzusperren -- dann kommt das
+            // Passwort aus dem Schluesselbund, jetzt ohne zweite Rueckfrage.
+            if (app.sperrMarke.length === 0) {
+                if (app.schluesselbundDa) {
+                    page.message = app.tr("unlockWorking")
+                    Schluesselbund.holen()
+                } else {
+                    nachfrage.stop()
+                    page.busy = false
+                }
+                return
+            }
             Briar.unlock2(app.sperrMarke, function(answer) {
+                nachfrage.stop()
                 page.busy = false
                 if (answer.error) {
                     page.message = app.tr("unlockWrong")
@@ -101,6 +144,10 @@ Page {
                     return
                 nachfrage.stop()
                 page.busy = false
+                // Ohne das schiebt die naechste Auffrischung die Seite
+                // gleich wieder davor -- der Dienst ist offen, die App
+                // glaubt aber weiter, sie sei gesperrt.
+                app.locked = false
                 app.refresh()
                 pageStack.pop()
             })
@@ -257,5 +304,4 @@ Page {
         })
     }
 
-    Component.onCompleted: feld.forceActiveFocus()
 }

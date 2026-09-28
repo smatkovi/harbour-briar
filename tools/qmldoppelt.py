@@ -21,7 +21,13 @@ import re
 import sys
 from pathlib import Path
 
-ANGABE = re.compile(r'^\s*(?:(?:readonly\s+)?property\s+\w+(?:<[\w.]+>)?\s+(\w+)|(on[A-Z]\w*))\s*:')
+# Auch gepunktete Empfaenger wie Component.onCompleted oder
+# imageCapture.onImageSaved -- genau so ist eine doppelte
+# Component.onCompleted durchgerutscht, die QML mit "Property value set
+# multiple times" ablehnt.
+ANGABE = re.compile(
+    r'^\s*(?:(?:readonly\s+)?property\s+\w+(?:<[\w.]+>)?\s+(\w+)'
+    r'|((?:[A-Za-z_]\w*\.)?on[A-Z]\w*))\s*:')
 # Zeichenketten und Kommentare zaehlen beim Klammern nicht mit.
 ZEICHENKETTE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
 

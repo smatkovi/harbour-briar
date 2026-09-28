@@ -1,6 +1,6 @@
 Name:       harbour-briar
 Summary:    Briar for Sailfish OS
-Version:    0.35.5
+Version:    0.35.9
 Release:    1
 License:    GPLv3
 URL:        https://github.com/smatkovi/harbour-briar
@@ -43,7 +43,17 @@ briar:// link and address.
 # Binaerdatei danebenliegt. Das hat schon mehrere Fehlersuchen gekostet.
 # Beim naechsten Oeffnen der App startet der neue; das Passwort wird dabei
 # einmal wieder gebraucht, weil der Speicher versiegelt.
-pkill -x harbour-briar-briard 2>/dev/null || :
+# Ueber /proc, nicht ueber pkill: Linux kuerzt den Prozessnamen auf 15
+# Zeichen, "harbour-briar-briard" hat 20 -- `pkill -x` mit dem vollen Namen
+# findet nie etwas. Nachgemessen: /proc/<pid>/comm sagt "harbour-briar-b".
+# Genau daran lief auf der Jolla stundenlang ein veralteter Dienst weiter,
+# waehrend jede Reparatur danebenlag.
+for d in /proc/[0-9]*; do
+    [ -r "$d/cmdline" ] || continue
+    case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in
+        *harbour-briar-briard*) kill "${d#/proc/}" 2>/dev/null || : ;;
+    esac
+done
 exit 0
 
 %files

@@ -1,5 +1,10 @@
 TARGET = harbour-briar
 CONFIG += sailfishapp c++11 link_pkgconfig
+# Die Fassung aus dem RPM-Rezept -- eine Quelle fuer alle Pakete. Die App
+# vergleicht sie mit der, die der laufende Dienst meldet.
+BRIARVER = $$system(sed -n 's/^Version: *//p' $$PWD/rpm/harbour-briar.spec)
+DEFINES += BRIAR_VERSION=\\\"$$BRIARVER\\\"
+
 QT += core gui qml quick network
 LIBS += -lsailfishapp
 

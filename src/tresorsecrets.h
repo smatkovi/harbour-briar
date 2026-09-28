@@ -134,8 +134,20 @@ public:
         m_holen->setIdentifier(Sailfish::Secrets::Secret::Identifier(
                 NAME, ABLAGE,
                 Sailfish::Secrets::SecretManager::DefaultStoragePluginName));
+        // Erst ohne Rueckfrage versuchen. Der Dialog "Erlauben?" kam bisher
+        // NACH dem Fingerabdruck und fragte damit ein zweites Mal dasselbe;
+        // die Berechtigung holt die Oberflaeche jetzt vorher selbst ueber das
+        // Geraeteschloss, und herausgegeben wird das Geheimnis ohnehin nur an
+        // diese Anwendung (OwnerOnlyMode).
+        //
+        // Gibt der Dienst es ohne Rueckfrage nicht heraus -- nachgemessen tut
+        // er das nicht --, wird EINMAL mit Rueckfrage nachgesetzt, statt in
+        // einer Sackgasse zu enden. Zwei Versuche sind besser als die Wahl
+        // zwischen einem Dialog zuviel und gar keinem Ergebnis.
         m_holen->setUserInteractionMode(
-                Sailfish::Secrets::SecretManager::SystemInteraction);
+                m_zweiterVersuch
+                ? Sailfish::Secrets::SecretManager::SystemInteraction
+                : Sailfish::Secrets::SecretManager::PreventInteraction);
         setzeLaeuft(true);
         connect(m_holen, SIGNAL(statusChanged()), this, SLOT(holenFertig()));
         m_holen->startRequest();
@@ -232,11 +244,22 @@ private slots:
                 : QString();
         m_holen->deleteLater();
         m_holen = 0;
-        fertig();
-        if (gut && !passwort.isEmpty())
+        if (gut && !passwort.isEmpty()) {
+            m_zweiterVersuch = false;
+            fertig();
             emit gefunden(passwort);
-        else
-            emit fehlgeschlagen();
+            return;
+        }
+        // Der stille Versuch ist gescheitert -- einmal mit Rueckfrage.
+        if (!m_zweiterVersuch) {
+            m_zweiterVersuch = true;
+            setzeLaeuft(false);
+            holen();
+            return;
+        }
+        m_zweiterVersuch = false;
+        fertig();
+        emit fehlgeschlagen();
     }
 
     void fristAbgelaufen()
@@ -294,6 +317,7 @@ private:
     Sailfish::Secrets::StoredSecretRequest *m_holen;
     QTimer m_frist;
     QString m_passwort;
+    bool m_zweiterVersuch = false;
     bool m_laeuft;
     // Eine eigene Ablage, damit nichts mit anderen Anwendungen kollidiert.
     const QString ABLAGE = QStringLiteral("harbour-briar");

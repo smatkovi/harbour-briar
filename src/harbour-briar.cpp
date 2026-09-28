@@ -12,6 +12,8 @@
 #include <QQuickView>
 #include <QStandardPaths>
 #include <QTcpSocket>
+#include <QThread>
+#include <csignal>
 #include <QDir>
 
 #include <sailfishapp.h>
@@ -31,10 +33,78 @@ bool daemonAnswers()
     return socket.waitForConnected(300);
 }
 
+#if __has_include("briarversion.h")
+#include "briarversion.h"
+#endif
+#ifndef BRIAR_VERSION
+#define BRIAR_VERSION "unbekannt"
+#endif
+
+/// Welche Fassung der laufende Dienst ist. Leer heisst: er antwortet nicht
+/// oder sagt es nicht -- dann ist er aelter als 0.35.2.
+static QString daemonVersion()
+{
+    QTcpSocket socket;
+    socket.connectToHost(QStringLiteral("127.0.0.1"), ApiPort);
+    if (!socket.waitForConnected(300))
+        return QString();
+    socket.write("GET /status HTTP/1.0\r\n\r\n");
+    if (!socket.waitForBytesWritten(300))
+        return QString();
+    QByteArray answer;
+    while (socket.waitForReadyRead(700))
+        answer += socket.readAll();
+    const int i = answer.indexOf("\"version\":\"");
+    if (i < 0)
+        return QString();
+    const int a = i + 11;
+    const int e = answer.indexOf('"', a);
+    return e < 0 ? QString() : QString::fromLatin1(answer.mid(a, e - a));
+}
+
+/// Den laufenden Dienst beenden -- ueber /proc.
+///
+/// Nicht ueber pkill: Linux kuerzt den Prozessnamen auf 15 Zeichen, und
+/// "harbour-briar-briard" hat 20. `pkill -x` mit dem vollen Namen findet
+/// deshalb nie etwas, /proc/<pid>/comm sagt nur "harbour-briar-b". Genau
+/// daran lief hier stundenlang ein veralteter Dienst weiter.
+static void stopDaemon()
+{
+    QDir proc(QStringLiteral("/proc"));
+    const QStringList entries = proc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QString &name : entries) {
+        bool number = false;
+        const int pid = name.toInt(&number);
+        if (!number || pid <= 1)
+            continue;
+        QFile f(QStringLiteral("/proc/") + name + QStringLiteral("/cmdline"));
+        if (!f.open(QIODevice::ReadOnly))
+            continue;
+        const QByteArray line = f.readAll();
+        f.close();
+        if (line.contains("harbour-briar-briard"))
+            ::kill(pid, SIGTERM);
+    }
+}
+
 void startDaemon()
 {
-    if (daemonAnswers())
-        return;
+    if (daemonAnswers()) {
+        // Laeuft schon einer -- aber der zur App gehoerende? Der Dienst
+        // ueberlebt eine Aktualisierung, und ohne diese Pruefung startet die
+        // App keinen zweiten. Dann liegt die neue Binaerdatei da, waehrend
+        // der alte Dienst weiterlaeuft und jede Reparatur wirkungslos scheint.
+        const QString running = daemonVersion();
+        if (running == QLatin1String(BRIAR_VERSION))
+            return;
+        qWarning("Dienst ist Fassung '%s', die App ist %s -- neu starten",
+                 qPrintable(running.isEmpty()
+                            ? QStringLiteral("aelter als 0.35.2") : running),
+                 BRIAR_VERSION);
+        stopDaemon();
+        for (int i = 0; i < 20 && daemonAnswers(); ++i)
+            QThread::msleep(100);
+    }
     const QString data = QStandardPaths::writableLocation(
                 QStandardPaths::GenericDataLocation) + QStringLiteral("/harbour-briar");
     QDir().mkpath(data);
