@@ -1,6 +1,6 @@
 Name:       harbour-briar
 Summary:    Briar for Sailfish OS
-Version:    0.37.0
+Version:    0.38.0
 Release:    1
 License:    GPLv3
 URL:        https://github.com/smatkovi/harbour-briar
