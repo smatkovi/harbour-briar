@@ -81,6 +81,12 @@ fn main() {
     // Dienst auf dem gewohnten Port und beantwortet nur "gesperrt" und
     // "hier ist das Passwort", bis er eines bekommt. Danach faehrt der Rest
     // hoch wie immer.
+    // Das Protokoll muss die Entsperrphase sehen: sie ist genau die, in der
+    // etwas schiefgehen kann. Stand das Setzen danach, fehlten "der Speicher
+    // ist verschluesselt" und "entsperrt" in der Datei -- also gerade das,
+    // wonach man sucht.
+    net::log_datei_setzen(&state_path);
+
     let mut store = if Store::ist_verschluesselt(&state_path) {
         briarkern::entsperren::warten(&state_path, api_port, DEFAULT_PORT)
     } else {
@@ -97,9 +103,6 @@ fn main() {
     if let Some(port) = lan_port {
         store.state.listen_port = port;
     }
-    // Ab hier schreibt das Protokoll auch neben den Zustand. Vorher geht
-    // es nicht: erst hier steht fest, wo der Zustand liegt.
-    net::log_datei_setzen(&state_path);
     net::log(&format!("state in {}", state_path.display()));
     let shared = Arc::new(Mutex::new(store));
 

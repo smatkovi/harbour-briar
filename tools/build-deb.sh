@@ -51,9 +51,23 @@ PY
 # RPM-Rezept. busybox kennt kein pkill -x, also ueber pgrep.
 cat > "$STAGE/DEBIAN/postinst" <<'SH'
 #!/bin/sh
-for p in $(pgrep briard 2>/dev/null); do
-    kill "$p" 2>/dev/null
+# Den alten Dienst beenden -- er ueberlebt sonst die Aktualisierung, und die
+# App startet keinen zweiten. Am N9 lief so Paket 0.35.1 neben einem Dienst
+# aus 0.34.0, und jede Reparatur schien wirkungslos.
+#
+# Ohne pgrep und ohne pkill: was in einem Wartungsskript unter aegis an
+# Werkzeugen und PATH da ist, laesst sich nicht voraussetzen. /proc reicht.
+getroffen=0
+for d in /proc/[0-9]*; do
+    [ -r "$d/cmdline" ] || continue
+    case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in
+        */briard*)
+            kill "${d#/proc/}" 2>/dev/null && getroffen=$((getroffen+1))
+            ;;
+    esac
 done
+# Eine Spur, damit sich nachsehen laesst, ob das Skript ueberhaupt lief.
+echo "$(date) postinst: $getroffen Dienst(e) beendet" >> /home/user/briar-postinst.log 2>/dev/null
 exit 0
 SH
 chmod 755 "$STAGE/DEBIAN/postinst"

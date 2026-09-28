@@ -56,8 +56,13 @@ QTINC=$SYSROOT/usr/include/qt4
 # zeigte auf den Bauwirt statt in das Sysroot.
 GSTINC="-I$SYSROOT/usr/include/gstreamer-0.10 -I$SYSROOT/usr/include/glib-2.0 \
  -I$SYSROOT/usr/lib/glib-2.0/include -I$SYSROOT/usr/include/libxml2"
+# Die Fassung kommt aus dem RPM-Rezept -- eine Quelle fuer alle Pakete. Die
+# App vergleicht sie mit der, die der laufende Dienst meldet, und startet ihn
+# neu, wenn sie auseinandergehen. Am N9 geht das nicht ueber das Paket:
+# aegis-dpkg fuehrt Wartungsskripte nicht aus.
+BRIARVER=$(sed -n 's/^Version: *//p' "$SRC/rpm/harbour-briar.spec")
 CXXFLAGS="--sysroot=$SYSROOT -std=gnu++17 -O2 -Wall -Wno-register \
- -Wno-deprecated-declarations -DQT_NO_DEBUG -I$QTINC $GSTINC"
+ -Wno-deprecated-declarations -DQT_NO_DEBUG -I$QTINC $GSTINC -I$OUT"
 for m in QtCore QtGui QtNetwork QtScript QtDeclarative QtDBus; do
     CXXFLAGS="$CXXFLAGS -I$QTINC/$m"
 done
@@ -71,6 +76,8 @@ LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtDBus -lQtGui -lQtCore -lpthread
  -lgstapp-0.10 -lgstbase-0.10 -lgstreamer-0.10 -lgobject-2.0 -lglib-2.0"
 
 cd "$OUT"
+printf '#define BRIAR_VERSION "%s"\n' "$BRIARVER" > briarversion.h
+echo "== Fassung fuer die Oberflaeche: $BRIARVER"
 # ImagePrep is a QObject, so it needs moc. The simulator Qt's moc produces
 # Qt 4 meta code, which is what the sysroot's Qt expects.
 MOC=${MOC:-$HOME/QtSDK/Simulator/Qt/gcc/bin/moc}

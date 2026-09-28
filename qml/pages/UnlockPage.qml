@@ -83,13 +83,39 @@ Page {
         onAborted: page.message = app.tr("lockedHint")
     }
 
+    // Neben dem POST eine eigene Nachfrage. Am N9 kam es vor, dass der Dienst
+    // laengst entsperrt war und lief, waehrend die Antwort auf das POST nicht
+    // ankam -- die Seite stand dann fuer immer auf "wird geprueft". Worauf es
+    // ankommt, ist nicht die Antwort, sondern der Zustand.
+    Timer {
+        id: nachfrage
+        interval: 1500
+        repeat: true
+        onTriggered: {
+            if (!page.busy) {
+                nachfrage.stop()
+                return
+            }
+            Briar.status(function(antwort) {
+                if (!page.busy || antwort.error || antwort.locked)
+                    return
+                nachfrage.stop()
+                page.busy = false
+                app.refresh()
+                pageStack.pop()
+            })
+        }
+    }
+
     function versuchen() {
         if (page.busy || feld.text.length === 0)
             return
         page.busy = true
         page.message = app.tr("unlockWorking")
+        nachfrage.restart()
         Briar.unlock(feld.text, function(answer) {
             page.busy = false
+            nachfrage.stop()
             if (answer.error) {
                 // Ein ausbleibender Dienst ist kein falsches Passwort -- wer
                 // das verwechselt, loescht am Ende sein Konto.

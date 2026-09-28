@@ -18,6 +18,9 @@
 #include <QLocale>
 #include <QProcess>
 #include <QTcpSocket>
+#include <csignal>
+#include <unistd.h>
+#include <sys/types.h>
 
 #include "../src/imageprep.h"
 
@@ -59,6 +62,65 @@ static bool dienstAntwortet()
     return socket.waitForConnected(300);
 }
 
+#if __has_include("briarversion.h")
+#include "briarversion.h"
+#endif
+#ifndef BRIAR_VERSION
+#define BRIAR_VERSION "unbekannt"
+#endif
+
+/// Welche Fassung der laufende Dienst ist -- leer, wenn er nicht antwortet
+/// oder es nicht sagt (dann ist er aelter als 0.35.2).
+static QString dienstFassung()
+{
+    QTcpSocket socket;
+    socket.connectToHost(QLatin1String("127.0.0.1"), ApiPort);
+    if (!socket.waitForConnected(300))
+        return QString();
+    socket.write("GET /status HTTP/1.0\r\n\r\n");
+    if (!socket.waitForBytesWritten(300))
+        return QString();
+    QByteArray antwort;
+    while (socket.waitForReadyRead(700))
+        antwort += socket.readAll();
+    const int i = antwort.indexOf("\"version\":\"");
+    if (i < 0)
+        return QString();
+    const int a = i + 11;
+    const int e = antwort.indexOf('"', a);
+    if (e < 0)
+        return QString();
+    return QString::fromLatin1(antwort.mid(a, e - a));
+}
+
+/// Den laufenden Dienst beenden.
+///
+/// Ueber /proc, weil sich in dieser Umgebung weder pkill noch pgrep
+/// voraussetzen laesst -- und weil der Weg ueber das Paket am N9 gar nicht
+/// geht: aegis-dpkg fuehrt Wartungsskripte nicht aus (nachgemessen, die
+/// Spur des postinst blieb aus). Der Dienst gehoert demselben Benutzer,
+/// also darf die App ihn beenden.
+static void dienstBeenden()
+{
+    QDir proc(QLatin1String("/proc"));
+    const QStringList eintraege =
+        proc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (int i = 0; i < eintraege.size(); ++i) {
+        bool zahl = false;
+        const int pid = eintraege.at(i).toInt(&zahl);
+        if (!zahl || pid <= 1)
+            continue;
+        QFile f(QLatin1String("/proc/") + eintraege.at(i)
+                + QLatin1String("/cmdline"));
+        if (!f.open(QIODevice::ReadOnly))
+            continue;
+        const QByteArray zeile = f.readAll();
+        f.close();
+        if (zeile.contains("briard"))
+            ::kill(pid, SIGTERM);
+    }
+}
+
 #include "dienst.h"
 #include "../src/qrcode.h"
 #include "kamera.h"
@@ -74,8 +136,24 @@ void Dienst::starten()
 
 static void dienstStarten()
 {
-    if (dienstAntwortet())
-        return;
+    if (dienstAntwortet()) {
+        // Laeuft schon einer -- aber ist es der zur App gehoerende? Der
+        // Dienst ueberlebt eine Aktualisierung des Pakets, und die App
+        // startet sonst keinen zweiten. Am N9 lief so Paket 0.35.3 neben
+        // einem Dienst aus 0.34.0, und jede Reparatur schien wirkungslos.
+        const QString laeuft = dienstFassung();
+        if (laeuft == QLatin1String(BRIAR_VERSION))
+            return;
+        qWarning("Dienst ist Fassung '%s', die App ist %s -- neu starten",
+                 qPrintable(laeuft.isEmpty() ? QLatin1String("aelter als 0.35.2")
+                                             : laeuft),
+                 BRIAR_VERSION);
+        dienstBeenden();
+        // Kurz warten, bis der Port wieder frei ist.
+        // QThread::msleep ist in Qt 4.7 geschuetzt -- also unmittelbar.
+        for (int i = 0; i < 20 && dienstAntwortet(); ++i)
+            ::usleep(100 * 1000);
+    }
     const QString daten = QDir::homePath() + QLatin1String("/.local/share/harbour-briar");
     QDir().mkpath(daten);
     QStringList argumente;

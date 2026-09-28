@@ -24,7 +24,36 @@ Page {
                 return
             seite.laeuft = false
             fenster.entsperrtGerade = false
+            nachfrage.stop()
             seite.meldung = fenster.tr("unlockNoAnswer")
+        }
+    }
+
+    // Neben dem POST eine eigene Nachfrage. Der Dienst war schon entsperrt
+    // und lief -- nur die Antwort auf das POST kam nicht an, und die Seite
+    // stand fuer immer auf "wird geprueft". Worauf es ankommt, ist nicht die
+    // Antwort, sondern der Zustand: ist er aufgesperrt, geht es weiter,
+    // gleichgueltig ob der Rueckruf je kommt.
+    Timer {
+        id: nachfrage
+        interval: 1500
+        repeat: true
+        onTriggered: {
+            if (!seite.laeuft) {
+                nachfrage.stop()
+                return
+            }
+            Briar.status(function(antwort) {
+                if (!seite.laeuft || antwort.error || antwort.locked)
+                    return
+                nachfrage.stop()
+                wache.stop()
+                seite.laeuft = false
+                fenster.entsperrtGerade = false
+                fenster.gesperrt = false
+                fenster.aktualisieren()
+                pageStack.pop()
+            })
         }
     }
 
@@ -35,8 +64,10 @@ Page {
         fenster.entsperrtGerade = true
         seite.meldung = fenster.tr("unlockWorking")
         wache.restart()
+        nachfrage.restart()
         Briar.unlock(feld.text, function(antwort) {
             wache.stop()
+            nachfrage.stop()
             seite.laeuft = false
             fenster.entsperrtGerade = false
             if (antwort.error) {
