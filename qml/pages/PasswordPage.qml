@@ -43,7 +43,8 @@ Page {
                     Schluesselbund.merken(eins.text)
                 else
                     Schluesselbund.vergessen()
-                app.schluesselbundDa = answer.encrypted && imTelefon.checked
+                // Erst wenn es wirklich drinliegt -- merken() meldet das.
+                app.schluesselbundDa = false
             }
             alt.text = ""
             eins.text = ""
@@ -52,6 +53,11 @@ Page {
             page.message = answer.encrypted ? app.tr("passwordIsSet")
                                             : app.tr("passwordNotSet")
         })
+    }
+
+    Connections {
+        target: Schluesselbund
+        onGemerkt: app.schluesselbundDa = erfolg
     }
 
     SilicaFlickable {

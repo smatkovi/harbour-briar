@@ -15,6 +15,10 @@ Page {
 
     property bool busy: false
     property string message: app.tr("lockedHint")
+    /// Hat der Schluesselbund gerade versagt? Dann ist die Ablage vermutlich
+    /// hinueber (Geraeteschloss entfernt oder neu eingerichtet), und das
+    /// getippte Passwort fuellt sie wieder.
+    property bool schluesselbundVersagt: false
 
     // Briar auf Android sperrt mit dem Bildschirmschloss des Telefons auf, nicht
     // mit dem Briar-Passwort (KeyguardManager, Fingerabdruck ueber
@@ -52,7 +56,10 @@ Page {
         }
         onFehlgeschlagen: {
             page.busy = false
-            // Kein Vorwurf und kein Raetsel: es bleibt das Passwort.
+            // Kein Vorwurf und kein Raetsel: es bleibt das Passwort. Gemerkt
+            // wird der Fehlschlag trotzdem -- glueckt gleich das Tippen, legen
+            // wir das Passwort neu in den Schluesselbund.
+            page.schluesselbundVersagt = true
             page.message = app.tr("unlockFallback")
         }
     }
@@ -88,6 +95,15 @@ Page {
                 feld.text = ""
                 feld.forceActiveFocus()
                 return
+            }
+            // Hat der Schluesselbund vorher versagt, obwohl dort etwas liegen
+            // sollte, ist die Ablage hinueber -- das passiert, wenn das
+            // Geraeteschloss entfernt oder neu eingerichtet wurde. Das
+            // getippte Passwort ist die Gelegenheit, sie wieder zu fuellen;
+            // sonst bliebe der Knopf stehen und scheiterte jedes Mal.
+            if (page.schluesselbundVersagt && Schluesselbund.verfuegbar) {
+                page.schluesselbundVersagt = false
+                Schluesselbund.merken(feld.text)
             }
             // Der Dienst faehrt jetzt hoch; die Oberflaeche holt sich den
             // Zustand beim naechsten Durchlauf von selbst.

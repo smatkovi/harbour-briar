@@ -47,8 +47,9 @@ Page {
                 // Gleich ins Geraeteschloss, wenn gewuenscht: dann genuegt
                 // kuenftig der Fingerabdruck.
                 if (Schluesselbund.verfuegbar && imTelefon.checked) {
+                    // merken() meldet als Signal, ob es geklappt hat -- die
+                    // Hauptseite hoert darauf.
                     Schluesselbund.merken(eins.text)
-                    app.schluesselbundDa = true
                 }
                 app.refresh()
                 pageStack.pop()

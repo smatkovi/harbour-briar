@@ -33,6 +33,13 @@ ApplicationWindow {
     // Dasselbe fuer das letzte Ereignis einer Gruppe: der Dienst schickt nur
     // die Art und den Namen, den Satz macht die Oberflaeche -- und er muss
     // beim Sprachwechsel mitkommen, darum ueber languageRevision.
+    // Der Schluesselbund meldet, ob das Hinterlegen geklappt hat -- egal von
+    // welcher Seite aus es angestossen wurde.
+    Connections {
+        target: Schluesselbund
+        onGemerkt: app.schluesselbundDa = erfolg
+    }
+
     function ereignis(e) {
         return languageRevision, Strings.ereignis(e)
     }
@@ -91,11 +98,12 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
-        // Ob wirklich etwas hinterlegt ist, fragen wir NICHT nach: das Holen
-        // loeste die Geraetepruefung aus, und niemand will beim Start einen
-        // Fingerabdruck, ohne danach gefragt zu haben. Der Knopf auf der
-        // Sperrseite versucht es dann einfach.
+        // Nicht "gibt es den Dienst", sondern "haben wir dort etwas abgelegt".
+        // Sonst stuende der Knopf "mit dem Telefon aufsperren" auch da, wo nie
+        // etwas hinterlegt wurde, und loeste eine Pruefung aus, die ins Leere
+        // fuehrt. Gefragt wird dabei nichts: die Marke ist eine leere Datei.
         app.schluesselbundDa = Schluesselbund.verfuegbar
+                               && Schluesselbund.hinterlegt()
         // English until the daemon says otherwise -- see toggleLanguage.
         app.refresh()
     }

@@ -28,7 +28,11 @@
 #ifndef TRESORSECRETS_H
 #define TRESORSECRETS_H
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QObject>
+#include <QStandardPaths>
 #include <QString>
 #include <QTimer>
 
@@ -63,6 +67,18 @@ public:
     /// Gibt es den Geheimnisdienst überhaupt? Ohne ihn bleibt alles beim
     /// Passwort -- das ist kein Fehler, nur ein Gerät ohne diese Ablage.
     bool verfuegbar() const { return verwalter.isInitialized(); }
+
+    /// Haben WIR dort je etwas hinterlegt? Das ist etwas anderes als "es gibt
+    /// den Dienst": ohne diese Unterscheidung stünde der Knopf "mit dem Telefon
+    /// aufsperren" auch da, wo nie etwas abgelegt wurde, und liefe jedes Mal
+    /// ins Leere -- samt Prüfung, die niemand angefordert hat.
+    ///
+    /// Gemerkt wird nur die Tatsache, in einer leeren Datei neben dem Speicher.
+    /// Das Passwort steht dort nicht.
+    Q_INVOKABLE bool hinterlegt() const
+    {
+        return QFile::exists(markenpfad());
+    }
 
     /// Läuft gerade eine Anfrage? Die Oberfläche zeigt derweil "warte".
     bool laeuft() const { return m_laeuft; }
@@ -142,6 +158,7 @@ public:
                 Sailfish::Secrets::SecretManager::PreventInteraction);
         weg.startRequest();
         weg.waitForFinished();
+        markeSetzen(false);
     }
 
 signals:
@@ -199,6 +216,7 @@ private slots:
                 == Sailfish::Secrets::Result::Succeeded;
         legen->deleteLater();
         m_passwort.clear();
+        markeSetzen(gut);
         fertig();
         emit gemerkt(gut);
     }
@@ -237,6 +255,27 @@ private slots:
     }
 
 private:
+    /// Der Pfad der Merkdatei -- neben dem Speicher, damit ein geloeschtes
+    /// Konto sie mitnimmt.
+    QString markenpfad() const
+    {
+        return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                + QLatin1String("/harbour-briar/schluesselbund");
+    }
+
+    void markeSetzen(bool gesetzt)
+    {
+        const QString pfad = markenpfad();
+        if (!gesetzt) {
+            QFile::remove(pfad);
+            return;
+        }
+        QDir().mkpath(QFileInfo(pfad).absolutePath());
+        QFile datei(pfad);
+        if (datei.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            datei.close();
+    }
+
     void setzeLaeuft(bool wert)
     {
         if (m_laeuft == wert)
