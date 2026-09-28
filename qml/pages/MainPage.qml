@@ -126,6 +126,17 @@ Page {
                 onClicked: pageStack.push(Qt.resolvedUrl("AboutPage.qml"))
             }
             MenuItem {
+                // Wie bei Briar in den Einstellungen: alles weg und von vorn.
+                // Mit Bedenkzeit, denn danach muessen dich alle neu hinzufuegen.
+                text: app.tr("deleteAccount")
+                onClicked: remorseAction(app.tr("deleteAccount"), function() {
+                    Briar.deleteAccount(function() {
+                        Daemon.ensureRunning()
+                        app.refresh()
+                    })
+                })
+            }
+            MenuItem {
                 text: app.tr("help")
                 onClicked: pageStack.push(Qt.resolvedUrl("HelpPage.qml"))
             }

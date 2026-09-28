@@ -1588,7 +1588,34 @@ impl Node {
                     .get(LAN_TRANSPORT_ID)
                     .and_then(|t| t.port)
                 {
-                    for geraten in ["192.168.43.1", "192.168.49.1"] {
+                    // Die festen Verdaechtigen: Androids Tethering und
+                    // Wi-Fi Direct -- und Sailfishs eigener Zugangspunkt, der
+                    // ein ganz anderes Netz aufspannt
+                    // (/etc/connman/main.conf: TetheringSubnetBlock =
+                    // 172.28.172.0, am Geraet nachgesehen). Ohne den letzten
+                    // fanden sich zwei Sailfish-Geraete im Hotspot nie.
+                    let mut kandidaten: Vec<String> = vec![
+                        "192.168.43.1".to_string(),
+                        "192.168.49.1".to_string(),
+                        "172.28.172.1".to_string(),
+                    ];
+                    // Und der beste Rat ueberhaupt: der Zugangspunkt DIESES
+                    // Netzes. Spannt die Gegenseite ihn auf, ist sie genau
+                    // das -- ganz gleich, welches System mit welchem
+                    // Adressblock. Das deckt auch jeden Hotspot ab, den
+                    // niemand vorhersehen kann.
+                    for (eigene, maske) in local_nets() {
+                        if maske < 8 || maske > 30 {
+                            continue;
+                        }
+                        let bits = u32::from(eigene);
+                        let netz = bits & (u32::MAX << (32 - maske));
+                        let tor = std::net::Ipv4Addr::from(netz | 1);
+                        if tor != eigene && !kandidaten.contains(&tor.to_string()) {
+                            kandidaten.push(tor.to_string());
+                        }
+                    }
+                    for geraten in kandidaten {
                         let eintrag = format!("{}:{}", geraten, port);
                         if !address.split(',').any(|e| e.trim() == eintrag) {
                             address.push(',');

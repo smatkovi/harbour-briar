@@ -73,6 +73,11 @@ Page {
                 text: fenster.tr("about")
                 onClicked: ueber.open()
             }
+            MenuItem {
+                // Wie bei Briar in den Einstellungen: alles weg und von vorn.
+                text: fenster.tr("deleteAccount")
+                onClicked: kontoLoeschen.open()
+            }
         }
     }
 
@@ -92,6 +97,18 @@ Page {
     // Dienst die Route laengst hat. Mit Rueckfrage, wie beim Wartenden.
     property int entferneId: 0
     property string entferneName: ""
+
+    QueryDialog {
+        id: kontoLoeschen
+        titleText: fenster.tr("deleteAccount")
+        message: fenster.tr("deleteAccountAsk")
+        acceptButtonText: fenster.tr("deleteAccount")
+        rejectButtonText: fenster.tr("cancel")
+        onAccepted: Briar.deleteAccount(function() {
+            dienst.starten()
+            fenster.aktualisieren()
+        })
+    }
 
     QueryDialog {
         id: kontaktEntfernen

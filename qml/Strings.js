@@ -138,8 +138,6 @@ var table = {
     passwordWarn:     { de: "Merk es dir gut: es gibt keinen Weg zurück. Ein vergessenes Passwort heißt, dass Kontakte und Verlauf verloren sind.",
                         en: "Remember it: there is no way back. A forgotten password means contacts and history are gone." },
     setupPassword:    { de: "Jetzt ein Passwort",             en: "Now a password" },
-    passwordMissing:  { de: "Dieses Konto hat noch keines",
-                        en: "This account has none yet" },
     lockNow:          { de: "Zusperren",                    en: "Lock" },
     lockAfter:        { de: "Von selbst zusperren",          en: "Lock by itself" },
     lockNever:        { de: "nie",                          en: "never" },

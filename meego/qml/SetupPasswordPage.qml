@@ -10,10 +10,6 @@ Page {
     property string wunschname: ""
     property bool laeuft: false
     property string meldung: ""
-    // Nur das Passwort setzen: das Konto gibt es schon. Diesen Fall kennt Briar
-    // auf Android nicht -- dort entsteht kein Konto ohne Passwort. Hier kann es
-    // eines geben, angelegt mit einer Fassung vor dem Passwort.
-    property bool nurPasswort: false
     property real staerke: Briar.passwordStrength(eins.text)
 
     tools: ToolBarLayout { }
@@ -30,7 +26,12 @@ Page {
             return
         }
         seite.laeuft = true
-        var passwortSetzen = function() {
+        Briar.createIdentity(seite.wunschname, function(antwort) {
+            if (antwort.error) {
+                seite.laeuft = false
+                seite.meldung = antwort.error
+                return
+            }
             Briar.setPassword("", eins.text, function(zweite) {
                 seite.laeuft = false
                 if (zweite.error) {
@@ -38,23 +39,8 @@ Page {
                     return
                 }
                 fenster.aktualisieren()
-                if (seite.nurPasswort)
-                    pageStack.replace(Qt.resolvedUrl("ContactsPage.qml"))
-                else
-                    pageStack.pop()
+                pageStack.pop()
             })
-        }
-        if (seite.nurPasswort) {
-            passwortSetzen()
-            return
-        }
-        Briar.createIdentity(seite.wunschname, function(antwort) {
-            if (antwort.error) {
-                seite.laeuft = false
-                seite.meldung = antwort.error
-                return
-            }
-            passwortSetzen()
         })
     }
 
@@ -71,9 +57,7 @@ Page {
                 width: parent.width
                 font.pixelSize: 26
                 font.bold: true
-                text: seite.nurPasswort
-                      ? fenster.tr("setupPassword") + " -- " + fenster.tr("passwordMissing")
-                      : fenster.tr("setupPassword")
+                text: fenster.tr("setupPassword")
             }
 
             Label {
