@@ -35,6 +35,28 @@ Page {
                                        && pruefer.availableMethods !== 0)
                                       || app.schluesselbundDa
 
+    // Der Schluesselbund antwortet nebenher.
+    Connections {
+        target: Schluesselbund
+        onGefunden: {
+            Briar.unlock(passwort, function(answer) {
+                page.busy = false
+                if (answer.error) {
+                    page.message = app.tr("unlockWrong")
+                    return
+                }
+                app.locked = false
+                app.refresh()
+                pageStack.pop()
+            })
+        }
+        onFehlgeschlagen: {
+            page.busy = false
+            // Kein Vorwurf und kein Raetsel: es bleibt das Passwort.
+            page.message = app.tr("unlockFallback")
+        }
+    }
+
     Authenticator {
         id: pruefer
         onAuthenticated: {
@@ -124,24 +146,12 @@ Page {
                         return
                     }
                     // Aus dem Schluesselbund: das Herausgeben fragt selbst nach
-                    // Fingerabdruck oder Code.
+                    // Fingerabdruck oder Code. Die Antwort kommt als Signal --
+                    // wer die Bestaetigung liegen laesst, haelt damit die App
+                    // nicht an.
                     page.busy = true
-                    var passwort = Schluesselbund.holen()
-                    if (!passwort) {
-                        page.busy = false
-                        page.message = app.tr("unlockWrong")
-                        return
-                    }
-                    Briar.unlock(passwort, function(answer) {
-                        page.busy = false
-                        if (answer.error) {
-                            page.message = app.tr("unlockWrong")
-                            return
-                        }
-                        app.locked = false
-                        app.refresh()
-                        pageStack.pop()
-                    })
+                    page.message = app.tr("unlockWorking")
+                    Schluesselbund.holen()
                 }
             }
             Label {

@@ -164,6 +164,8 @@ var table = {
                         en: "Then a fingerprint is enough from now on, even after a restart. The password is kept encrypted in Sailfish's keyring and only comes out after a check." },
     keptInDevice:     { de: "Im Geräteschloss hinterlegt",
                         en: "Kept in the device lock" },
+    unlockFallback:   { de: "Das Telefon hat nicht bestätigt -- gib das Passwort ein.",
+                        en: "The phone did not confirm -- type the password." },
     torOffWhenAdding: { de: "Tor ist aus. Ohne Tor tauscht ihr keine .onion-Adresse aus, und ihr findet euch später nur wieder, wenn ihr im selben Netz oder in Bluetooth-Nähe seid.",
                         en: "Tor is off. Without it you exchange no .onion address, and later you will only find each other on the same network or within Bluetooth range." },
     setupPasswordWhy: { de: "Es verschlüsselt alles, was Briar auf diesem Gerät ablegt — Schlüssel, Kontakte, Nachrichten.",

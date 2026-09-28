@@ -37,6 +37,8 @@ Page {
             // Ins Geraeteschloss legen oder wieder herausnehmen -- was der
             // Schalter sagt. Bei aufgehobenem Passwort immer heraus.
             if (Schluesselbund.verfuegbar) {
+                // merken() laeuft nebenher und fragt womoeglich nach; das
+                // Ergebnis meldet es als Signal, hier warten wir nicht darauf.
                 if (answer.encrypted && imTelefon.checked)
                     Schluesselbund.merken(eins.text)
                 else
