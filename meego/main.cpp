@@ -145,6 +145,11 @@ static void dienstStarten()
         const QString laeuft = dienstFassung();
         if (laeuft == QLatin1String(BRIAR_VERSION))
             return;
+        // Keine Fassung lesbar: nicht beenden -- siehe die Sailfish-Seite.
+        if (laeuft.isEmpty()) {
+            qWarning("Dienst nennt keine Fassung -- bleibt stehen");
+            return;
+        }
         qWarning("Dienst ist Fassung '%s', die App ist %s -- neu starten",
                  qPrintable(laeuft.isEmpty() ? QLatin1String("aelter als 0.35.2")
                                              : laeuft),

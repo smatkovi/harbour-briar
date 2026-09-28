@@ -124,7 +124,19 @@ fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Stor
         (200, "{\"ok\":true}".to_string(), None)
     } else if verb == "GET" && weg.starts_with("/status") {
         // Genau so viel, dass die Oberflaeche weiss, was sie fragen muss.
-        (200, "{\"locked\":true,\"running\":true}".to_string(), None)
+        // MIT Fassung. Ohne sie las die App "leer", hielt den Dienst fuer
+        // veraltet und beendete ihn -- genau waehrend er auf das Passwort
+        // wartete. Im Protokoll stand "der Speicher ist verschluesselt"
+        // zweimal, 80 Sekunden auseinander, und die Oberflaeche blieb auf
+        // "wird geprueft".
+        (
+            200,
+            format!(
+                "{{\"locked\":true,\"running\":true,\"version\":\"{}\"}}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            None,
+        )
     } else {
         (
             503,

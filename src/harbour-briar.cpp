@@ -99,6 +99,13 @@ void startDaemon()
         const QString running = daemonVersion();
         if (running == QLatin1String(BRIAR_VERSION))
             return;
+        // Keine Fassung lesbar: NICHT beenden. Das war ein wartender Dienst
+        // vor dem Entsperren, oder ein sehr alter -- und den ersten mitten im
+        // Passwort zu toeten kostet mehr als den zweiten stehenzulassen.
+        if (running.isEmpty()) {
+            qWarning("Dienst nennt keine Fassung -- bleibt stehen");
+            return;
+        }
         qWarning("Dienst ist Fassung '%s', die App ist %s -- neu starten",
                  qPrintable(running.isEmpty()
                             ? QStringLiteral("aelter als 0.35.2") : running),
