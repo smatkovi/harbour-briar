@@ -70,6 +70,20 @@ Dialog {
             font.pixelSize: Theme.fontSizeExtraSmall
             text: app.tr("addHint")
         }
+
+        // Der Fall, der sich spaeter nicht mehr heilen laesst: ohne Tor wird
+        // keine .onion ausgetauscht, und getrennte Wege kennen weder WLAN noch
+        // Bluetooth. Die Meldung spaeter nachzureichen braucht einen Kanal,
+        // den es dann nicht mehr gibt.
+        Label {
+            visible: !app.status.tor
+            x: Theme.horizontalPageMargin
+            width: parent.width - 2 * Theme.horizontalPageMargin
+            wrapMode: Text.Wrap
+            color: Theme.errorColor
+            font.pixelSize: Theme.fontSizeExtraSmall
+            text: app.tr("torOffWhenAdding")
+        }
     }
 
     onAccepted: {

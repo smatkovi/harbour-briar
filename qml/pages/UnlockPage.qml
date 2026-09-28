@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import org.nemomobile.devicelock 1.0
 import "../Briar.js" as Briar
 
 // Steht vor allem anderen, solange der Dienst "locked" meldet. Ohne das
@@ -14,6 +15,37 @@ Page {
 
     property bool busy: false
     property string message: app.tr("lockedHint")
+
+    // Briar auf Android sperrt mit dem Bildschirmschloss des Telefons auf, nicht
+    // mit dem Briar-Passwort (KeyguardManager, Fingerabdruck ueber
+    // BiometricPrompt). Das geht hier auch: org.nemomobile.devicelock fragt
+    // Fingerabdruck oder Gerätecode ab.
+    //
+    // Der Dienst weiss davon nichts, also bekommt die App beim Zusperren eine
+    // einmalige Marke und gibt sie nach geglueckter Pruefung zurueck. Die Marke
+    // liegt nur im Arbeitsspeicher; nach einem Neustart des Dienstes ist der
+    // Speicher ohnehin versiegelt, und dann hilft nur das Passwort.
+    property bool mitTelefonMoeglich: app.sperrMarke.length > 0
+                                      && pruefer.availableMethods !== 0
+
+    Authenticator {
+        id: pruefer
+        onAuthenticated: {
+            page.busy = true
+            Briar.unlock2(app.sperrMarke, function(answer) {
+                page.busy = false
+                if (answer.error) {
+                    page.message = app.tr("unlockWrong")
+                    return
+                }
+                app.sperrMarke = ""
+                app.locked = false
+                app.refresh()
+                pageStack.pop()
+            })
+        }
+        onAborted: page.message = app.tr("lockedHint")
+    }
 
     function versuchen() {
         if (page.busy || feld.text.length === 0)
@@ -66,6 +98,30 @@ Page {
             text: app.tr("unlockAction")
             enabled: !page.busy && feld.text.length > 0
             onClicked: page.versuchen()
+        }
+
+        // Mit dem Telefon statt mit dem Passwort -- nur wenn diese App gerade
+        // selbst zugesperrt hat und das Telefon ein Schloss kennt.
+        Column {
+            visible: page.mitTelefonMoeglich
+            width: parent.width
+            spacing: Theme.paddingSmall
+
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: app.tr("unlockWithDevice")
+                enabled: !page.busy
+                onClicked: pruefer.authenticate("briar-unlock")
+            }
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+                text: app.tr("unlockDeviceHint")
+            }
         }
 
         // Der einzige Weg heraus, wenn das Passwort weg ist. Es gibt keinen

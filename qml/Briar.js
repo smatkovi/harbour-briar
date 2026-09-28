@@ -92,6 +92,11 @@ function unlock(password, callback) {
     request("POST", "/unlock", { password: password }, callback)
 }
 
+/** Aufsperren mit der Marke vom Zusperren -- nach Fingerabdruck oder Code. */
+function unlock2(token, callback) {
+    request("POST", "/unlock", { token: token }, callback)
+}
+
 /** Zusperren wie Briars Bildschirmsperre: der Abgleich laeuft weiter. */
 function lock(callback) {
     request("POST", "/lock", {}, callback)
@@ -114,6 +119,11 @@ function deleteMessage(contact, id, callback) {
 
 function deleteAllMessages(contact, callback) {
     request("POST", "/message/delete", { contact: contact, all: true }, callback)
+}
+
+/** Mehrere auf einmal -- Briars Auswahlmodus. */
+function deleteMessages(contact, ids, callback) {
+    request("POST", "/message/delete", { contact: contact, ids: ids }, callback)
 }
 
 // Briars Staerkemass, eins zu eins: die Zahl der VERSCHIEDENEN Zeichen

@@ -104,6 +104,31 @@ Page {
     // Eine Bedenkzeit fuer beides -- Loeschen ist hier endgueltig.
     RemorsePopup { id: entfernen }
 
+    // Briars Auswahlmodus: mehrere antippen, dann zusammen loeschen. Die
+    // Auswahl haengt an den Kennungen, nicht an den Reihen -- die Liste laedt
+    // alle drei Sekunden neu.
+    property bool auswahl: false
+    property var gewaehlt: ({})
+    property int gewaehltAnzahl: 0
+
+    function auswahlUmschalten(id) {
+        var neu = page.gewaehlt
+        if (neu[id]) {
+            delete neu[id]
+            page.gewaehltAnzahl--
+        } else {
+            neu[id] = true
+            page.gewaehltAnzahl++
+        }
+        page.gewaehlt = neu
+    }
+
+    function auswahlBeenden() {
+        page.auswahl = false
+        page.gewaehlt = ({})
+        page.gewaehltAnzahl = 0
+    }
+
     SilicaListView {
         id: view
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: input.top }
@@ -113,6 +138,28 @@ Page {
         onCountChanged: positionViewAtEnd()
 
         PullDownMenu {
+            MenuItem {
+                visible: page.auswahl && page.gewaehltAnzahl > 0
+                text: app.tr("deleteSelected") + " (" + page.gewaehltAnzahl + ")"
+                onClicked: {
+                    var ids = Object.keys(page.gewaehlt)
+                    entfernen.execute(app.tr("deleteSelected"), function() {
+                        Briar.deleteMessages(page.contactId, ids, function() {
+                            page.auswahlBeenden()
+                            page.reload()
+                        })
+                    })
+                }
+            }
+            MenuItem {
+                text: page.auswahl ? app.tr("selectionDone") : app.tr("selectMessages")
+                onClicked: {
+                    if (page.auswahl)
+                        page.auswahlBeenden()
+                    else
+                        page.auswahl = true
+                }
+            }
             MenuItem {
                 text: app.tr("deleteAllMessages")
                 onClicked: entfernen.execute(app.tr("deleteAllMessages"), function() {
@@ -131,9 +178,11 @@ Page {
                                 view.width * 0.8)
                 height: content.height + 2 * Theme.paddingMedium
                 radius: Theme.paddingSmall
-                color: modelData.outgoing
-                       ? Theme.rgba(Theme.highlightBackgroundColor, 0.3)
-                       : Theme.rgba(Theme.secondaryHighlightColor, 0.2)
+                color: page.auswahl && page.gewaehlt[modelData.id]
+                       ? Theme.rgba(Theme.highlightColor, 0.4)
+                       : modelData.outgoing
+                         ? Theme.rgba(Theme.highlightBackgroundColor, 0.3)
+                         : Theme.rgba(Theme.secondaryHighlightColor, 0.2)
                 anchors {
                     right: modelData.outgoing ? parent.right : undefined
                     left: modelData.outgoing ? undefined : parent.left
@@ -160,6 +209,10 @@ Page {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: {
+                            if (page.auswahl) {
+                                page.auswahlUmschalten(modelData.id)
+                                return
+                            }
                             if (modelData.attachmentPath)
                                 pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
                                     "pfad": modelData.attachmentPath,

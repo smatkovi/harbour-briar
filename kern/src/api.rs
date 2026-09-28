@@ -117,6 +117,21 @@ fn spawn_poll(store: &Shared) {
 /// Absichtlich nicht gespeichert: nach einem Neustart des Dienstes ist der
 /// Speicher ohnehin versiegelt, und dann fragt entsperren.rs.
 static GESPERRT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Die Marke, mit der die Oberflaeche wieder aufsperren darf, ohne das
+/// Passwort zu kennen.
+///
+/// Gedacht fuer den Fingerabdruck: an der Jolla sperrt Briar auf Android mit
+/// dem Bildschirmschloss des Telefons auf, nicht mit dem Briar-Passwort. Das
+/// geht hier auch (org.nemomobile.devicelock), nur weiss der Dienst nichts
+/// davon, ob jemand seinen Finger aufgelegt hat -- also bekommt die App beim
+/// Zusperren eine einmalige Marke, die sie nach geglueckter Pruefung
+/// zurueckgibt.
+///
+/// Sie liegt nur im Arbeitsspeicher, gilt nur fuer dieses eine Zusperren und
+/// ist nach dem Aufsperren verbraucht. Mit ihr laesst sich die Datei nicht
+/// entschluesseln: sie oeffnet nur die Oberflaeche, die der Dienst ohnehin
+/// schon offen haelt.
+static MARKE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Wann zuletzt etwas ueber die Schnittstelle kam -- fuer die Sperre nach Zeit.
 static LETZTE_REGUNG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -127,6 +142,13 @@ pub fn ist_gesperrt() -> bool {
 pub fn sperren() {
     GESPERRT.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::net::log("die Oberflaeche ist zugesperrt");
+}
+
+/// Beim Zusperren von selbst gibt es keine Marke: niemand steht davor, der sie
+/// entgegennehmen koennte. Dann hilft nur das Passwort -- so wie bei Briar,
+/// wo nach der Frist ebenfalls das Bildschirmschloss verlangt wird.
+fn marke_verwerfen() {
+    *MARKE.lock().unwrap() = None;
 }
 
 fn regung_vermerken() {
@@ -151,6 +173,7 @@ pub fn sperrwaechter(store: Shared) {
         }
         let zuletzt = LETZTE_REGUNG.load(std::sync::atomic::Ordering::Relaxed);
         if zuletzt > 0 && now_ms().saturating_sub(zuletzt) > frist * 60_000 {
+            marke_verwerfen();
             sperren();
         }
     });
@@ -199,15 +222,29 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 return json!({"error": "set a password first"});
             }
             sperren();
-            json!({"ok": true, "locked": true})
+            let marke = to_hex(&crate::util::random(16));
+            *MARKE.lock().unwrap() = Some(marke.clone());
+            json!({"ok": true, "locked": true, "token": marke})
         }
 
         // Aufsperren, wenn nur die Oberflaeche zu ist. Ist der Speicher selbst
         // versiegelt, laeuft dieser Dienst gar nicht -- dann antwortet
         // entsperren.rs auf denselben Weg.
         ("POST", "/unlock") => {
-            let passwort = body["password"].as_str().unwrap_or("");
-            let stimmt = {
+            // Zwei Wege herein: das Passwort, oder die Marke vom Zusperren --
+            // die gibt die Oberflaeche erst zurueck, wenn das Telefon selbst
+            // den Benutzer erkannt hat (Fingerabdruck oder Gerätecode).
+            let marke = body["token"].as_str().unwrap_or("");
+            let stimmt = if !marke.is_empty() {
+                let mut gemerkt = MARKE.lock().unwrap();
+                let passt = gemerkt.as_deref() == Some(marke) && !marke.is_empty();
+                if passt {
+                    // Einmalig: verbraucht ist verbraucht.
+                    *gemerkt = None;
+                }
+                passt
+            } else {
+                let passwort = body["password"].as_str().unwrap_or("");
                 let locked = store.lock().unwrap();
                 locked.passwort_stimmt(passwort)
             };
@@ -237,12 +274,22 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             let contact_id = body["contact"].as_u64().unwrap_or(0) as u32;
             let alle = body["all"].as_bool().unwrap_or(false);
             let kennung = body["id"].as_str().unwrap_or("").to_string();
+            // Mehrere auf einmal, wie Briars Auswahlmodus: eine Liste von
+            // Kennungen. Einzeln geht weiter ueber "id".
+            let liste: std::collections::BTreeSet<String> = body["ids"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut locked = store.lock().unwrap();
             let betroffen: Vec<(String, Option<String>)> = match locked.contact(contact_id) {
                 Some(c) => c
                     .messages
                     .iter()
-                    .filter(|m| alle || m.id == kennung)
+                    .filter(|m| alle || m.id == kennung || liste.contains(&m.id))
                     .map(|m| (m.id.clone(), m.attachment.clone()))
                     .collect(),
                 None => return json!({"error": "no such contact"}),

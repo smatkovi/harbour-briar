@@ -71,13 +71,33 @@ Page {
                 placeholderText: fenster.tr("onionAddress")
                 inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
             }
-
             Label {
                 width: parent.width
                 wrapMode: Text.Wrap
                 color: "#a0a0a0"
                 font.pixelSize: 20
                 text: fenster.tr("addHint")
+            }
+
+
+            // Ohne Tor wird keine .onion ausgetauscht -- und getrennte Wege kennen
+
+            // weder WLAN noch Bluetooth.
+
+            Label {
+
+                visible: !fenster.zustand.tor
+
+                width: parent.width
+
+                wrapMode: Text.Wrap
+
+                color: "#ff6666"
+
+                font.pixelSize: 18
+
+                text: fenster.tr("torOffWhenAdding")
+
             }
 
             Button {

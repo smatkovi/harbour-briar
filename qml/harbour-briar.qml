@@ -16,6 +16,9 @@ ApplicationWindow {
     // Bumped when the language changes, so every binding that calls
     // Strings.t() is re-evaluated.
     property int languageRevision: 0
+    /// Die Marke vom Zusperren -- damit sperrt der Fingerabdruck wieder auf,
+    /// ohne dass das Passwort irgendwo liegt. Nur im Arbeitsspeicher.
+    property string sperrMarke: ""
 
     // Every label goes through this, so one comma expression ties all of
     // them to languageRevision -- otherwise the texts would only change on

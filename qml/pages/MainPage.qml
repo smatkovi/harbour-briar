@@ -115,10 +115,14 @@ Page {
                 // weiter und nimmt Nachrichten an, die App zeigt nichts mehr.
                 text: app.tr("lockNow")
                 onClicked: Briar.lock(function(answer) {
-                    if (answer.error)
+                    if (answer.error) {
                         app.lastError = app.tr("lockNeedsPassword")
-                    else
-                        app.refresh()
+                        return
+                    }
+                    // Die Marke merken: mit ihr sperrt der Fingerabdruck
+                    // wieder auf, ohne dass das Passwort irgendwo liegt.
+                    app.sperrMarke = answer.token || ""
+                    app.refresh()
                 })
             }
             MenuItem {
