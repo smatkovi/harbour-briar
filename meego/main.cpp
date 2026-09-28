@@ -116,7 +116,8 @@ static void dienstBeenden()
             continue;
         const QByteArray zeile = f.readAll();
         f.close();
-        if (zeile.contains("briard"))
+        // Nur das erste Wort der Befehlszeile, siehe die Sailfish-Seite.
+        if (zeile.split('\0').value(0) == "/opt/briar/bin/briard")
             ::kill(pid, SIGTERM);
     }
 }

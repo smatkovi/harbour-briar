@@ -82,7 +82,9 @@ static void stopDaemon()
             continue;
         const QByteArray line = f.readAll();
         f.close();
-        if (line.contains("harbour-briar-briard"))
+        // Nur das erste Wort der Befehlszeile: ein `contains` traf auch eine
+        // Shell, in deren Zeile der Pfad bloss vorkam.
+        if (line.split('\0').value(0) == "/usr/bin/harbour-briar-briard")
             ::kill(pid, SIGTERM);
     }
 }

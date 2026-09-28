@@ -2,7 +2,11 @@ TARGET = harbour-briar
 CONFIG += sailfishapp c++11 link_pkgconfig
 # Die Fassung aus dem RPM-Rezept -- eine Quelle fuer alle Pakete. Die App
 # vergleicht sie mit der, die der laufende Dienst meldet.
-BRIARVER = $$system(sed -n 's/^Version: *//p' $$PWD/rpm/harbour-briar.spec)
+# Die Fassung reicht das RPM-Rezept herein (%qmake5 BRIARVER=%{version}).
+# Sie hier selbst aus der spec zu lesen ging nicht: im SDK-Behaelter laeuft
+# $$system(sed ...) ins Leere und BRIAR_VERSION blieb leer -- nachgemessen,
+# in der Binaerdatei stand gar keine Fassung.
+isEmpty(BRIARVER): BRIARVER = unbekannt
 DEFINES += BRIAR_VERSION=\\\"$$BRIARVER\\\"
 
 QT += core gui qml quick network

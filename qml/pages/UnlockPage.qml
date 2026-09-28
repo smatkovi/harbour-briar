@@ -19,6 +19,9 @@ Page {
     /// hinueber (Geraeteschloss entfernt oder neu eingerichtet), und das
     /// getippte Passwort fuellt sie wieder.
     property bool schluesselbundVersagt: false
+    /// Was die Nachfrage zuletzt gesehen hat -- steht klein unter der
+    /// Meldung, damit ein Haenger sich selbst erklaert.
+    property string hinweis: ""
 
     // Briar auf Android sperrt mit dem Bildschirmschloss des Telefons auf, nicht
     // mit dem Briar-Passwort (KeyguardManager, Fingerabdruck ueber
@@ -105,8 +108,12 @@ Page {
                     page.message = app.tr("unlockWorking")
                     Schluesselbund.holen()
                 } else {
+                    // Schloss bestanden, aber nichts hinterlegt: sagen, statt
+                    // stumm stehenzubleiben.
                     nachfrage.stop()
                     page.busy = false
+                    page.message = app.tr("unlockFallback")
+                    feld.forceActiveFocus()
                 }
                 return
             }
@@ -140,7 +147,17 @@ Page {
                 return
             }
             Briar.status(function(antwort) {
-                if (!page.busy || antwort.error || antwort.locked)
+                if (!page.busy)
+                    return
+                // Sagen, woran es liegt, statt stumm "wird geprueft" stehen
+                // zu lassen: ein Mensch kann damit etwas anfangen, und ich
+                // muss nicht raten.
+                page.hinweis = antwort.error
+                               ? "Dienst: " + antwort.error
+                               : (antwort.locked
+                                  ? "Dienst wartet noch auf das Passwort"
+                                  : "")
+                if (antwort.error || antwort.locked)
                     return
                 nachfrage.stop()
                 page.busy = false
@@ -234,16 +251,21 @@ Page {
                 text: app.tr("unlockWithDevice")
                 enabled: !page.busy
                 onClicked: {
-                    if (app.sperrMarke.length > 0 && pruefer.availableMethods !== 0) {
+                    // IMMER zuerst das Geraeteschloss -- Fingerabdruck oder
+                    // Sperrcode. Frueher sprang der Knopf ohne Marke am
+                    // Schloss vorbei direkt zum Schluesselbund; dann fragte
+                    // niemand nach dem Finger, und der Schluesselbund
+                    // schwieg. Was danach geschieht, entscheidet
+                    // onAuthenticated: Marke, sonst Schluesselbund.
+                    if (pruefer.availableMethods !== 0) {
                         pruefer.authenticate("briar-unlock")
                         return
                     }
-                    // Aus dem Schluesselbund: das Herausgeben fragt selbst nach
-                    // Fingerabdruck oder Code. Die Antwort kommt als Signal --
-                    // wer die Bestaetigung liegen laesst, haelt damit die App
-                    // nicht an.
+                    // Kein Geraeteschloss eingerichtet: dann bleibt nur der
+                    // Schluesselbund selbst, mit seiner eigenen Rueckfrage.
                     page.busy = true
                     page.message = app.tr("unlockWorking")
+                    nachfrage.restart()
                     Schluesselbund.holen()
                 }
             }
@@ -255,6 +277,16 @@ Page {
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
                 text: app.tr("unlockDeviceHint")
+            }
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                visible: page.hinweis.length > 0
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                color: Theme.highlightColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+                text: page.hinweis
             }
         }
 

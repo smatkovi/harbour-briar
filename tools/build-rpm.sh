@@ -14,6 +14,20 @@ CONTAINER=${SDK_CONTAINER:-sfossdk52}
 TARGET=${SDK_TARGET:-SailfishOS-5.2.0.15}
 VERSION=$(sed -n 's/^Version: *//p' "$ROOT/rpm/harbour-briar.spec")
 
+# Der Dienst muss dieselbe Fassung tragen wie das Paket. Die App vergleicht
+# beide und ersetzt den Dienst, wenn sie auseinandergehen -- ein Paket mit
+# einem aelteren Dienst darin loest damit bei JEDEM Start einen Neustart aus,
+# womoeglich mitten im Entsperren. Genau das ist passiert, weil hier lange
+# nur die Oberflaeche neu gebaut wurde.
+for a in aarch64 armv7 i486; do
+    [ -f "$ROOT/build/briard-$a" ] || continue
+    if ! strings "$ROOT/build/briard-$a" | grep -q "$VERSION"; then
+        echo "ABBRUCH: build/briard-$a traegt nicht die Fassung $VERSION." >&2
+        echo "         Erst tools/remote-build.sh laufen lassen." >&2
+        exit 1
+    fi
+done
+
 echo "harbour-briar $VERSION for: $ARCHES (build machine $HOST)"
 mkdir -p "$HOME/ps/rpms/briar"
 ssh "$HOST" "mkdir -p ~/briar-build/out"

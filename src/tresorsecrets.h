@@ -37,6 +37,7 @@
 #include <QTimer>
 
 #include <Sailfish/Secrets/createcollectionrequest.h>
+#include <Sailfish/Secrets/deletecollectionrequest.h>
 #include <Sailfish/Secrets/deletesecretrequest.h>
 #include <Sailfish/Secrets/request.h>
 #include <Sailfish/Secrets/secret.h>
@@ -101,8 +102,17 @@ public:
         anlegen->setCollectionName(ABLAGE);
         anlegen->setCollectionLockType(
                 Sailfish::Secrets::CreateCollectionRequest::DeviceLock);
+        // KeepUnlocked, nicht VerifyLock. VerifyLock heisst woertlich: bei
+        // JEDEM Zugriff das Geraeteschloss neu abfragen -- daher der Dialog
+        // "Erlauben?", der nach dem Fingerabdruck ein zweites Mal dasselbe
+        // fragte. KeepUnlocked heisst: zugaenglich, solange das Telefon
+        // selbst entsperrt ist; ist es gesperrt, kommt niemand daran.
+        //
+        // Der Schutz bleibt damit das Geraeteschloss, nur eben einmal statt
+        // zweimal -- und die App fragt davor ohnehin selbst ueber den
+        // Authenticator nach Fingerabdruck oder Sperrcode.
         anlegen->setDeviceLockUnlockSemantic(
-                Sailfish::Secrets::SecretManager::DeviceLockVerifyLock);
+                Sailfish::Secrets::SecretManager::DeviceLockKeepUnlocked);
         anlegen->setAccessControlMode(
                 Sailfish::Secrets::SecretManager::OwnerOnlyMode);
         anlegen->setStoragePluginName(
@@ -196,6 +206,26 @@ private slots:
         if (!gut && !schonDa) {
             fertig();
             emit gemerkt(false);
+            return;
+        }
+        // Eine Ablage, die es schon gibt, wurde womoeglich noch mit
+        // VerifyLock angelegt -- die Regel aendert sich nicht dadurch, dass
+        // wir sie jetzt anders anfordern. Also einmal wegnehmen und neu
+        // anlegen. Es liegt nichts darin als dieses eine Passwort, und das
+        // legen wir gleich danach wieder hinein.
+        if (schonDa && !m_neuAngelegt) {
+            m_neuAngelegt = true;
+            Sailfish::Secrets::DeleteCollectionRequest weg;
+            weg.setManager(&verwalter);
+            weg.setCollectionName(ABLAGE);
+            weg.setStoragePluginName(
+                    Sailfish::Secrets::SecretManager::DefaultStoragePluginName);
+            weg.setUserInteractionMode(
+                    Sailfish::Secrets::SecretManager::PreventInteraction);
+            weg.startRequest();
+            weg.waitForFinished();
+            setzeLaeuft(false);
+            merken(m_passwort);
             return;
         }
 
@@ -318,6 +348,7 @@ private:
     QTimer m_frist;
     QString m_passwort;
     bool m_zweiterVersuch = false;
+    bool m_neuAngelegt = false;
     bool m_laeuft;
     // Eine eigene Ablage, damit nichts mit anderen Anwendungen kollidiert.
     const QString ABLAGE = QStringLiteral("harbour-briar");

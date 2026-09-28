@@ -60,11 +60,10 @@ cat > "$STAGE/DEBIAN/postinst" <<'SH'
 getroffen=0
 for d in /proc/[0-9]*; do
     [ -r "$d/cmdline" ] || continue
-    case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in
-        */briard*)
-            kill "${d#/proc/}" 2>/dev/null && getroffen=$((getroffen+1))
-            ;;
-    esac
+    erstes=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1)
+    if [ "$erstes" = "/opt/briar/bin/briard" ]; then
+        kill "${d#/proc/}" 2>/dev/null && getroffen=$((getroffen+1))
+    fi
 done
 # Eine Spur, damit sich nachsehen laesst, ob das Skript ueberhaupt lief.
 echo "$(date) postinst: $getroffen Dienst(e) beendet" >> /home/user/briar-postinst.log 2>/dev/null

@@ -1,6 +1,6 @@
 Name:       harbour-briar
 Summary:    Briar for Sailfish OS
-Version:    0.35.9
+Version:    0.36.4
 Release:    1
 License:    GPLv3
 URL:        https://github.com/smatkovi/harbour-briar
@@ -30,7 +30,9 @@ briar:// link and address.
 %setup -q -n %{name}-%{version}
 
 %build
-%qmake5
+# Die Fassung ins Programm reichen: die App vergleicht sie mit der, die der
+# laufende Dienst meldet, und ersetzt ihn, wenn sie auseinandergehen.
+%qmake5 "BRIARVER=%{version}"
 %make_build
 
 %install
@@ -48,11 +50,13 @@ briar:// link and address.
 # findet nie etwas. Nachgemessen: /proc/<pid>/comm sagt "harbour-briar-b".
 # Genau daran lief auf der Jolla stundenlang ein veralteter Dienst weiter,
 # waehrend jede Reparatur danebenlag.
+# Nur das ERSTE Wort der Befehlszeile zaehlt. Ein Muster ueber die ganze
+# Zeile traf auch die Shell, die gerade `strings .../harbour-briar-briard`
+# aufrief -- und beendete sie mit.
 for d in /proc/[0-9]*; do
     [ -r "$d/cmdline" ] || continue
-    case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in
-        *harbour-briar-briard*) kill "${d#/proc/}" 2>/dev/null || : ;;
-    esac
+    erstes=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1)
+    [ "$erstes" = "/usr/bin/harbour-briar-briard" ] && kill "${d#/proc/}" 2>/dev/null || :
 done
 exit 0
 
