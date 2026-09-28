@@ -127,9 +127,16 @@ What this port does **differently**, and why:
   bramble-core): the code carries a commitment to an ephemeral key plus the
   transport descriptors, both sides read the other's code, and the key
   agreement that follows proves the key matches the commitment. A code from
-  Briar on Android is read here and ours there. Over LAN only, so far — the
-  Bluetooth road would need a service under a UUID derived from the commitment
-  (`UUID.nameUUIDFromBytes`), and that is not written. The older code carries
+  Briar on Android is read here and ours there. Both roads are built: over
+  Wi-Fi, and since 0.32.0 over Bluetooth as well. Briar tries Bluetooth first
+  and looks for a service under a UUID derived from the commitment
+  (`UUID.nameUUIDFromBytes`, checked against values computed independently),
+  so the device listens under exactly that UUID before its address goes into
+  the code — an address with no service behind it would be worse than none,
+  because the other side waits on it every time. BlueZ 5 owns the listening
+  socket and hands the connection over as a profile; BlueZ 4 has no such
+  thing, so the N9 and N950 listen on a channel of their own and only publish
+  the record. The older code carries
   the `briar://` link with the addresses behind it (`?lan=…&bt=…&tor=…`) and
   stays, because it also works at a distance. The encoder is our own
   (`src/qrencode.h`, checked against zbar), the decoder is quirc

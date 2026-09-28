@@ -105,7 +105,7 @@ pub fn serve(store: Arc<Mutex<Store>>, uuid: String) {
                 // BlueZ 5 kennt ProfileManager1, BlueZ 4 nicht. Auf Harmattan
                 // ist das also kein Fehler, sondern der andere Weg.
                 crate::net::log(&format!("no profile manager ({}) -- trying BlueZ 4", e));
-                bluez4_eintrag(&verbindung, &uuid);
+                bluez4_eintrag_mit(&verbindung, &uuid, crate::bt::CHANNEL);
             }
         }
         loop {
@@ -120,9 +120,17 @@ pub fn serve(store: Arc<Mutex<Store>>, uuid: String) {
 /// sucht den RFCOMM-Kanal eines Kontakts ueber dessen gemeldete UUID und findet
 /// ohne Eintrag gar nichts -- auch wenn ein Sockel lauscht.
 ///
-/// Der Kanal steht fest im Eintrag (11, derselbe wie beim rohen Lauscher);
-/// BlueZ 4 sucht sich hier keinen aus, es legt nur ab, was man ihm gibt.
-fn bluez4_eintrag(verbindung: &zbus::blocking::Connection, uuid: &str) {
+/// Der Kanal kommt von aussen; BlueZ 4 sucht sich hier keinen aus, es legt
+/// nur ab, was man ihm gibt. Fuer den Abgleich ist das der feste Kanal 11,
+/// fuer ein Treffen der, auf dem der BQP-Lauscher gerade sitzt.
+///
+/// Gibt den Griff zurueck, mit dem sich der Eintrag wieder entfernen laesst --
+/// ein Treffen ist voruebergehend, sein Eintrag darf nicht stehenbleiben.
+pub fn bluez4_eintrag_mit(
+    verbindung: &zbus::blocking::Connection,
+    uuid: &str,
+    kanal: u8,
+) -> Option<u32> {
     // Erst den Adapter finden -- sein Pfad traegt bei BlueZ 4 die
     // Prozessnummer des Dienstes, ist also nicht zu raten.
     let adapter: zbus::zvariant::OwnedObjectPath = match verbindung.call_method(
@@ -136,12 +144,12 @@ fn bluez4_eintrag(verbindung: &zbus::blocking::Connection, uuid: &str) {
             Ok(p) => p,
             Err(e) => {
                 crate::net::log(&format!("no SDP record: adapter path unreadable ({})", e));
-                return;
+                return None;
             }
         },
         Err(e) => {
             crate::net::log(&format!("no SDP record: no adapter ({})", e));
-            return;
+            return None;
         }
     };
 
@@ -151,7 +159,6 @@ fn bluez4_eintrag(verbindung: &zbus::blocking::Connection, uuid: &str) {
     //   0x0005 Sichtbarkeit  -- PublicBrowseGroup, sonst findet ihn kein
     //                           Durchsuchen
     //   0x0100 Name
-    let kanal = crate::bt::CHANNEL;
     let eintrag = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\
 <record>\
@@ -180,7 +187,141 @@ fn bluez4_eintrag(verbindung: &zbus::blocking::Connection, uuid: &str) {
                 "SDP record published for {} on channel {} (BlueZ 4, handle {})",
                 uuid, kanal, griff
             ));
+            Some(griff)
         }
-        Err(e) => crate::net::log(&format!("no SDP record: AddRecord failed ({})", e)),
+        Err(e) => {
+            crate::net::log(&format!("no SDP record: AddRecord failed ({})", e));
+            None
+        }
     }
+}
+
+/// Einen BlueZ-4-Eintrag wieder entfernen. Ein Treffen ist voruebergehend;
+/// bliebe sein Eintrag stehen, faende eine Gegenseite spaeter eine Kennung,
+/// hinter der niemand mehr lauscht -- genau der Fehler, den wir bei den
+/// Beschreibern vermeiden.
+pub fn bluez4_eintrag_weg(griff: u32) {
+    let Ok(verbindung) = zbus::blocking::Connection::system() else {
+        return;
+    };
+    let adapter: zbus::zvariant::OwnedObjectPath = match verbindung.call_method(
+        Some("org.bluez"),
+        "/",
+        Some("org.bluez.Manager"),
+        "DefaultAdapter",
+        &(),
+    ) {
+        Ok(a) => match a.body().deserialize() {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    let _ = verbindung.call_method(
+        Some("org.bluez"),
+        adapter.as_str(),
+        Some("org.bluez.Service"),
+        "RemoveRecord",
+        &(griff,),
+    );
+}
+
+/// Ein Profil, das jede eingehende Verbindung an einen Rueckruf gibt.
+///
+/// Fuer das Treffen nebeneinander: dort wechselt die Kennung mit jedem Lauf
+/// (sie wird aus der Verpflichtung gerechnet), und die Verbindung gehoert
+/// nicht dem Abgleich, sondern der Schluesseleinigung.
+struct RufProfil {
+    ruf: Box<dyn Fn(std::os::unix::net::UnixStream) + Send + Sync>,
+}
+
+#[zbus::interface(name = "org.bluez.Profile1")]
+impl RufProfil {
+    fn new_connection(
+        &self,
+        _device: zbus::zvariant::ObjectPath<'_>,
+        fd: zbus::zvariant::OwnedFd,
+        _eigenschaften: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let roh = unsafe { libc::dup(fd.as_raw_fd()) };
+        if roh < 0 {
+            crate::net::log("BQP: Bluetooth-Griff liess sich nicht uebernehmen");
+            return;
+        }
+        (self.ruf)(unsafe { std::os::unix::net::UnixStream::from_raw_fd(roh) });
+    }
+
+    fn request_disconnection(&self, _device: zbus::zvariant::ObjectPath<'_>) {}
+
+    fn release(&self) {}
+}
+
+/// Unter einer Kennung lauschen und jede Verbindung an den Rueckruf geben --
+/// der Weg von BlueZ 5, wo das Lauschen BlueZ selbst gehoert.
+///
+/// Gibt die Verbindung zurueck, solange sie lebt: laesst man sie fallen, ist
+/// das Profil abgemeldet. Genau das wollen wir am Ende eines Treffens.
+pub fn bluez5_lauschen<F>(
+    pfad: &'static str,
+    uuid: &str,
+    ruf: F,
+) -> Option<zbus::blocking::Connection>
+where
+    F: Fn(std::os::unix::net::UnixStream) + Send + Sync + 'static,
+{
+    let gebaut = zbus::blocking::connection::Builder::system()
+        .and_then(|b| b.serve_at(pfad, RufProfil { ruf: Box::new(ruf) }))
+        .and_then(|b| b.build());
+    let verbindung = match gebaut {
+        Ok(v) => v,
+        Err(e) => {
+            crate::net::log(&format!("BQP: kein Bluetooth-Profil ({})", e));
+            return None;
+        }
+    };
+    let mut optionen: std::collections::HashMap<&str, zbus::zvariant::Value> =
+        std::collections::HashMap::new();
+    optionen.insert("Name", zbus::zvariant::Value::from("Briar Treffen"));
+    optionen.insert("Role", zbus::zvariant::Value::from("server"));
+    optionen.insert("RequireAuthentication", zbus::zvariant::Value::from(false));
+    optionen.insert("RequireAuthorization", zbus::zvariant::Value::from(false));
+    optionen.insert("AutoConnect", zbus::zvariant::Value::from(false));
+    let ergebnis: Result<(), zbus::Error> = verbindung
+        .call_method(
+            Some("org.bluez"),
+            "/org/bluez",
+            Some("org.bluez.ProfileManager1"),
+            "RegisterProfile",
+            &(
+                zbus::zvariant::ObjectPath::try_from(pfad).unwrap(),
+                uuid,
+                optionen,
+            ),
+        )
+        .map(|_| ());
+    match ergebnis {
+        Ok(()) => {
+            crate::net::log(&format!("BQP: lauscht ueber Bluetooth unter {}", uuid));
+            Some(verbindung)
+        }
+        Err(e) => {
+            crate::net::log(&format!("BQP: RegisterProfile scheiterte ({})", e));
+            None
+        }
+    }
+}
+
+/// Das Profil wieder abmelden. Ohne das bleibt die Kennung angemeldet, und
+/// eine Gegenseite fände einen Dienst, hinter dem niemand mehr steht.
+pub fn bluez5_abmelden(verbindung: &zbus::blocking::Connection, pfad: &str) {
+    let _: Result<(), zbus::Error> = verbindung
+        .call_method(
+            Some("org.bluez"),
+            "/org/bluez",
+            Some("org.bluez.ProfileManager1"),
+            "UnregisterProfile",
+            &(zbus::zvariant::ObjectPath::try_from(pfad).unwrap(),),
+        )
+        .map(|_| ());
 }

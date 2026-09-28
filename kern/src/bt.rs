@@ -230,6 +230,25 @@ impl Listener {
         Ok(Listener { fd })
     }
 
+    /// Der Lauscher soll nicht ewig in accept() stehen: ein Treffen hoert
+    /// auf, wenn es geglueckt ist oder der Benutzer den Bildschirm zumacht,
+    /// und der Faden muss das merken koennen.
+    pub fn set_nonblocking(&self, an: bool) -> io::Result<()> {
+        let flaggen = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
+        if flaggen < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let neu = if an {
+            flaggen | libc::O_NONBLOCK
+        } else {
+            flaggen & !libc::O_NONBLOCK
+        };
+        if unsafe { libc::fcntl(self.fd, libc::F_SETFL, neu) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Waits for a connection and returns it with the peer's address.
     pub fn accept(&self) -> io::Result<(UnixStream, String)> {
         let mut address = SockaddrRc {

@@ -100,6 +100,22 @@ impl Conn {
         }
     }
 
+    /// Die Zeitgrenzen fuer ein Treffen. Grosszuegiger als beim Abgleich:
+    /// die Gegenseite haelt die Verbindung womoeglich, bis jemand den Code
+    /// scannt.
+    fn set_bqp_timeouts(&self) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => {
+                s.set_read_timeout(Some(BQP_IO_TIMEOUT))?;
+                s.set_write_timeout(Some(BQP_IO_TIMEOUT))
+            }
+            Conn::Bluetooth(s) => {
+                s.set_read_timeout(Some(BQP_IO_TIMEOUT))?;
+                s.set_write_timeout(Some(BQP_IO_TIMEOUT))
+            }
+        }
+    }
+
     fn set_timeouts(&self) -> std::io::Result<()> {
         match self {
             Conn::Tcp(s) => {
@@ -4651,6 +4667,35 @@ pub struct BqpLauf {
     /// keiner. Damit kann der anwaehlende Faden melden, dass es geklappt hat,
     /// auch wenn der Lauscher schneller war.
     pub kontakt: Arc<std::sync::atomic::AtomicU32>,
+    /// Was am Ende eines Treffens wieder wegzuraeumen ist: die Kennung, unter
+    /// der wir ueber Bluetooth lauschen, bleibt sonst angemeldet, und eine
+    /// Gegenseite faende einen Dienst, hinter dem niemand mehr steht.
+    pub bt_aufraeumen: Arc<Mutex<Option<BqpBt>>>,
+}
+
+/// Der Bluetooth-Lauscher eines Treffens, in der Form, die das jeweilige
+/// BlueZ verlangt.
+pub enum BqpBt {
+    /// BlueZ 5 (Jolla): das Lauschen gehoert BlueZ, wir haengen als Profil
+    /// daran. Die Verbindung offen zu halten haelt das Profil am Leben.
+    Bluez5 {
+        verbindung: zbus::blocking::Connection,
+        pfad: &'static str,
+    },
+    /// BlueZ 4 (N9, N950): wir lauschen selbst auf einem Kanal und legen nur
+    /// den Eintrag ab. Der Faden hoert ueber `fertig` von selbst auf.
+    Bluez4 { griff: u32 },
+}
+
+impl BqpBt {
+    fn abmelden(self) {
+        match self {
+            BqpBt::Bluez5 { verbindung, pfad } => {
+                crate::btprofile::bluez5_abmelden(&verbindung, pfad)
+            }
+            BqpBt::Bluez4 { griff } => crate::btprofile::bluez4_eintrag_weg(griff),
+        }
+    }
 }
 
 pub static BQP: std::sync::Mutex<Option<BqpLauf>> = std::sync::Mutex::new(None);
@@ -4682,19 +4727,43 @@ impl Node {
                 crate::bdf::Bdf::Int(port as i64),
             ]));
         }
-        // Kein Bluetooth-Beschreiber. Briar probiert die Beschreiber in
-        // fester Reihenfolge durch -- Bluetooth zuerst, dann LAN -- und
-        // horcht dabei auf einer UUID, die aus der Verpflichtung abgeleitet
-        // ist. Wer eine Adresse nennt, aber keinen solchen Dienst anbietet,
-        // laesst die Gegenseite bei jedem Versuch in eine lange Wartezeit
-        // laufen, bevor sie es ueber LAN probiert. Solange wir den
-        // BQP-Lauscher auf Bluetooth nicht haben, nennen wir ihn nicht.
-        let rumpf = crate::bqp::encode(&crate::bqp::Payload {
-            commitment: crate::bqp::commitment(&oeffentlich),
-            descriptors: beschreiber,
-        });
+        let verpflichtung = crate::bqp::commitment(&oeffentlich);
         let fertig = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kontakt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        // Bluetooth. Briar probiert die Beschreiber in fester Reihenfolge --
+        // Bluetooth zuerst, dann LAN -- und sucht den Dienst unter einer
+        // Kennung, die aus der Verpflichtung gerechnet wird. Deshalb gilt
+        // hier: erst lauschen, dann nennen. Wer eine Adresse nennt, hinter der
+        // kein Dienst steht, laesst die Gegenseite bei jedem Versuch in eine
+        // lange Wartezeit laufen, bevor sie es ueber LAN probiert -- das waere
+        // schlimmer als gar kein Bluetooth.
+        let bt_lauscher = {
+            let uuid = crate::bqp::bt_uuid(&verpflichtung);
+            self.bqp_bt_lauschen(
+                &uuid,
+                privat,
+                oeffentlich,
+                Arc::clone(&fertig),
+                Arc::clone(&kontakt),
+            )
+        };
+        if bt_lauscher.is_some() {
+            // Die Adresse darf fehlen -- dann sucht die Gegenseite das Geraet
+            // selbst ueber die Kennung (descriptor.size() == 1 bei Briar).
+            let mut glieder = vec![crate::bdf::Bdf::Int(crate::bqp::TRANSPORT_BLUETOOTH)];
+            if let Some(mac) = crate::bt::local_address() {
+                if let Some(bytes) = mac_zu_bytes(&mac) {
+                    glieder.push(crate::bdf::Bdf::Raw(bytes));
+                }
+            }
+            beschreiber.insert(0, crate::bdf::Bdf::List(glieder));
+        }
+
+        let rumpf = crate::bqp::encode(&crate::bqp::Payload {
+            commitment: verpflichtung,
+            descriptors: beschreiber,
+        });
         *BQP.lock().unwrap() = Some(BqpLauf {
             privat,
             oeffentlich,
@@ -4702,6 +4771,7 @@ impl Node {
             port,
             fertig: Arc::clone(&fertig),
             kontakt: Arc::clone(&kontakt),
+            bt_aufraeumen: Arc::new(Mutex::new(bt_lauscher)),
         });
 
         let node = Node {
@@ -4731,7 +4801,7 @@ impl Node {
                         let rumpf2 = rumpf_fuer_lauscher.clone();
                         std::thread::spawn(move || {
                             match knoten.bqp_bedienen(
-                                strom,
+                                Conn::Tcp(strom),
                                 gegen.ip().to_string(),
                                 privat,
                                 oeffentlich,
@@ -4774,14 +4844,179 @@ impl Node {
         Ok(rumpf)
     }
 
+    /// Ueber Bluetooth lauschen, unter der Kennung aus der eigenen
+    /// Verpflichtung.
+    ///
+    /// Genau so macht es Briar (AbstractBluetoothPlugin:432):
+    ///
+    /// ```java
+    /// String uuid = UUID.nameUUIDFromBytes(commitment).toString();
+    /// ss = openServerSocket(uuid);
+    /// ```
+    ///
+    /// Zwei Wege, wie ueberall beim Bluetooth hier: BlueZ 5 (Jolla) fuehrt
+    /// das Lauschen selbst und reicht uns die Verbindung; BlueZ 4 (N9, N950)
+    /// kennt das nicht, dort lauschen wir auf einem eigenen Kanal und legen
+    /// nur den Eintrag ab.
+    ///
+    /// Gibt None zurueck, wenn nichts davon geht -- dann nennt der Rumpf auch
+    /// keine Bluetooth-Adresse. Eine genannte Adresse ohne Dienst dahinter
+    /// waere schlimmer als gar keine: Briar probiert Bluetooth zuerst und
+    /// laeuft bei jedem Versuch in eine lange Wartezeit.
+    fn bqp_bt_lauschen(
+        &self,
+        uuid: &str,
+        privat: SecretKey,
+        oeffentlich: [u8; 32],
+        fertig: Arc<std::sync::atomic::AtomicBool>,
+        kontakt: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Option<BqpBt> {
+        const PFAD: &str = "/harbour/briar/bqp";
+
+        // Was mit einer angenommenen Verbindung zu geschehen hat -- fuer
+        // beide Wege dasselbe.
+        fn bedienen(
+            store: Arc<Mutex<Store>>,
+            strom: std::os::unix::net::UnixStream,
+            privat: SecretKey,
+            oeffentlich: [u8; 32],
+            fertig: Arc<std::sync::atomic::AtomicBool>,
+            kontakt: Arc<std::sync::atomic::AtomicU32>,
+        ) {
+            std::thread::spawn(move || {
+                // Den eigenen Rumpf erst jetzt holen: er nennt die Adresse
+                // dieses Lauschers, kann also beim Anmelden noch nicht
+                // fertig gewesen sein.
+                let Some(rumpf) = BQP.lock().unwrap().as_ref().map(|l| l.rumpf.clone()) else {
+                    return;
+                };
+                let knoten = Node::new(store);
+                match knoten.bqp_bedienen(
+                    Conn::Bluetooth(strom),
+                    String::new(),
+                    privat,
+                    oeffentlich,
+                    rumpf,
+                    &fertig,
+                ) {
+                    Ok(id) => {
+                        log(&format!("BQP: Kontakt {} ueber Bluetooth angelegt", id));
+                        kontakt.store(id, std::sync::atomic::Ordering::Relaxed);
+                        fertig.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => log(&format!("BQP: Bluetooth-Versuch scheiterte: {}", e)),
+                }
+            });
+        }
+
+        // BlueZ 5 zuerst -- dort gehoert das Lauschen BlueZ.
+        {
+            let store = Arc::clone(&self.store);
+            let fertig5 = Arc::clone(&fertig);
+            let kontakt5 = Arc::clone(&kontakt);
+            if let Some(verbindung) =
+                crate::btprofile::bluez5_lauschen(PFAD, uuid, move |strom| {
+                    bedienen(
+                        Arc::clone(&store),
+                        strom,
+                        privat,
+                        oeffentlich,
+                        Arc::clone(&fertig5),
+                        Arc::clone(&kontakt5),
+                    )
+                })
+            {
+                return Some(BqpBt::Bluez5 {
+                    verbindung,
+                    pfad: PFAD,
+                });
+            }
+        }
+
+        // BlueZ 4: einen freien Kanal suchen und selbst lauschen. Kanal 11
+        // bleibt dem Abgleich.
+        let mut gefunden = None;
+        for kanal in 2u8..=30 {
+            if kanal == crate::bt::CHANNEL {
+                continue;
+            }
+            if let Ok(l) = crate::bt::Listener::bind(kanal) {
+                gefunden = Some((kanal, l));
+                break;
+            }
+        }
+        let (kanal, lauscher) = gefunden?;
+        let verbindung = zbus::blocking::Connection::system().ok()?;
+        let griff = crate::btprofile::bluez4_eintrag_mit(&verbindung, uuid, kanal)?;
+
+        let store = Arc::clone(&self.store);
+        let fertig4 = Arc::clone(&fertig);
+        let kontakt4 = Arc::clone(&kontakt);
+        std::thread::spawn(move || {
+            let _ = lauscher.set_nonblocking(true);
+            while !fertig4.load(std::sync::atomic::Ordering::Relaxed) {
+                match lauscher.accept() {
+                    Ok((strom, _gegen)) => {
+                        let _ = strom.set_nonblocking(false);
+                        bedienen(
+                            Arc::clone(&store),
+                            strom,
+                            privat,
+                            oeffentlich,
+                            Arc::clone(&fertig4),
+                            Arc::clone(&kontakt4),
+                        );
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => {
+                        log(&format!("BQP: Bluetooth-Lauscher scheiterte: {}", e));
+                        break;
+                    }
+                }
+            }
+        });
+        Some(BqpBt::Bluez4 { griff })
+    }
+
     /// Den Lauf beenden: die Oberflaeche hat den Bildschirm zugemacht. Der
     /// Lauscher haengt sonst am fluechtigen Port, bis jemand anwaehlt.
     pub fn bqp_stop() {
-        if let Some(lauf) = BQP.lock().unwrap().as_ref() {
-            lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
+        let aufraeumen = {
+            let lauf = BQP.lock().unwrap();
+            match lauf.as_ref() {
+                Some(l) => {
+                    l.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
+                    l.bt_aufraeumen.lock().unwrap().take()
+                }
+                None => None,
+            }
+        };
+        // Ausserhalb der Sperre: das Abmelden redet mit BlueZ und kann
+        // dauern.
+        if let Some(bt) = aufraeumen {
+            bt.abmelden();
         }
         *BQP_GEGENUEBER.lock().unwrap() = None;
     }
+}
+
+/// Eine Bluetooth-Adresse in die sechs Bytes, die Briar in den Beschreiber
+/// legt (`macToBytes`). Hohe Stelle zuerst, wie in der Schreibweise.
+fn mac_zu_bytes(mac: &str) -> Option<Vec<u8>> {
+    let teile: Vec<&str> = mac.split(':').collect();
+    if teile.len() != 6 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(6);
+    for t in teile {
+        bytes.push(u8::from_str_radix(t, 16).ok()?);
+    }
+    Some(bytes)
+}
+
+impl Node {
 
     /// Eine eingehende Verbindung bedienen.
     ///
@@ -4793,7 +5028,7 @@ impl Node {
     /// -- auf Android endet der ganze Versuch dann mit einem Fehler.
     fn bqp_bedienen(
         &self,
-        strom: std::net::TcpStream,
+        strom: Conn,
         gegen_ip: String,
         privat: SecretKey,
         oeffentlich: [u8; 32],
@@ -4836,24 +5071,50 @@ impl Node {
         // scannt, wartet damit einfach, bis die Gegenseite ihren Code zeigt.
         // Ohne das muesste der Benutzer noch einmal scannen.
         let mut letzter = bad("keine Adresse im Code");
-        let Some(adresse) = payload.lan() else {
+        let adresse = payload.lan();
+        // Die Kennung des Dienstes der Gegenseite kommt aus IHRER
+        // Verpflichtung -- Briar macht es genauso
+        // (AbstractBluetoothPlugin.createKeyAgreementConnection:464).
+        let bt_mac = payload.bluetooth();
+        let bt_uuid = crate::bqp::bt_uuid(&payload.commitment);
+        if adresse.is_none() && bt_mac.is_none() {
             return Err(letzter);
-        };
+        }
         let bis = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            match dial(LAN_TRANSPORT_ID, &adresse, None) {
-                Ok(Conn::Tcp(strom)) => {
-                    return self.bqp_durchfuehren(
-                        strom,
-                        privat,
-                        oeffentlich,
-                        unser_rumpf,
-                        ihr_rumpf,
-                        adresse.rsplit_once(':').map(|(ip, _)| ip.to_string()),
-                    )
+            // Bluetooth zuerst, in derselben Reihenfolge wie Briar.
+            if let Some(mac) = bt_mac.as_deref() {
+                match crate::bt::lookup_channel(mac, &bt_uuid)
+                    .and_then(|kanal| crate::bt::connect(mac, kanal))
+                {
+                    Ok(strom) => {
+                        return self.bqp_durchfuehren(
+                            Conn::Bluetooth(strom),
+                            privat,
+                            oeffentlich,
+                            unser_rumpf,
+                            ihr_rumpf,
+                            None,
+                        )
+                    }
+                    Err(e) => letzter = e,
                 }
-                Ok(_) => {}
-                Err(e) => letzter = e,
+            }
+            if let Some(adresse) = adresse.as_deref() {
+                match dial(LAN_TRANSPORT_ID, adresse, None) {
+                    Ok(strom @ Conn::Tcp(_)) => {
+                        return self.bqp_durchfuehren(
+                            strom,
+                            privat,
+                            oeffentlich,
+                            unser_rumpf,
+                            ihr_rumpf,
+                            adresse.rsplit_once(':').map(|(ip, _)| ip.to_string()),
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(e) => letzter = e,
+                }
             }
             // Hat unser eigener Lauscher derweil eine Verbindung angenommen
             // und den Austausch erledigt, ist hier nichts mehr zu tun.
@@ -5033,7 +5294,7 @@ impl Node {
     /// Der gemeinsame Teil: Sitzung, dann Kontaktaustausch.
     fn bqp_durchfuehren(
         &self,
-        strom: std::net::TcpStream,
+        strom: Conn,
         privat: SecretKey,
         oeffentlich: [u8; 32],
         unser_rumpf: Vec<u8>,
@@ -5043,8 +5304,7 @@ impl Node {
         let ihr = crate::bqp::parse(&ihr_rumpf).ok_or_else(|| bad("kein BQP-Code"))?;
         let unser = crate::bqp::parse(&unser_rumpf).ok_or_else(|| bad("eigener Code kaputt"))?;
         let alice = crate::bqp::ist_alice(&unser.commitment, &ihr.commitment);
-        strom.set_read_timeout(Some(BQP_IO_TIMEOUT))?;
-        strom.set_write_timeout(Some(BQP_IO_TIMEOUT))?;
+        strom.set_bqp_timeouts()?;
         let mut strom = strom;
         let master = crate::bqp::sitzung(
             &mut strom,
@@ -5056,8 +5316,7 @@ impl Node {
             alice,
         )?;
         log("BQP: die Einigung steht");
-        let conn = Conn::Tcp(strom);
-        let id = self.bqp_austausch(conn, master, alice, gegen_ip)?;
+        let id = self.bqp_austausch(strom, master, alice, gegen_ip)?;
         if let Some(lauf) = BQP.lock().unwrap().as_ref() {
             lauf.kontakt.store(id, std::sync::atomic::Ordering::Relaxed);
             lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5125,12 +5384,12 @@ mod bqp_dienst_tests {
         let a_rumpf2 = a_rumpf.clone();
         let laeufer = std::thread::spawn(move || {
             let (strom, _) = lauscher.accept().unwrap();
-            b.bqp_durchfuehren(strom, b_privat, b_oeff, b_rumpf2, a_rumpf2, None)
+            b.bqp_durchfuehren(Conn::Tcp(strom), b_privat, b_oeff, b_rumpf2, a_rumpf2, None)
                 .map(|id| (id, b))
         });
 
         let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let ergebnis_a = a.bqp_durchfuehren(strom, a_privat, a_oeff, a_rumpf, b_rumpf, None);
+        let ergebnis_a = a.bqp_durchfuehren(Conn::Tcp(strom), a_privat, a_oeff, a_rumpf, b_rumpf, None);
         let (id_b, b) = laeufer.join().unwrap().expect("B scheitert nicht");
         let id_a = ergebnis_a.expect("A scheitert nicht");
         assert_eq!(id_a, 1);
@@ -5170,6 +5429,7 @@ mod bqp_dienst_tests {
             port: 0,
             fertig: Arc::clone(&fertig),
             kontakt: Arc::new(AtomicU32::new(0)),
+                    bt_aufraeumen: Arc::new(Mutex::new(None)),
         });
         *BQP_GEGENUEBER.lock().unwrap() = None;
 
@@ -5180,7 +5440,7 @@ mod bqp_dienst_tests {
         let bedienen = std::thread::spawn(move || {
             let (strom, _) = lauscher.accept().unwrap();
             b.bqp_bedienen(
-                strom,
+                Conn::Tcp(strom),
                 "127.0.0.1".to_string(),
                 b_privat,
                 b_oeff,
@@ -5193,7 +5453,7 @@ mod bqp_dienst_tests {
         let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let a_rumpf_fuer_b = a_rumpf.clone();
         let anwaehlen = std::thread::spawn(move || {
-            a.bqp_durchfuehren(strom, a_privat, a_oeff, a_rumpf, b_rumpf, None)
+            a.bqp_durchfuehren(Conn::Tcp(strom), a_privat, a_oeff, a_rumpf, b_rumpf, None)
                 .map(|id| (id, a))
         });
 

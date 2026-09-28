@@ -37,6 +37,36 @@ pub const COMMIT_LEN: usize = 16;
 pub const TRANSPORT_BLUETOOTH: i64 = 0;
 pub const TRANSPORT_LAN: i64 = 1;
 
+/// Javas `UUID.nameUUIDFromBytes`, Byte fuer Byte nachgebaut.
+///
+/// Briar leitet daraus die Kennung des Bluetooth-Dienstes ab, unter dem es
+/// waehrend eines Treffens lauscht -- gelesen in
+/// `AbstractBluetoothPlugin.createKeyAgreementListener`:
+///
+/// ```java
+/// // No truncation necessary because COMMIT_LENGTH = 16
+/// String uuid = UUID.nameUUIDFromBytes(commitment).toString();
+/// ```
+///
+/// Das ist eine UUID der Fassung 3: MD5 ueber die Bytes, dann zwei Nibbles
+/// gesetzt. MD5 steht hier nicht als Pruefsumme, sondern weil die Kennung
+/// genau so entsteht; ein anderer Hash ergaebe eine andere Kennung und damit
+/// keinen Fund.
+pub fn bt_uuid(commitment: &[u8]) -> String {
+    let mut h = md5::compute(commitment).0;
+    h[6] = (h[6] & 0x0f) | 0x30; // Fassung 3
+    h[8] = (h[8] & 0x3f) | 0x80; // IETF-Variante
+    let hex: String = h.iter().map(|b| format!("{:02x}", b)).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// Satzarten (RecordTypes.java). Die Rahmen sind dieselben wie sonst.
 pub const KEY: u8 = 0;
 pub const CONFIRM: u8 = 1;
@@ -65,12 +95,20 @@ impl Payload {
     /// Die LAN-Adresse aus den Beschreibern, als `ip:port`.
     pub fn lan(&self) -> Option<String> {
         for d in &self.descriptors {
-            let teile = d.as_list()?;
-            if teile.first()?.as_int()? != TRANSPORT_LAN {
+            // Weiterschauen statt aufgeben: ein Beschreiber, mit dem wir
+            // nichts anfangen koennen, darf die folgenden nicht verdecken.
+            // Briar schickt den Bluetooth-Beschreiber auch ohne Adresse --
+            // als Liste mit nur einem Glied -- und dahinter erst den fuer LAN.
+            let Some(teile) = d.as_list() else { continue };
+            if teile.first().and_then(|t| t.as_int()) != Some(TRANSPORT_LAN) {
                 continue;
             }
-            let roh = teile.get(1)?.as_raw()?;
-            let port = teile.get(2)?.as_int()?;
+            let Some(roh) = teile.get(1).and_then(|t| t.as_raw()) else {
+                continue;
+            };
+            let Some(port) = teile.get(2).and_then(|t| t.as_int()) else {
+                continue;
+            };
             let ip = match roh.len() {
                 4 => std::net::IpAddr::from([roh[0], roh[1], roh[2], roh[3]]),
                 16 => {
@@ -92,13 +130,22 @@ impl Payload {
     }
 
     /// Die Bluetooth-Adresse aus den Beschreibern, in Grossbuchstaben.
+    /// Die Bluetooth-Adresse aus den Beschreibern.
+    ///
+    /// None heisst hier zweierlei: kein Bluetooth-Beschreiber, oder einer
+    /// ohne Adresse. Briar laesst die Adresse weg, wenn es seine eigene nicht
+    /// kennt, und die Gegenseite sucht das Geraet dann selbst ueber die
+    /// Kennung (`discoverAndConnect`). Das koennen wir nicht, also ist beides
+    /// fuer uns dasselbe: kein Bluetooth.
     pub fn bluetooth(&self) -> Option<String> {
         for d in &self.descriptors {
-            let teile = d.as_list()?;
-            if teile.first()?.as_int()? != TRANSPORT_BLUETOOTH {
+            let Some(teile) = d.as_list() else { continue };
+            if teile.first().and_then(|t| t.as_int()) != Some(TRANSPORT_BLUETOOTH) {
                 continue;
             }
-            let roh = teile.get(1)?.as_raw()?;
+            let Some(roh) = teile.get(1).and_then(|t| t.as_raw()) else {
+                continue;
+            };
             if roh.len() != 6 {
                 continue;
             }
@@ -502,3 +549,118 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod uuid_tests {
+    use super::*;
+
+    /// Die Vergleichswerte stammen nicht aus dieser Umsetzung, sondern aus
+    /// einer unabhaengigen Rechnung nach Javas Vorschrift (MD5, dann Fassung
+    /// 3 und IETF-Variante setzen).
+    #[test]
+    fn kennung_wie_bei_java() {
+        let verpflichtung =
+            hex("3df9d22ad582d3fb6c90edaa1f7f3e6e");
+        assert_eq!(
+            bt_uuid(&verpflichtung),
+            "d00458d5-46bf-395c-9d7c-ccd157ae8882"
+        );
+        assert_eq!(
+            bt_uuid(&[0u8; 16]),
+            "4ae71336-e44b-39bf-b9d2-752e234818a5"
+        );
+    }
+
+    /// Die Fassungs- und Variantenbits muessen bei jeder Eingabe stimmen,
+    /// sonst faende Briar den Dienst nur zufaellig.
+    #[test]
+    fn fassung_und_variante_stehen_immer() {
+        for i in 0u8..64 {
+            let u = bt_uuid(&[i; 16]);
+            assert_eq!(&u[14..15], "3", "Fassung 3 fehlt in {}", u);
+            let variante = u.as_bytes()[19];
+            assert!(
+                matches!(variante, b'8' | b'9' | b'a' | b'b'),
+                "IETF-Variante fehlt in {}",
+                u
+            );
+        }
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod bluetooth_beschreiber_tests {
+    use super::*;
+    use crate::bdf::Bdf;
+
+    fn rumpf(beschreiber: Vec<Bdf>) -> Payload {
+        let roh = encode(&Payload {
+            commitment: vec![7u8; 16],
+            descriptors: beschreiber,
+        });
+        parse(&roh).expect("eigener Rumpf muss lesbar sein")
+    }
+
+    /// Briars Beschreiber ist [0, sechs Bytes], hohe Stelle zuerst.
+    #[test]
+    fn adresse_kommt_so_heraus_wie_sie_hineinging() {
+        let p = rumpf(vec![Bdf::List(vec![
+            Bdf::Int(TRANSPORT_BLUETOOTH),
+            Bdf::Raw(vec![0x40, 0x98, 0x4E, 0xAD, 0xBD, 0x42]),
+        ])]);
+        assert_eq!(p.bluetooth().as_deref(), Some("40:98:4E:AD:BD:42"));
+    }
+
+    /// Briar laesst die Adresse weg, wenn es seine eigene nicht kennt --
+    /// dann darf der Beschreiber dahinter trotzdem gefunden werden. Mit dem
+    /// alten `?` verschluckte ein solcher Beschreiber die LAN-Adresse.
+    #[test]
+    fn bluetooth_ohne_adresse_verdeckt_das_lan_nicht() {
+        let p = rumpf(vec![
+            Bdf::List(vec![Bdf::Int(TRANSPORT_BLUETOOTH)]),
+            Bdf::List(vec![
+                Bdf::Int(TRANSPORT_LAN),
+                Bdf::Raw(vec![10, 156, 40, 213]),
+                Bdf::Int(7327),
+            ]),
+        ]);
+        assert_eq!(p.bluetooth(), None, "ohne Adresse ist es fuer uns keins");
+        assert_eq!(p.lan().as_deref(), Some("10.156.40.213:7327"));
+    }
+
+    /// Beide Wege nebeneinander, in Briars Reihenfolge.
+    #[test]
+    fn beide_wege_nebeneinander() {
+        let p = rumpf(vec![
+            Bdf::List(vec![
+                Bdf::Int(TRANSPORT_BLUETOOTH),
+                Bdf::Raw(vec![0x50, 0x56, 0xA8, 0x06, 0x05, 0xCA]),
+            ]),
+            Bdf::List(vec![
+                Bdf::Int(TRANSPORT_LAN),
+                Bdf::Raw(vec![10, 156, 40, 213]),
+                Bdf::Int(32951),
+            ]),
+        ]);
+        assert_eq!(p.bluetooth().as_deref(), Some("50:56:A8:06:05:CA"));
+        assert_eq!(p.lan().as_deref(), Some("10.156.40.213:32951"));
+    }
+
+    /// Die Kennung des Dienstes haengt an der Verpflichtung, nicht am Geraet:
+    /// zwei Laeufe mit verschiedenen Schluesseln lauschen unter verschiedenen
+    /// Kennungen, und beide Seiten rechnen dieselbe aus.
+    #[test]
+    fn kennung_haengt_an_der_verpflichtung() {
+        let a = bt_uuid(&[1u8; 16]);
+        let b = bt_uuid(&[2u8; 16]);
+        assert_ne!(a, b);
+        assert_eq!(a, bt_uuid(&[1u8; 16]));
+    }
+}
