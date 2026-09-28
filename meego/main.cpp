@@ -63,6 +63,7 @@ static bool dienstAntwortet()
 #include "../src/qrcode.h"
 #include "kamera.h"
 #include "geraeteschloss.h"
+#include "sucher.h"
 
 static void dienstStarten();
 
@@ -87,6 +88,10 @@ static void dienstStarten()
 int main(int argc, char *argv[])
 {
     sitzungsBusSetzen();
+    // GStreamer fuer den Sucher (sucher.h). Scheitert es, faellt nur der
+    // Sucher aus -- die Seite geht dann den alten Weg ueber die Kamera-App.
+    gst_init(&argc, &argv);
+
     QApplication app(argc, argv);
 
     // Without this the virtual keyboard never appears once the hardware one
@@ -104,6 +109,10 @@ int main(int argc, char *argv[])
     // Kontext-Eigenschaft darauf.
     Kamera kamera;
     Geraeteschloss geraeteschloss;
+
+    // Der Sucher ist ein zeichnendes Element, keine Eigenschaft: er muss
+    // als Typ angemeldet werden, damit QML ihn hinstellen kann.
+    qmlRegisterType<Sucher>("Briar", 1, 0, "Sucher");
 
     QDeclarativeView view;
     // Qt 4.7's QML has no Qt.locale(), so the interface gets the system's

@@ -204,6 +204,44 @@ private:
         return dir;
     }
 
+public:
+    /// Ein Bild, das schon Graustufen ist, unmittelbar an quirc.
+    ///
+    /// Der Sucher am N9 (meego/sucher.h) liefert genau das: das
+    /// Helligkeitsfeld, das er aus UYVY herausgreift. Der Weg ueber
+    /// decodeImage() wuerde es erst nach RGB32 kopieren und dann Bildpunkt
+    /// fuer Bildpunkt wieder auf Grau zurueckrechnen -- zweimal umsonst, und
+    /// auf einem 1-GHz-A8 ist das nicht wenig.
+    static QString decodeHexAusBild(const QImage &grau)
+    {
+        if (grau.format() != QImage::Format_Indexed8)
+            return QString::fromLatin1(decodeImage(grau).toHex());
+
+        struct quirc *q = quirc_new();
+        if (!q)
+            return QString();
+        QByteArray ergebnis;
+        if (quirc_resize(q, grau.width(), grau.height()) >= 0) {
+            uint8_t *puffer = quirc_begin(q, 0, 0);
+            for (int y = 0; y < grau.height(); ++y) {
+                memcpy(puffer + (size_t)y * (size_t)grau.width(),
+                       grau.scanLine(y), (size_t)grau.width());
+            }
+            quirc_end(q);
+            const int anzahl = quirc_count(q);
+            for (int i = 0; i < anzahl && ergebnis.isEmpty(); ++i) {
+                struct quirc_code code;
+                struct quirc_data data;
+                quirc_extract(q, i, &code);
+                if (quirc_decode(&code, &data) == QUIRC_SUCCESS)
+                    ergebnis = QByteArray((const char *)data.payload, data.payload_len);
+            }
+        }
+        quirc_destroy(q);
+        return QString::fromLatin1(ergebnis.toHex());
+    }
+
+private:
     static QByteArray decodeImage(const QImage &source)
     {
         QImage grey = source.convertToFormat(QImage::Format_RGB32);

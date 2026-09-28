@@ -1,6 +1,7 @@
 import QtQuick 1.1
 import com.nokia.meego 1.0
 import "Briar.js" as Briar
+import Briar 1.0
 
 // Den QR-Code des anderen Geraets einlesen.
 //
@@ -46,7 +47,7 @@ Page {
     }
 
     // Beim Verlassen der Seite MeeScan nicht weiterlaufen lassen.
-    Component.onDestruction: kamera.meeScanBeenden()
+    Component.onDestruction: { kamera.meeScanBeenden(); sucher.anhalten() }
 
     // Einen gelesenen Text als Kontakt uebernehmen. Gibt false zurueck, wenn
     // kein briar://-Link darin steht.
@@ -85,6 +86,32 @@ Page {
             seite.meldung = fenster.tr("scanNothing")
     }
 
+    // Ein Fund aus dem eigenen Sucher. Derselbe Weg wie beim Foto, nur ohne
+    // Foto -- und wenn nichts Brauchbares drinstand, wird weitergesucht.
+    function ausSucher(hex) {
+        if (Briar.istBqp(hex)) {
+            seite.meldung = fenster.tr("scanIsMeetCode")
+            sucher.anhalten()
+            pageStack.pop()
+            pageStack.push(Qt.resolvedUrl("MeetPage.qml"), { "gescannt": hex })
+            return
+        }
+        var text = Briar.hexZuText(hex)
+        if (text && seite.uebernehmen(text)) {
+            sucher.anhalten()
+            return
+        }
+        seite.meldung = fenster.tr("scanNotBriar")
+        sucher.weitersuchen()
+    }
+
+    onStatusChanged: {
+        if (status === PageStatus.Active)
+            sucher.starten()
+        else
+            sucher.anhalten()
+    }
+
     Column {
         anchors { fill: parent; margins: 24 }
         spacing: 20
@@ -99,12 +126,29 @@ Page {
             text: seite.meldung
         }
 
-        // MeeScan zuerst, wenn es da ist: es hat als einziges einen Sucher,
-        // mit dem man zielen kann.
+        // Der eigene Sucher. Er liest jedes Kamerabild selbst -- kein Foto,
+        // kein zweiter Schritt. Siehe meego/sucher.h; die Kette ist am Geraet
+        // nachgemessen.
+        Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: 400
+            height: sucher.laeuft ? 300 : 0
+            visible: height > 0
+            color: "black"
+
+            Sucher {
+                id: sucher
+                anchors.fill: parent
+                onCodeGelesen: seite.ausSucher(hex)
+            }
+        }
+
+        // MeeScan und die Kamera-App bleiben als Rueckfall, falls der eigene
+        // Sucher nicht anlaeuft.
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
             text: fenster.tr("scanWithMeeScan")
-            visible: kamera.meeScanVorhanden()
+            visible: kamera.meeScanVorhanden() && !sucher.laeuft
             onClicked: {
                 seite.meldung = fenster.tr("scanning")
                 if (!kamera.meeScanStarten())
@@ -115,6 +159,7 @@ Page {
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
             text: fenster.tr("scanOpenCamera")
+            visible: !sucher.laeuft
             onClicked: {
                 seite.wartetAufFoto = true
                 if (!kamera.oeffnen()) {
@@ -127,6 +172,7 @@ Page {
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
             text: fenster.tr("scanReadPhoto")
+            visible: !sucher.laeuft
             onClicked: seite.lesen()
         }
     }

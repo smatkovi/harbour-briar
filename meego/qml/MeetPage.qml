@@ -2,16 +2,22 @@ import QtQuick 1.1
 import com.nokia.meego 1.0
 import "Briar.js" as Briar
 import "Strings.js" as Strings
+import Briar 1.0
 
 // Zwei Geräte nebeneinander: BQP, dasselbe Verfahren wie in Briar auf
 // Android. Jedes Gerät zeigt einen Code und liest den des anderen; danach
 // steht der Kontakt, ohne dass ein Link durch fremde Hände geht.
 //
-// Anders als an der Jolla gibt es hier kein Sucherbild im Programm -- das
-// QML-Kameraelement bleibt auf diesen Geräten schwarz. Also derselbe Weg wie
-// beim Einlesen eines Links: mit der Kamera-App fotografieren, hier lesen.
-// Der Code der Gegenseite steht auf ihrem Bildschirm und bewegt sich nicht,
-// das reicht dafür gut.
+// Seit 0.33.0 steht hier ein Sucherbild, und es liest selbst mit: jedes
+// Kamerabild geht durch quirc, kein Foto, kein zweiter Schritt. Das
+// QML-Kameraelement bleibt auf diesen Geräten weiter schwarz -- sein Unterbau
+// camerabin kommt nicht über PAUSED hinaus --, aber die Kamera selbst liefert
+// sehr wohl: nachgemessen gibt subdevsrc2 Rahmen in UYVY, und dort ist die
+// Helligkeit jedes zweite Byte, also genau das Feld, das quirc will. Siehe
+// meego/sucher.h.
+//
+// Geht die Kette wider Erwarten nicht an, erscheinen die beiden alten Knöpfe:
+// mit der Kamera-App fotografieren, hier lesen.
 Page {
     id: seite
 
@@ -119,6 +125,17 @@ Page {
         onTriggered: fenster.aktualisieren()
     }
 
+    onStatusChanged: {
+        if (status === PageStatus.Active && seite.lage === 0)
+            sucher.starten()
+        else
+            sucher.anhalten()
+    }
+
+    Component.onDestruction: sucher.anhalten()
+
+    onLageChanged: if (seite.lage !== 0) sucher.anhalten()
+
     Connections {
         target: fenster
         onZustandChanged: {
@@ -169,8 +186,32 @@ Page {
                 visible: source != ""
             }
 
+            // Der Sucher. Er liest selbst mit -- jedes Kamerabild geht durch
+            // quirc, kein Foto, kein zweiter Schritt. Geht die Kette nicht
+            // an (gemessen laeuft sie, aber verlassen wollen wir uns nicht
+            // darauf), bleibt es bei den beiden Knoepfen darunter.
+            Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: 400
+                height: sucher.laeuft ? 300 : 0
+                visible: height > 0
+                color: "black"
+
+                Sucher {
+                    id: sucher
+                    anchors.fill: parent
+                    sucheNach: "bqp"
+                    onCodeGelesen: {
+                        if (seite.lage !== 0)
+                            return
+                        seite.uebergeben(hex)
+                    }
+                }
+            }
+
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
+                visible: !sucher.laeuft
                 text: fenster.tr("scanOpenCamera")
                 onClicked: {
                     seite.wartetAufFoto = true
@@ -183,6 +224,7 @@ Page {
 
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
+                visible: !sucher.laeuft
                 text: fenster.tr("scanReadPhoto")
                 onClicked: seite.lesen()
             }

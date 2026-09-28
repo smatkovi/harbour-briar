@@ -51,8 +51,13 @@ if [ ! -x "$CXX" ]; then
     exit 0
 fi
 QTINC=$SYSROOT/usr/include/qt4
+# GStreamer 0.10 aus demselben Sysroot: der Sucher am N9 haengt unmittelbar
+# an subdevsrc2 (meego/sucher.h). pkg-config wird hier nicht bemueht -- es
+# zeigte auf den Bauwirt statt in das Sysroot.
+GSTINC="-I$SYSROOT/usr/include/gstreamer-0.10 -I$SYSROOT/usr/include/glib-2.0 \
+ -I$SYSROOT/usr/lib/glib-2.0/include -I$SYSROOT/usr/include/libxml2"
 CXXFLAGS="--sysroot=$SYSROOT -std=gnu++17 -O2 -Wall -Wno-register \
- -Wno-deprecated-declarations -DQT_NO_DEBUG -I$QTINC"
+ -Wno-deprecated-declarations -DQT_NO_DEBUG -I$QTINC $GSTINC"
 for m in QtCore QtGui QtNetwork QtScript QtDeclarative QtDBus; do
     CXXFLAGS="$CXXFLAGS -I$QTINC/$m"
 done
@@ -62,7 +67,8 @@ LDFLAGS="--sysroot=$SYSROOT -static-libstdc++ -static-libgcc -Wl,-O1 \
 # einem Endgeraet haengt, und dann kommt bis zum Programmende nichts an.
 # QtDBus: das Geraeteschloss von Harmattan haengt am Systembus
 # (com.nokia.devicelock), und daran fuehrt Briar seine eigene Sperre.
-LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtDBus -lQtGui -lQtCore -lpthread -lutil"
+LIBS="-lQtDeclarative -lQtScript -lQtNetwork -lQtDBus -lQtGui -lQtCore -lpthread -lutil \
+ -lgstapp-0.10 -lgstbase-0.10 -lgstreamer-0.10 -lgobject-2.0 -lglib-2.0"
 
 cd "$OUT"
 # ImagePrep is a QObject, so it needs moc. The simulator Qt's moc produces
@@ -80,6 +86,8 @@ $MOC "$SRC/meego/kamera.h" -o moc_kamera.cpp
 $CXX $CXXFLAGS -I"$SRC/src" -I"$SRC/meego" -c moc_kamera.cpp -o moc_kamera.o
 $MOC "$SRC/meego/geraeteschloss.h" -o moc_geraeteschloss.cpp
 $CXX $CXXFLAGS -I"$SRC/meego" -c moc_geraeteschloss.cpp -o moc_geraeteschloss.o
+$MOC "$SRC/meego/sucher.h" -o moc_sucher.cpp
+$CXX $CXXFLAGS -I"$SRC/src" -I"$SRC/meego" -c moc_sucher.cpp -o moc_sucher.o
 QUIRCOBJS=""
 for q in quirc decode identify version_db; do
     $CC --sysroot=$SYSROOT -O2 -std=gnu99 -I"$SRC/src/quirc" \
@@ -88,5 +96,5 @@ for q in quirc decode identify version_db; do
 done
 $CXX $CXXFLAGS -c "$SRC/meego/main.cpp" -o main.o
 $CXX $LDFLAGS -o briar main.o moc_imageprep.o moc_dienst.o moc_qrcode.o \
- moc_kamera.o moc_geraeteschloss.o $QUIRCOBJS $LIBS
+ moc_kamera.o moc_geraeteschloss.o moc_sucher.o $QUIRCOBJS $LIBS
 echo "== briar (Harmattan interface): $(stat -c %s briar) B"
