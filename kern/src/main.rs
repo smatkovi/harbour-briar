@@ -173,6 +173,42 @@ fn main() {
         };
     });
 
+    // Der Besen fuer verschwindende Nachrichten. Er schlaeft bis zur
+    // naechsten faelligen Frist, nicht im festen Takt: steht keine an,
+    // kostet er nichts, und eine Nachricht geht auf die Sekunde und nicht
+    // irgendwann in der naechsten Runde.
+    let fege_store = Arc::clone(&shared);
+    std::thread::spawn(move || loop {
+        let naechste = {
+            let mut store = fege_store.lock().unwrap();
+            let jetzt = briarkern::util::now_ms();
+            if briarkern::net::verschwundenes_fegen(&mut store, jetzt) {
+                let _ = store.save();
+            }
+            store
+                .state
+                .contacts
+                .iter()
+                .flat_map(|c| c.messages.iter())
+                .filter_map(|m| m.loesch_frist)
+                .min()
+        };
+        let schlaf = match naechste {
+            Some(frist) => {
+                let jetzt = briarkern::util::now_ms();
+                Duration::from_millis(frist.saturating_sub(jetzt))
+                    .max(Duration::from_secs(1))
+                    // Nicht laenger als eine Minute schlafen, auch wenn die
+                    // naechste Frist weiter weg ist: die feinste Stufe ist
+                    // eine Minute, und eine neue Nachricht soll nicht bis zum
+                    // naechsten Aufwachen auf ihre Uhr warten.
+                    .min(Duration::from_secs(60))
+            }
+            None => Duration::from_secs(60),
+        };
+        std::thread::sleep(schlaf);
+    });
+
     // Der Netzwaechter. Er fragt nicht nach, er wartet: der Systembus
     // meldet, wenn WLAN, mobile Daten oder Bluetooth kommen oder gehen
     // (ConnMan auf Sailfish, ICd2 auf Harmattan, BlueZ auf beiden). Dann

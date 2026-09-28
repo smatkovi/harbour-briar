@@ -27,7 +27,8 @@ Nokia N950 (Harmattan, armv7):
 - Messages both ways, with delivery receipts
 - Private groups: create, invite, join, post — posts reach members who are not
   contacts of each other
-- Attachments up to 32 KB (images are scaled down first)
+- Attachments up to 32 KB (images are scaled down first); a message from
+  Briar that carries several is shown with all of them, one below the other
 - Tor: a statically built Tor 0.4.8.14 ships in the package; the daemon starts
   it, publishes a hidden service and reaches peers at their onion address
 - The store is encrypted with a password: scrypt over the password, then
@@ -89,32 +90,52 @@ Every row below is verified against reference bytes from `bramble-core` 1.5.20
 
 What this port does **differently**, and why:
 
-- **The invitation protocol has two rooms missing.** Since 0.27.0 all four
-  clients are announced — messaging, properties, the private group and its
-  invitation client (`kern/src/sync.rs`) — so a real Briar no longer keeps our
-  groups invisible. What is built: one invitation session per (contact, group),
-  as Briar keeps it, with the chain of previous messages, rising timestamps, and
-  JOIN, LEAVE and ABORT both read and answered. What is not: the PEER role
-  between two members who *are* contacts of each other but where neither invited
-  the other (Briar's `revealRelationship`) — they cannot confirm to each other
-  that both are in the group, though the member list and every post reach them
-  anyway. Declining has no button of its own: removing the group before joining
-  sends the LEAVE that Briar books as a decline. The invitation client is announced as minor
-  version 0, not Briar's 1: minor 1 promises to honour the disappearing-message
-  timer, and this port ignores that field.
-- **No SDP record on Harmattan.** The Jolla publishes one through BlueZ 5's
-  `ProfileManager1`; BlueZ 4 on the N9 and N950 offers a different interface
-  (`org.bluez.Service.AddRecord`) and that is not written yet. Those two
-  devices listen on channel 11 and are therefore invisible to a real Briar over
-  Bluetooth, whatever else works.
+- **The invitation protocol is built, its minor version deliberately is not.**
+  Since 0.27.0 all four clients are announced — messaging, properties, the
+  private group and its invitation client (`kern/src/sync.rs`) — so a real
+  Briar no longer keeps our groups invisible. One invitation session per
+  (contact, group), as Briar keeps it, with the chain of previous messages,
+  rising timestamps, and JOIN, LEAVE and ABORT both read and answered; since
+  0.29.0 also the PEER role between two members who are contacts of each other
+  without either having invited the other. Declining has no button of its own:
+  removing the group before joining sends the LEAVE that Briar books as a
+  decline. The invitation client is still announced as minor version 0, not
+  Briar's 1: minor 1 promises the disappearing-message timer for invitations
+  too, and that one is not built. Private messages have it (minor 3), group
+  invitations do not.
+- **The SDP record takes two different roads.** The Jolla publishes one
+  through BlueZ 5's `ProfileManager1`; the N9 and N950 run BlueZ 4, which
+  offers `org.bluez.Service.AddRecord` with a hand-written XML record instead
+  (`kern/src/btprofile.rs`). Both announce the same UUID on channel 11, so a
+  real Briar can find either.
 - **No forums, no blogs, no introductions.**
-- **A QR code, but not Briar's BQP.** Briar exchanges a handshake secret
-  through the code. Here the code carries the `briar://` link with the
-  addresses behind it (`?lan=…&bt=…&tor=…`); the other side photographs it and
-  has everything filled in. The encoder is our own (`src/qrencode.h`, checked
-  against zbar), the decoder is quirc (`src/quirc/`) — neither device has a QR
-  library. On the N9 the shutter fires and the picture is read afterwards: Qt
-  4.7 gives QML no live camera frames.
+- **Disappearing messages, for private messages only.** Since 0.29.0 the
+  messaging client is announced as minor version 3, which is Briar's promise to
+  read and write the auto-delete timer. The timer travels inside each private
+  message, is mirrored rather than negotiated, and the clock starts when the
+  message arrives — on acknowledgement for our own, on reading for theirs, as
+  Briar starts its cleanup timer. Group posts and invitations carry no timer:
+  their clients still announce minor 0. A contact whose announcement we never
+  stored counts as knowing it: Briar only re-announces its client list when
+  that list changes, never because a peer's minor version rose, so waiting for
+  an announcement that will not come would keep the timer switched off for
+  every contact added before 0.29.0. Briar itself skips an unreadable fourth
+  element, so the timer is safe to send blind; only the "the other side deletes
+  too" line in the chat waits for an announcement that really says minor 3.
+- **Two kinds of QR code.** "Meet in person" is Briar's own BQP (Bramble QR
+  Code Protocol, `kern/src/bqp.rs`, checked against reference bytes from
+  bramble-core): the code carries a commitment to an ephemeral key plus the
+  transport descriptors, both sides read the other's code, and the key
+  agreement that follows proves the key matches the commitment. A code from
+  Briar on Android is read here and ours there. Over LAN only, so far — the
+  Bluetooth road would need a service under a UUID derived from the commitment
+  (`UUID.nameUUIDFromBytes`), and that is not written. The older code carries
+  the `briar://` link with the addresses behind it (`?lan=…&bt=…&tor=…`) and
+  stays, because it also works at a distance. The encoder is our own
+  (`src/qrencode.h`, checked against zbar), the decoder is quirc
+  (`src/quirc/`) — neither device has a QR library. On the N9 the shutter
+  fires and the picture is read afterwards: Qt 4.7 gives QML no live camera
+  frames.
 - **Addresses follow Briar's shape, not its plan.** Briar's properties client
   announces addresses as its own versioned messages; here they travel in the
   same shape (transport, version, dictionary) through the outbox and are

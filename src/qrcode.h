@@ -32,9 +32,44 @@ class QrCode : public QObject
 public:
     explicit QrCode(QObject *parent = 0) : QObject(parent) {}
 
+    /// Ein Code aus rohen Bytes, als Hex uebergeben.
+    ///
+    /// BQP -- Briars Verfahren fuer zwei Geraete nebeneinander -- steckt keine
+    /// Schrift in den Code, sondern Bytes. Android baut daraus einen String
+    /// nach ISO-8859-1 und laesst ZXing ihn im Byte-Modus schreiben; gelesen
+    /// wird mit demselben Zeichensatz zurueck. Unser Schreiber nimmt ohnehin
+    /// Bytes, also geht der Umweg ueber den Zeichensatz hier gar nicht erst
+    /// los: Hex herein, Bytes in den Code.
+    Q_INVOKABLE QString imageForHex(const QString &hex, int pixels = 480)
+    {
+        const QByteArray roh = QByteArray::fromHex(hex.toLatin1());
+        if (roh.isEmpty())
+            return QString();
+        return imageForBytes(roh, pixels);
+    }
+
+    /// Wie decodeAndRemove(), liefert aber die rohen Bytes als Hex.
+    ///
+    /// Ein BQP-Rumpf ist kein Text: `QString::fromUtf8` wuerde ihn zerstoeren.
+    /// Wer Schrift erwartet, macht aus dem Hex wieder Zeichen -- das steht in
+    /// der Oberflaeche, weil nur sie weiss, was sie gerade sucht.
+    Q_INVOKABLE QString decodeHexAndRemove(const QString &file)
+    {
+        QString path = file;
+        if (path.startsWith(QLatin1String("file://")))
+            path = path.mid(7);
+        const QByteArray roh = decodeBytes(path);
+        QFile::remove(path);
+        return QString::fromLatin1(roh.toHex());
+    }
+
     Q_INVOKABLE QString imageFor(const QString &text, int pixels = 480)
     {
-        const QByteArray utf8 = text.toUtf8();
+        return imageForBytes(text.toUtf8(), pixels);
+    }
+
+    QString imageForBytes(const QByteArray &utf8, int pixels)
+    {
         qr::Matrix matrix = qr::encode(std::string(utf8.constData(), utf8.size()));
         if (matrix.size == 0)
             return QString();
@@ -79,22 +114,7 @@ public:
     /// hurts.
     Q_INVOKABLE QString decode(const QString &file)
     {
-        QString path = file;
-        if (path.startsWith(QLatin1String("file://")))
-            path = path.mid(7);
-        QImage image(path);
-        if (image.isNull())
-            return QString();
-        const int widths[3] = { 1280, 800, 0 };
-        for (int i = 0; i < 3; ++i) {
-            QImage scaled = image;
-            if (widths[i] > 0 && image.width() > widths[i])
-                scaled = image.scaledToWidth(widths[i], Qt::SmoothTransformation);
-            const QString text = decodeImage(scaled);
-            if (!text.isEmpty())
-                return text;
-        }
-        return QString();
+        return QString::fromUtf8(decodeBytes(pfadVon(file)));
     }
 
     /// Wie decode(), raeumt die Datei danach aber weg. Der Sucher schiesst
@@ -102,11 +122,9 @@ public:
     /// Zwischenspeicher voll, und QML kann keine Datei loeschen.
     Q_INVOKABLE QString decodeAndRemove(const QString &file)
     {
-        const QString text = decode(file);
-        QString path = file;
-        if (path.startsWith(QLatin1String("file://")))
-            path = path.mid(7);
-        QFile::remove(path);
+        const QString pfad = pfadVon(file);
+        const QString text = QString::fromUtf8(decodeBytes(pfad));
+        QFile::remove(pfad);
         return text;
     }
 
@@ -114,28 +132,47 @@ public:
     // das zuletzt aufgenommene Foto.
     static QString decodeStatic(const QString &file)
     {
+        return QString::fromUtf8(decodeBytes(pfadVon(file)));
+    }
+
+    // Dasselbe in Rohbytes, als Hex -- fuer BQP, das keine Schrift im Code
+    // hat, sondern Bytes.
+    static QString decodeHexStatic(const QString &file)
+    {
+        return QString::fromLatin1(decodeBytes(pfadVon(file)).toHex());
+    }
+
+private:
+    static QString pfadVon(const QString &file)
+    {
         QString path = file;
         if (path.startsWith(QLatin1String("file://")))
             path = path.mid(7);
-        QImage image(path);
+        return path;
+    }
+
+    /// Liest die rohen Bytes des ersten Codes im Bild.
+    ///
+    /// Mehrere Groessen: ein formatfuellender Code will die erste Stufe, ein
+    /// kleiner im Bild die zweite, und bei einem unscharfen Foto helfen
+    /// weniger Bildpunkte mehr als mehr.
+    static QByteArray decodeBytes(const QString &pfad)
+    {
+        QImage image(pfad);
         if (image.isNull())
-            return QString();
-        // Gross, klein, im Original: ein formatfuellender Code will die
-        // erste Stufe, ein kleiner im Bild die zweite, und bei einem
-        // unscharfen Foto helfen weniger Bildpunkte mehr als mehr.
+            return QByteArray();
         const int widths[3] = { 1280, 1600, 800 };
         for (int i = 0; i < 3; ++i) {
             QImage scaled = image;
-            if (widths[i] > 0 && image.width() > widths[i])
+            if (image.width() > widths[i])
                 scaled = image.scaledToWidth(widths[i], Qt::SmoothTransformation);
-            const QString text = decodeImage(scaled);
-            if (!text.isEmpty())
-                return text;
+            const QByteArray roh = decodeImage(scaled);
+            if (!roh.isEmpty())
+                return roh;
         }
         return decodeImage(image);
     }
 
-private:
     static QString cacheDir()
     {
         // Both systems have a home directory; this port keeps its data in
@@ -148,13 +185,13 @@ private:
         return dir;
     }
 
-    static QString decodeImage(const QImage &source)
+    static QByteArray decodeImage(const QImage &source)
     {
         QImage grey = source.convertToFormat(QImage::Format_RGB32);
         struct quirc *q = quirc_new();
         if (!q)
-            return QString();
-        QString result;
+            return QByteArray();
+        QByteArray result;
         if (quirc_resize(q, grey.width(), grey.height()) >= 0) {
             uint8_t *buffer = quirc_begin(q, 0, 0);
             for (int y = 0; y < grey.height(); ++y) {
@@ -172,7 +209,7 @@ private:
                 struct quirc_data data;
                 quirc_extract(q, i, &code);
                 if (quirc_decode(&code, &data) == QUIRC_SUCCESS)
-                    result = QString::fromUtf8((const char *)data.payload, data.payload_len);
+                    result = QByteArray((const char *)data.payload, data.payload_len);
             }
         }
         quirc_destroy(q);

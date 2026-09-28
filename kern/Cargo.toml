@@ -1,6 +1,6 @@
 [package]
 name = "briarkern"
-version = "0.28.0"
+version = "0.30.0"
 edition = "2021"
 description = "Briar's Bramble protocols for MeeGo/Harmattan and Sailfish OS"
 

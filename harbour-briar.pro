@@ -15,6 +15,16 @@ HEADERS += src/imageprep.h src/qrcode.h src/qrencode.h src/quirc/quirc.h \
 # die MeeGo-Oberflaeche baut mit meego/briar.pro und sieht diese Datei nicht.
 PKGCONFIG += sailfishsecrets
 
+# Ortsunabhaengig binden und main() ausfuehrbar lassen.
+#
+# Das Icon startet die App nicht selbst: lipstick reicht sie an den Booster
+# weiter (invoker --type=silica-qt5), und der laedt die Binaerdatei per
+# dlopen. Das geht nur mit einer PIE. Bis 0.27.1 kam eine heraus, ab 0.28.0
+# -- dem Bau, in dem sailfishsecrets dazukam -- eine feste (ET_EXEC), und
+# seitdem sagte der Booster nur "Kann das Programm nicht dynamisch Laden".
+# Aus dem Terminal lief sie weiter, darum fiel es lange nicht auf.
+QMAKE_LFLAGS += -pie -rdynamic
+
 DISTFILES += \
     qml/harbour-briar.qml \
     qml/Briar.js \

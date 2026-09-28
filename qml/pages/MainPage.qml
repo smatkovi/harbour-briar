@@ -61,6 +61,19 @@ Page {
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
+            // Eine falsch gestellte Uhr bricht alles, ohne dass man es sieht:
+            // die Gegenseite verwirft unsere Nachrichten, quittiert sie aber
+            // vorher -- bei uns stehen sie dann als zugestellt da.
+            Label {
+                visible: !!app.status.clockWrong
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                x: Theme.horizontalPageMargin
+                text: app.tr("clockWrong")
+                wrapMode: Text.Wrap
+                color: Theme.errorColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
             // Contacts whose handshake has not run yet
             Repeater {
                 model: app.status.pending
@@ -152,6 +165,11 @@ Page {
                 text: app.tr("groups")
                 enabled: !!app.status.identity
                 onClicked: pageStack.push(Qt.resolvedUrl("GroupsPage.qml"))
+            }
+            MenuItem {
+                text: app.tr("meetAction")
+                enabled: !!app.status.identity
+                onClicked: pageStack.push(Qt.resolvedUrl("MeetPage.qml"))
             }
             MenuItem {
                 text: app.tr("scanQr")

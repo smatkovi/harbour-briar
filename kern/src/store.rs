@@ -120,10 +120,40 @@ pub struct Message {
     pub text: String,
     pub outgoing: bool,
     pub acked: bool,
+    /// Der erste Anhang -- bleibt fuer alles stehen, was nur einen kennt.
     #[serde(default)]
     pub attachment: Option<String>,
     #[serde(default)]
     pub attachment_type: Option<String>,
+    /// Alle Anhaenge dieser Nachricht, in der Reihenfolge, in der sie
+    /// genannt wurden.
+    ///
+    /// Briar laesst bis zu zehn Bilder an einer Nachricht zu
+    /// (MAX_ATTACHMENTS_PER_MESSAGE). Bis 0.29.2 wurde nur der erste behalten:
+    /// die weiteren kamen an, wurden quittiert -- und verschwanden, weil
+    /// niemand mehr auf sie zeigte. Fuer den Absender sah es aus, als seien
+    /// alle angekommen.
+    #[serde(default)]
+    pub anhaenge: Vec<Anhangskopf>,
+    /// Verschwindende Nachricht: wie lange sie nach dem Ankommen noch da
+    /// bleibt, in Millisekunden. Nichts heisst: sie bleibt.
+    #[serde(default)]
+    pub loesch_dauer: Option<u64>,
+    /// Der Zeitpunkt, an dem sie geht. Er steht erst fest, wenn die Uhr
+    /// laeuft: bei einer eigenen Nachricht mit der Bestaetigung der
+    /// Gegenseite, bei einer fremden mit dem Lesen. So haelt es Briar auch --
+    /// eine ungelesene Nachricht verschwindet nicht unter der Hand.
+    #[serde(default)]
+    pub loesch_frist: Option<u64>,
+}
+
+/// Ein Anhang, wie die Nachricht ihn nennt: seine Kennung und sein Typ. Die
+/// Bytes liegen daneben in einer Datei (siehe `Attachment`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Anhangskopf {
+    pub id: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 /// An attachment that has arrived or been sent: its bytes live in a file
@@ -150,6 +180,10 @@ pub struct OutMessage {
     /// "noch nicht gesendet" ausweisen.
     #[serde(default)]
     pub intern: bool,
+    /// Die Zuenddauer, die in dieser Nachricht steht -- gebraucht, um beim
+    /// Eintreffen der Bestaetigung die Uhr zu starten.
+    #[serde(default)]
+    pub loesch_dauer: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,9 +242,85 @@ pub struct Contact {
     /// unread, and that is what a notification is raised for.
     #[serde(default)]
     pub last_read: u64,
+    /// Verschwindende Nachrichten: die Dauer in Millisekunden, die jede neue
+    /// Nachricht an diesen Kontakt mitbekommt. -1 heisst aus.
+    ///
+    /// Die Dauer wird nicht ausgehandelt, sondern gespiegelt: sie faehrt in
+    /// jeder Nachricht mit, und wer eine mit anderer Dauer bekommt,
+    /// uebernimmt sie. So haben beide Seiten dieselbe Einstellung, ohne dass
+    /// es dafuer eigene Nachrichten braeuchte (AutoDeleteManagerImpl).
+    #[serde(default = "kein_timer")]
+    pub loesch_timer: i64,
+    /// Die vorige Dauer, solange die Aenderung noch in keiner Nachricht
+    /// draussen war. -2 heisst: keine offene Aenderung. Briar entscheidet
+    /// daran, wessen Aenderung gilt, wenn beide gleichzeitig umstellen.
+    #[serde(default = "keine_vorige")]
+    pub loesch_vorher: i64,
+    /// Der Zeitstempel der letzten Nachricht, die eine Dauer gemeldet hat.
+    /// Aeltere Meldungen zaehlen nicht mehr.
+    #[serde(default)]
+    pub loesch_stempel: u64,
+    /// Was die Gegenseite angesagt hat: Klientenkennung -> Nebenfassung.
+    /// Danach richtet sich, was ihr geschickt werden darf.
+    #[serde(default)]
+    pub fremde_fassungen: BTreeMap<String, u32>,
+    /// Die Nummer ihrer letzten Ansage -- eine aeltere zaehlt nicht mehr.
+    #[serde(default)]
+    pub fremde_ansage_nummer: u64,
 }
 
+/// -1: keine Zuenddauer -- dieselbe Zahl wie Briars NO_AUTO_DELETE_TIMER.
+pub fn kein_timer() -> i64 {
+    -1
+}
+
+/// -2: keine offene Aenderung (NO_PREVIOUS_TIMER).
+pub fn keine_vorige() -> i64 {
+    -2
+}
+
+/// Die Grenzen, die Briar an eine Zuenddauer legt: eine Minute bis ein Jahr.
+pub const MIN_LOESCHDAUER_MS: i64 = 60 * 1000;
+pub const MAX_LOESCHDAUER_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
 impl Contact {
+    /// Darf diese Gegenseite eine Zuenddauer bekommen?
+    ///
+    /// Ja -- ausser sie hat ausdruecklich weniger als Nebenfassung 3 angesagt.
+    /// Das ist der entscheidende Unterschied zu "hat 3 angesagt": wir selbst
+    /// sagen 3 an, also erwartet Briar die Dauer von uns. Bekommt es
+    /// stattdessen eine dreigliedrige Nachricht, liest es das als "keine
+    /// Dauer" und spiegelt sie zurueck -- dem Benutzer drueben werden seine
+    /// verschwindenden Nachrichten abgeschaltet, und zwar mit dem Hinweis,
+    /// wir haetten das getan.
+    ///
+    /// Eine leere Karte heisst nicht "kann es nicht", sondern "wir haben ihre
+    /// Ansage nie gesehen". Das ist der Normalfall fuer jeden Kontakt von vor
+    /// 0.29.0: Briar erneuert seine Ansage nur, wenn sich seine eigenen
+    /// Klienten aendern, nicht wegen unserer neuen Nebenfassung
+    /// (ClientVersioningManagerImpl.updateStatesFromRemoteStates sieht nur die
+    /// Hauptfassung). Die Karte bliebe also fuer immer leer.
+    ///
+    /// Gefaehrlich ist das nicht: Briars Pruefer nimmt drei ODER vier Glieder
+    /// an, gleich welche Fassung angesagt wurde (checkSize(body, 3, 4)), und
+    /// unsere eigenen aelteren Fassungen lesen das vierte Glied einfach nicht.
+    pub fn darf_zuenddauer_bekommen(&self) -> bool {
+        self.fremde_fassungen
+            .get(crate::sync::MESSAGING_CLIENT_ID)
+            .map(|neben| *neben >= 3)
+            .unwrap_or(true)
+    }
+
+    /// Hat die Gegenseite die Zuenddauer nachweislich angesagt oder benutzt?
+    /// Nur fuer die Anzeige -- daran haengt keine Entscheidung auf der
+    /// Leitung.
+    pub fn zuenddauer_bestaetigt(&self) -> bool {
+        self.fremde_fassungen
+            .get(crate::sync::MESSAGING_CLIENT_ID)
+            .map(|neben| *neben >= 3)
+            .unwrap_or(false)
+    }
+
     pub fn master_key_bytes(&self) -> SecretKey {
         key_from_hex(&self.master_key)
     }
@@ -470,7 +580,7 @@ pub struct State {
 }
 
 /// The newest layout this build knows.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 5;
 
 /// Transports are on unless switched off -- a state file written before a
 /// transport existed should not leave it disabled for ever.
@@ -730,6 +840,22 @@ impl Store {
                     } else {
                         Sitzungszustand::Start
                     };
+                }
+            }
+        }
+        // Fassung 4 kannte je Nachricht nur einen Anhang. Den einen in die
+        // Liste heben, damit von hier an alles ueber sie laeuft.
+        if store.state.state_version < 5 {
+            for contact in store.state.contacts.iter_mut() {
+                for m in contact.messages.iter_mut() {
+                    if m.anhaenge.is_empty() {
+                        if let Some(id) = m.attachment.clone() {
+                            m.anhaenge.push(Anhangskopf {
+                                id,
+                                content_type: m.attachment_type.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1060,7 +1186,7 @@ mod wanderung_tests {
         let roh = std::fs::read_to_string(&p).unwrap();
         assert!(!roh.contains("einladung_previous"), "{}", roh);
         assert!(
-            roh.replace(' ', "").contains("\"state_version\":3"),
+            roh.replace(' ', "").contains("\"state_version\":5"),
             "{}",
             roh
         );
@@ -1272,6 +1398,167 @@ mod wechsel_tests {
         }
         let roh = std::fs::read(&p).unwrap();
         assert!(!crate::tresor::ist_verschluesselt(&roh));
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod aufmachen_tests {
+    use super::*;
+
+    /// Eine Datei, wie 0.28.0 sie geschrieben hat: verschluesselt, Fassung 3,
+    /// und ohne jedes Feld, das 0.29.0 dazugelegt hat. Sie MUSS sich mit dem
+    /// richtigen Passwort oeffnen lassen.
+    ///
+    /// Das ist keine Formalie: der Entsperrweg meldet jeden Fehler beim
+    /// Oeffnen als "falsches Passwort" -- ein Lesefehler saehe fuer den
+    /// Benutzer also aus wie ein vergessenes Passwort, und der naechste
+    /// Schritt waere, das Konto zu loeschen.
+    #[test]
+    fn eine_datei_von_0_28_geht_auf() {
+        let alt = r#"{
+            "identity": {
+                "name": "Ich",
+                "signature_seed": "11",
+                "signature_public": "22",
+                "author_id": "33",
+                "handshake_private": "44",
+                "handshake_public": "55"
+            },
+            "listen_port": 7327,
+            "bluetooth": true,
+            "tor": true,
+            "tor_key": null,
+            "tor_onion": "abc",
+            "lan_recent": ["192.168.1.5:7327"],
+            "lan_published": "192.168.1.5:7327",
+            "lan6_recent": [],
+            "bt_uuid": "0000-1111",
+            "pending": [],
+            "contacts": [{
+                "id": 1,
+                "name": "Gegenueber",
+                "author_id": "aa",
+                "signature_public": "bb",
+                "handshake_public": "cc",
+                "master_key": "dd",
+                "alice": true,
+                "creation_period": 3,
+                "transports": {},
+                "messages": [{
+                    "id": "m1",
+                    "timestamp": 1000,
+                    "text": "hallo",
+                    "outgoing": true,
+                    "acked": true,
+                    "attachment": null,
+                    "attachment_type": null
+                }],
+                "outbox": [{
+                    "id": "m2",
+                    "group": "gg",
+                    "timestamp": 1001,
+                    "body": "00",
+                    "acked": false,
+                    "intern": false
+                }],
+                "to_ack": [],
+                "to_request": [],
+                "last_seen": 900,
+                "versioning_sent": "abcd",
+                "versioning_version": 2,
+                "sent_properties": "x",
+                "props_sent_version": 1,
+                "last_read": 500
+            }],
+            "groups": [],
+            "verlassene_einladungen": {},
+            "sperre_nach_minuten": 0,
+            "attachments": {},
+            "next_contact_id": 2,
+            "revision": 42,
+            "state_version": 3
+        }"#;
+
+        let mut p = std::env::temp_dir();
+        p.push("briar-aufmachen-0-28.json");
+        let _ = std::fs::remove_file(&p);
+        let siegel = crate::tresor::Siegel::frisch("geheim").expect("Siegel");
+        std::fs::write(&p, siegel.verschluesseln(alt.as_bytes())).unwrap();
+
+        let store = Store::open_mit_passwort(&p, 7327, "geheim");
+        let store = match store {
+            Ok(s) => s,
+            Err(e) => panic!("0.28-Datei laesst sich nicht oeffnen: {}", e),
+        };
+        assert_eq!(store.state.contacts.len(), 1);
+        assert_eq!(store.state.contacts[0].messages.len(), 1);
+        assert_eq!(store.state.contacts[0].loesch_timer, kein_timer());
+        assert_eq!(store.state.contacts[0].loesch_vorher, keine_vorige());
+        assert!(store.state.contacts[0].fremde_fassungen.is_empty());
+        assert_eq!(store.state.state_version, STATE_VERSION);
+        // Und ein falsches Passwort muss weiterhin scheitern.
+        assert!(Store::open_mit_passwort(&p, 7327, "falsch").is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod anhangs_tests {
+    use super::*;
+
+    /// Eine Datei aus 0.29.2 kannte je Nachricht nur einen Anhang. Er muss
+    /// beim Oeffnen in die Liste wandern, sonst zeigt die Oberflaeche nach
+    /// dem Aufruesten gar keinen mehr.
+    #[test]
+    fn der_einzelne_anhang_wandert_in_die_liste() {
+        let alt = r#"{
+            "identity": null,
+            "listen_port": 7327,
+            "contacts": [{
+                "id": 1,
+                "name": "Gegenueber",
+                "author_id": "aa",
+                "signature_public": "bb",
+                "handshake_public": null,
+                "master_key": "dd",
+                "alice": true,
+                "creation_period": 0,
+                "messages": [
+                    {
+                        "id": "m1", "timestamp": 1, "text": "Bild",
+                        "outgoing": false, "acked": true,
+                        "attachment": "a1", "attachment_type": "image/jpeg"
+                    },
+                    {
+                        "id": "m2", "timestamp": 2, "text": "ohne",
+                        "outgoing": false, "acked": true,
+                        "attachment": null, "attachment_type": null
+                    }
+                ],
+                "last_seen": 0
+            }],
+            "state_version": 4
+        }"#;
+        let mut p = std::env::temp_dir();
+        p.push("briar-anhangswanderung.json");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, alt).unwrap();
+
+        let store = Store::open(&p, 7327).unwrap();
+        let m = &store.state.contacts[0].messages;
+        assert_eq!(
+            m[0].anhaenge,
+            vec![Anhangskopf {
+                id: "a1".to_string(),
+                content_type: Some("image/jpeg".to_string()),
+            }]
+        );
+        assert!(m[1].anhaenge.is_empty(), "ohne Anhang bleibt leer");
+        // Der alte Platz bleibt gefuellt -- alles, was nur einen kennt,
+        // findet ihn weiterhin.
+        assert_eq!(m[0].attachment.as_deref(), Some("a1"));
+        assert_eq!(store.state.state_version, STATE_VERSION);
         let _ = std::fs::remove_file(&p);
     }
 }

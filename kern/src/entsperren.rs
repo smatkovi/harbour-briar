@@ -69,14 +69,20 @@ fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Stor
         match passwort {
             Some(pw) => match Store::open_mit_passwort(pfad, default_port, &pw) {
                 Ok(s) => (200, "{\"ok\":true}".to_string(), Some(s)),
-                // Absichtlich ohne Unterscheidung nach aussen, ob das
-                // Passwort falsch oder die Datei kaputt ist -- der Grund
-                // steht im Protokoll, nicht in der Antwort.
-                Err(_) => (
-                    403,
-                    "{\"error\":\"falsches Passwort\"}".to_string(),
-                    None,
-                ),
+                // Nach aussen absichtlich ohne Unterscheidung, ob das
+                // Passwort falsch oder die Datei kaputt ist. Ins Protokoll
+                // gehoert der Grund aber sehr wohl: stand er nirgends, sah
+                // ein Lesefehler fuer den Benutzer aus wie ein vergessenes
+                // Passwort -- und der naechste Schritt waere gewesen, das
+                // Konto zu loeschen. Genau das ist einmal passiert.
+                Err(e) => {
+                    crate::net::log(&format!("Entsperren gescheitert: {}", e));
+                    (
+                        403,
+                        "{\"error\":\"falsches Passwort\"}".to_string(),
+                        None,
+                    )
+                }
             },
             None => (
                 400,

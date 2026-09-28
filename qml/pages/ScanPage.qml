@@ -65,10 +65,19 @@ Page {
 
     // Ein frisches Bild ist da: lesen, wegraeumen, entscheiden.
     function lesen(pfad) {
-        var text = QrCode.decodeAndRemove(pfad)
+        var hex = QrCode.decodeHexAndRemove(pfad)
         page.busy = false
-        if (!text)
+        if (!hex)
             return
+        // Ein Code zum persoenlichen Treffen (BQP) steckt voller Bytes, kein
+        // Link. Dafuer gibt es eine eigene Seite -- also dorthin, samt dem
+        // schon gelesenen Code, damit niemand zweimal zielen muss.
+        if (Briar.istBqp(hex)) {
+            page.message = app.tr("scanIsMeetCode")
+            pageStack.replace(Qt.resolvedUrl("MeetPage.qml"), { "gescannt": hex })
+            return
+        }
+        var text = Briar.hexZuText(hex)
         var found = Briar.qrParse(text)
         if (!found || !found.link) {
             // Ein Code, aber keiner von Briar -- weiterschauen statt

@@ -71,7 +71,16 @@ Page {
             return
         }
         seite.meldung = fenster.tr("scanning")
-        var text = kamera.letztenCodeLesen()
+        // Erst die rohen Bytes: ein Code zum persoenlichen Treffen (BQP)
+        // enthaelt keine Schrift. Dafuer gibt es eine eigene Seite.
+        var hex = kamera.letztenCodeAlsHex()
+        if (Briar.istBqp(hex)) {
+            seite.meldung = fenster.tr("scanIsMeetCode")
+            pageStack.pop()
+            pageStack.push(Qt.resolvedUrl("MeetPage.qml"), { "gescannt": hex })
+            return
+        }
+        var text = Briar.hexZuText(hex)
         if (!text || !seite.uebernehmen(text))
             seite.meldung = fenster.tr("scanNothing")
     }

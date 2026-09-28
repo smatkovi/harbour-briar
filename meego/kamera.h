@@ -147,6 +147,15 @@ public:
         return QrCode::decodeStatic(foto.absoluteFilePath());
     }
 
+    // Dasselbe, aber als Hex der rohen Bytes: ein BQP-Code -- Briars
+    // Verfahren fuer zwei Geraete nebeneinander -- enthaelt keine Schrift.
+    Q_INVOKABLE QString letztenCodeAlsHex() const
+    {
+        const QFileInfo foto = letztesFoto();
+        if (!foto.exists()) return QString();
+        return QrCode::decodeHexStatic(foto.absoluteFilePath());
+    }
+
 signals:
     // MeeScan hat etwas gelesen.
     void meeScanErkannt(const QString &text);

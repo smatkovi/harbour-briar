@@ -9,11 +9,18 @@ Page {
     property int kontakt: 0
     property string name: ""
     property variant nachrichten: []
+    // Verschwindende Nachrichten: die Dauer in Millisekunden, -1 heisst aus.
+    property int zuenddauer: -1
+    property bool zuendbereit: false
 
     function neuLaden() {
         Briar.messages(kontakt, function(antwort) {
-            if (!antwort.error)
+            if (!antwort.error) {
                 seite.nachrichten = antwort.messages
+                seite.zuenddauer = antwort.autoDelete !== undefined
+                        ? antwort.autoDelete : -1
+                seite.zuendbereit = !!antwort.autoDeleteReady
+            }
         })
     }
 
@@ -76,9 +83,44 @@ Page {
         id: gespraechsMenue
         MenuLayout {
             MenuItem {
+                text: fenster.tr("autoDelete") + ": "
+                      + Briar.autoDeleteName(seite.zuenddauer, fenster.tr)
+                onClicked: zuendauswahl.open()
+            }
+            MenuItem {
                 text: fenster.tr("deleteAllMessages")
                 onClicked: alleLoeschen.open()
             }
+        }
+    }
+
+    // Wie lange eine neue Nachricht in diesem Gespraech stehen bleibt. Die
+    // Einstellung gilt fuer beide Seiten -- sie faehrt in der naechsten
+    // Nachricht mit.
+    SelectionDialog {
+        id: zuendauswahl
+        titleText: fenster.tr("autoDelete")
+        model: ListModel {
+            ListElement { name: "Aus"; dauer: -1 }
+            ListElement { name: "1"; dauer: 60000 }
+            ListElement { name: "2"; dauer: 3600000 }
+            ListElement { name: "3"; dauer: 86400000 }
+            ListElement { name: "4"; dauer: 604800000 }
+        }
+        Component.onCompleted: {
+            // Die Namen erst hier, damit sie aus den Sprachtexten kommen.
+            model.setProperty(0, "name", fenster.tr("autoDeleteOff"))
+            model.setProperty(1, "name", fenster.tr("autoDelete1Min"))
+            model.setProperty(2, "name", fenster.tr("autoDelete1Hour"))
+            model.setProperty(3, "name", fenster.tr("autoDelete1Day"))
+            model.setProperty(4, "name", fenster.tr("autoDelete1Week"))
+        }
+        onAccepted: {
+            var dauer = model.get(selectedIndex).dauer
+            Briar.setAutoDelete(seite.kontakt, dauer, function(antwort) {
+                if (!antwort.error)
+                    seite.zuenddauer = dauer
+            })
         }
     }
 
@@ -142,13 +184,12 @@ Page {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: {
-                            if (modelData.attachmentPath !== undefined
-                                    && modelData.attachmentPath !== null)
+                            var liste = Briar.attachmentsOf(modelData)
+                            if (liste.length > 0 && liste[0].path)
                                 pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
-                                    "pfad": modelData.attachmentPath,
-                                    "typ": "" + modelData.attachmentType,
-                                    "groesse": modelData.attachmentSize
-                                               ? modelData.attachmentSize : 0
+                                    "pfad": liste[0].path,
+                                    "typ": "" + liste[0].type,
+                                    "groesse": liste[0].size ? liste[0].size : 0
                                 })
                         }
                         // Halten loescht sie -- nur hier, die Gegenseite
@@ -159,27 +200,46 @@ Page {
                         }
                     }
 
-                    Image {
-                        id: bild
-                        visible: modelData.attachmentPath !== undefined
-                                 && modelData.attachmentPath !== null
-                                 && ("" + modelData.attachmentType).indexOf("image/") === 0
-                        source: visible ? "file://" + modelData.attachmentPath : ""
-                        width: visible ? Math.min(sourceSize.width, liste.width * 0.62) : 0
-                        height: visible ? width * (sourceSize.height / Math.max(1, sourceSize.width)) : 0
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                    }
+                    // Alle Anhaenge, nicht nur der erste: Briar haengt bis zu
+                    // zehn Bilder an eine Nachricht.
+                    Repeater {
+                        model: Briar.attachmentsOf(modelData)
 
-                    Text {
-                        id: anhang
-                        visible: modelData.attachmentPath !== undefined
-                                 && modelData.attachmentPath !== null && !bild.visible
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        color: "#95d220"
-                        font.pixelSize: 20
-                        text: fenster.tr("attach") + ": " + ("" + modelData.attachmentType)
+                        Item {
+                            width: parent.width
+                            height: einzelbild.visible ? einzelbild.height : einzeltext.height
+
+                            Image {
+                                id: einzelbild
+                                visible: Briar.isImage(modelData) && !!modelData.path
+                                source: visible ? "file://" + modelData.path : ""
+                                width: visible ? Math.min(sourceSize.width, liste.width * 0.62) : 0
+                                height: visible ? width * (sourceSize.height / Math.max(1, sourceSize.width)) : 0
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+
+                            Text {
+                                id: einzeltext
+                                visible: !einzelbild.visible
+                                width: parent.width
+                                wrapMode: Text.Wrap
+                                color: "#95d220"
+                                font.pixelSize: 20
+                                text: fenster.tr("attach") + ": " + ("" + modelData.type)
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: !!modelData.path
+                                onClicked: pageStack.push(
+                                    Qt.resolvedUrl("AttachmentPage.qml"), {
+                                        "pfad": modelData.path,
+                                        "typ": "" + modelData.type,
+                                        "groesse": modelData.size ? modelData.size : 0
+                                    })
+                            }
+                        }
                     }
 
                     Text {

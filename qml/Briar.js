@@ -289,3 +289,78 @@ function sendToGroup(group, text, callback) {
 function removeGroup(group, callback) {
     request("POST", "/group/remove", { group: group }, callback)
 }
+
+// BQP -- zwei Geraete nebeneinander. Briar nennt es "Kontakt in der Naehe
+// hinzufuegen": jedes Geraet zeigt einen Code und liest den des anderen,
+// danach steht der Kontakt, ohne dass ein Link durch fremde Haende geht.
+function bqpStart(callback) {
+    request("POST", "/bqp/start", {}, callback)
+}
+
+function bqpScan(payloadHex, callback) {
+    request("POST", "/bqp/scan", { payload: payloadHex }, callback)
+}
+
+function bqpStop(callback) {
+    request("POST", "/bqp/stop", {}, callback)
+}
+
+// Ein gelesener Code, als Hex. Das erste Byte sagt, was es ist: 0x04 ist ein
+// BQP-Rumpf (Briars Fassung 4), alles andere ist Schrift -- unser Link.
+function istBqp(hex) {
+    return !!hex && hex.length > 2 && hex.substring(0, 2) === "04"
+}
+
+// Hex zu Schrift. Der Leser gibt immer Bytes zurueck; wer Schrift erwartet,
+// setzt sie hier zusammen. Mehr als ASCII steht in unseren Links nicht.
+function hexZuText(hex) {
+    if (!hex)
+        return ""
+    var text = ""
+    for (var i = 0; i + 1 < hex.length; i += 2) {
+        var b = parseInt(hex.substring(i, i + 2), 16)
+        if (isNaN(b) || b === 0)
+            return text
+        text += String.fromCharCode(b)
+    }
+    return text
+}
+
+// Verschwindende Nachrichten: die Dauer in Millisekunden, -1 schaltet sie ab.
+// Sie geht nicht als eigene Nachricht hinaus, sondern faehrt in der naechsten
+// Nachricht mit -- so macht es Briar auch.
+function setAutoDelete(contact, timer, callback) {
+    request("POST", "/autodelete", { contact: contact, timer: timer }, callback)
+}
+
+// Die Dauer als Wort. Nur die vier Stufen, die die Oberflaeche anbietet --
+// alles andere kaeme von der Gegenseite und wird in Minuten gezeigt.
+function autoDeleteName(ms, tr) {
+    if (!ms || ms < 0)
+        return tr("autoDeleteOff")
+    if (ms === 60000) return tr("autoDelete1Min")
+    if (ms === 3600000) return tr("autoDelete1Hour")
+    if (ms === 86400000) return tr("autoDelete1Day")
+    if (ms === 604800000) return tr("autoDelete1Week")
+    return Math.round(ms / 60000) + " min"
+}
+
+// Die Anhaenge einer Nachricht als Liste -- gleich, ob der Dienst schon die
+// neue Liste liefert oder nur die vier alten Einzelfelder. Briar haengt bis
+// zu zehn Bilder an eine Nachricht; bis 0.29.2 kam davon nur das erste an.
+function attachmentsOf(message) {
+    if (!message)
+        return []
+    if (message.attachments && message.attachments.length > 0)
+        return message.attachments
+    if (message.attachmentPath)
+        return [{ "id": message.attachment,
+                  "type": message.attachmentType,
+                  "path": message.attachmentPath,
+                  "size": message.attachmentSize }]
+    return []
+}
+
+function isImage(anhang) {
+    return !!anhang && ("" + anhang.type).indexOf("image/") === 0
+}

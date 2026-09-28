@@ -39,6 +39,31 @@ const MAX_CLOCK_DIFFERENCE: u64 = 24 * 60 * 60 * 1000;
 // der schlimmste Fall von fuenf vollen Wartezeiten auf wenige Sekunden.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Die Lesefrist beim Treffen nebeneinander (BQP). Sie ist laenger als die
+/// gewoehnliche, und zwar aus einem Grund, der nichts mit dem Netz zu tun hat:
+/// beide Seiten muessen den Code der anderen scannen, und wer zuerst fertig
+/// ist, waehlt sofort an und wartet dann auf einen Menschen. Briar gibt dafuer
+/// eine Minute (KeyAgreementConstants.CONNECTION_TIMEOUT = 60_000, und der
+/// Socket haelt mit 2 * MAX_IDLE_TIME ebenso lange). Mit den 30 Sekunden der
+/// gewoehnlichen Frist brach die erste Seite genau dann ab, wenn die zweite
+/// sich normal viel Zeit liess -- und der zerfallene Socket riss den zweiten
+/// Weg gleich mit, weil Briars ConnectionChooser ihn trotzdem waehlt.
+const BQP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Die frueheste Uhrzeit, die Briar noch fuer echt haelt: 1. Januar 2021
+/// (bramble-api Clock.MIN_REASONABLE_TIME_MS). Steht die Uhr davor, weigert
+/// sich Briar, einen Kontakt anzulegen -- es wirft beim Austausch eine
+/// FormatException und laesst den schwebenden Eintrag stehen.
+///
+/// Das muss diese Seite genauso halten, sonst laeuft es auseinander: wir
+/// legten den Kontakt an und raeumten den Treffpunkt ab, drueben entstand
+/// nichts und es wurde weiter auf genau diesen Treffpunkt gewartet. Danach
+/// waehlen wir mit Schluesseln, die die Gegenseite nicht hat, und sie waehlt
+/// eine Zwiebeladresse, die es nicht mehr gibt -- beide Seiten schweigen.
+///
+/// N9 und N950 haben keine Netzzeit; eine leere Pufferbatterie setzt sie auf
+/// 1970 zurueck. Die falsche Uhr ist also immer unsere.
+pub const MIN_VERNUENFTIGE_ZEIT_MS: u64 = 1_609_459_200_000;
 /// Wie lange auf das naechste Byte der Gegenseite gewartet wird, wenn wir schon
 /// alles geschrieben haben. Briar beendet seinen Strom nicht von selbst -- dass
 /// nichts mehr kommt, zeigt sich nur an der Ruhe. Kurz genug, dass eine Runde
@@ -644,6 +669,7 @@ fn versionsansage_einreihen(contact: &mut crate::store::Contact, our_author: &Se
             body: to_hex(&rumpf),
             acked: false,
             intern: true,
+            loesch_dauer: None,
         });
     }
     // Eingereiht ist die Zusage: ab hier haelt der Korb die Ansage fest, bis
@@ -1112,20 +1138,26 @@ impl Node {
                 .find(|p| p.public_key == schwebend)
                 .ok_or_else(|| bad("pending contact vanished"))?;
             let zustand = pending.transport_mut(transport_id);
-            // Nicht ueber das Fenster hinaus zaehlen. Eine Gegenstelle mit
-            // einer Fassung bis 0.26.0 hat ihren Fusspunkt fest auf 0 und
-            // erkennt darum nur 0..31; ihr Fenster laeuft nicht mit. Der
-            // Taktgeber waehlt einen Treffpunkt jede Minute an, wir waeren
-            // also nach einer halben Stunde darueber -- und dann ist der
-            // Handschlag mit den eigenen drei Geraeten nicht mehr moeglich,
-            // bis der Abschnitt wechselt. Briars Fenster schiebt mit, dort
-            // darf die Nummer beliebig steigen; nur duerfen wir das nicht
-            // voraussetzen, solange nebenan noch 0.26 laeuft.
+            // Ohne Deckel. Bis 0.29.1 stand hier `.min(WINDOW - 1)`, aus
+            // Ruecksicht auf eigene Fassungen bis 0.26.0: die hatten ihren
+            // Fusspunkt fest auf 0 und erkannten nur 0..31.
             //
-            // 32 verschiedene Marken je Abschnitt statt einer einzigen sind
-            // der Gewinn; die letzte wird dann wiederholt, und das ist genau
-            // das, was 0.26.0 immer tat.
-            let nummer = naechste_stromnummer(zustand, period).min(WINDOW - 1);
+            // Gegen ein echtes Briar war das genau verkehrt herum. Briars
+            // Fenster schiebt mit (ReorderingWindow.setSeen), und die
+            // erkannte Marke wird verbraucht -- `inContexts.remove(...)` in
+            // TransportKeyManagerImpl. Nach 32 Handschlagstroemen an denselben
+            // Wartenden steht Briars Fenster auf 32..63; unsere immer gleiche
+            // 31 liegt darunter und ist dort laengst gestrichen. Briar legt
+            // die Verbindung ohne ein einziges Byte Antwort weg, und zwar
+            // still. Ein Abschnitt dauert gut einen Tag, der Taktgeber waehlt
+            // jede Minute an: ein Handschlag, der ein paarmal scheitert, war
+            // danach bis zum Abschnittswechsel tot, obwohl beide Seiten
+            // weiterprobierten.
+            //
+            // Die Ruecksicht wiegt das nicht auf. 0.26.0 ist ein halbes Jahr
+            // alt und laeuft auf keinem der drei Geraete mehr; ein echtes
+            // Briar ist der haeufigere Fall.
+            let nummer = naechste_stromnummer(zustand, period);
             stromnummer_vormerken(zustand, period, nummer);
             nummer
         };
@@ -1435,6 +1467,14 @@ impl Node {
             return Err(bad("the contact's signature did not verify"));
         }
         let timestamp = local_timestamp.min(remote.timestamp);
+        if timestamp < MIN_VERNUENFTIGE_ZEIT_MS {
+            // Genau Briars Pruefung (ContactExchangeManagerImpl: "Timestamp is
+            // too old" -> FormatException). Lieber kein Kontakt als ein
+            // Kontakt, den nur eine Seite hat.
+            return Err(bad(
+                "die Uhr eines der beiden Geraete steht vor 2021 -- erst die Zeit stellen",
+            ));
+        }
         let mut addresses = addresses_from_properties(&remote.properties, peer_ip.as_deref());
         if let Some(address) = pending_bluetooth {
             addresses
@@ -1449,13 +1489,29 @@ impl Node {
         // list twice. The old entry keeps its master key and its history, and
         // only learns any address it did not know yet -- and because both
         // sides do this, both keep the same key.
+        //
+        // Erkannt wird an zwei Merkmalen, nicht nur an einem. Der
+        // Handschlagschluessel allein reicht nicht: beim Treffen nebeneinander
+        // (BQP) wird gar keiner ausgetauscht (`handshake_public: None`). Wer
+        // erst den Link eingetragen hat und dann, weil das Rendezvous ueber
+        // Tor dauert, den Code scannt, stand hinterher zweimal in der Liste --
+        // und die zweite Zeile trug einen Hauptschluessel, den drueben niemand
+        // kennt, also fiel jede Marke daraus wortlos durch. Briar prueft an
+        // dieser Stelle die Autorenkennung und wirft eine
+        // ContactExistsException (DatabaseComponentImpl), macht die Anlage
+        // also rueckgaengig. Wir machen dasselbe, nur ohne Ausnahme: der
+        // bestehende Eintrag bleibt und lernt dazu.
+        let author_id_hex = to_hex(&author_id);
         {
             let mut store = self.store.lock().unwrap();
             let known = store
                 .state
                 .contacts
                 .iter()
-                .position(|c| c.handshake_public.as_deref() == Some(their_public_hex.as_str()));
+                .position(|c| {
+                    c.handshake_public.as_deref() == Some(their_public_hex.as_str())
+                        || c.author_id == author_id_hex
+                });
             if let Some(index) = known {
                 let contact = &mut store.state.contacts[index];
                 let id = contact.id;
@@ -1469,6 +1525,13 @@ impl Node {
                             in_stream: BTreeMap::new(),
                             ..Default::default()
                         });
+                }
+                // Stand der Eintrag bisher ohne Handschlagschluessel da --
+                // beim Treffen nebeneinander gibt es keinen --, lernt er ihn
+                // jetzt. Sonst faende ihn der naechste Handschlag wieder nur
+                // ueber die Autorenkennung.
+                if contact.handshake_public.is_none() {
+                    contact.handshake_public = Some(their_public_hex.clone());
                 }
                 contact.last_seen = now_ms();
                 store
@@ -1559,6 +1622,11 @@ impl Node {
                 sent_properties: None,
                 props_sent_version: 0,
                 last_read: 0,
+                loesch_timer: crate::store::kein_timer(),
+                loesch_vorher: crate::store::keine_vorige(),
+                loesch_stempel: 0,
+                fremde_fassungen: Default::default(),
+                fremde_ansage_nummer: 0,
             });
             store
                 .state
@@ -1837,6 +1905,7 @@ impl Node {
                             body: to_hex(&body),
                             acked: false,
                             intern: true,
+                            loesch_dauer: None,
                         },
                     );
                 }
@@ -2027,9 +2096,14 @@ impl Node {
                         message.acked = true;
                     }
                 }
+                let jetzt = now_ms();
                 for message in contact.messages.iter_mut() {
                     if message.outgoing && peer_acked.contains(&message.id) {
                         message.acked = true;
+                        // Angekommen heisst: die Uhr einer verschwindenden
+                        // Nachricht laeuft ab jetzt. Vorher waere sie hier
+                        // verschwunden und drueben liegengeblieben.
+                        loeschuhr_starten(message, jetzt);
                     }
                 }
                 // Acknowledged means delivered, and the queue has done its
@@ -2278,6 +2352,29 @@ impl Node {
             return false;
         }
 
+        if *group == sync::versioning_group_id(&our_author, &their_author) {
+            // Was die Gegenseite kann. Briar merkt es sich und fragt vor dem
+            // Senden nach; ohne das waere jede Neuerung ein Blindflug.
+            if let Some((nummer, klienten)) = sync::parse_versioning_update(body) {
+                if let Some(contact) = store.contact_mut(contact_id) {
+                    let nummer = nummer.max(0) as u64;
+                    // Strikt die hoehere Ansage gewinnt -- wie bei den
+                    // Adressen. Eine verspaetet eintreffende alte darf eine
+                    // neuere nicht ueberschreiben.
+                    if nummer != 0 && nummer <= contact.fremde_ansage_nummer {
+                        return true;
+                    }
+                    if nummer != 0 {
+                        contact.fremde_ansage_nummer = nummer;
+                    }
+                    contact.fremde_fassungen =
+                        klienten.into_iter().map(|(id, _, neben)| (id, neben)).collect();
+                }
+                return true;
+            }
+            return false;
+        }
+
         if *group == sync::messaging_group_id(&our_author, &their_author) {
             // An attachment arrives as a message of its own, possibly before
             // or after the message that refers to it.
@@ -2291,6 +2388,11 @@ impl Node {
                                 for message in contact.messages.iter_mut() {
                                     if message.attachment.as_deref() == Some(hex.as_str()) {
                                         message.attachment_type = Some(kind.clone());
+                                    }
+                                    for kopf in message.anhaenge.iter_mut() {
+                                        if kopf.id == hex {
+                                            kopf.content_type = Some(kind.clone());
+                                        }
                                     }
                                 }
                             }
@@ -2308,6 +2410,16 @@ impl Node {
             }
             if let Some(text) = sync::private_message_text(body) {
                 let attachments = sync::private_message_attachments(body);
+                // Alle, nicht nur den ersten. Briar haengt bis zu zehn Bilder
+                // an eine Nachricht; die weiteren kamen an, wurden quittiert
+                // und lagen danach unerreichbar herum.
+                let anhaenge: Vec<crate::store::Anhangskopf> = attachments
+                    .iter()
+                    .map(|(id, content_type)| crate::store::Anhangskopf {
+                        id: to_hex(id),
+                        content_type: Some(content_type.clone()),
+                    })
+                    .collect();
                 let (attachment, attachment_type) = match attachments.first() {
                     Some((id, content_type)) => {
                         (Some(to_hex(id)), Some(content_type.clone()))
@@ -2322,6 +2434,31 @@ impl Node {
                 } else {
                     text.clone()
                 };
+                // Verschwindende Nachricht: die Dauer steht in der Nachricht
+                // selbst. Sie gilt fuer diese Nachricht und wird ausserdem
+                // gespiegelt -- ab jetzt tragen auch unsere eigenen sie.
+                let dauer = sync::private_message_timer(body);
+                // Nur eine Nachricht, die das Glied ueberhaupt traegt, stellt
+                // die Einstellung um. Eine dreigliedrige sagt nichts ueber die
+                // Zuenddauer -- sie als "aus" zu lesen, wuerde die Einstellung
+                // bei jeder Nachricht einer aelteren Gegenseite loeschen.
+                if sync::hat_zuenddauer_glied(body) {
+                    // Und sie ist zugleich der Beweis, dass die Gegenseite die
+                    // Form beherrscht -- besser als jede Ansage, denn sie
+                    // benutzt sie gerade. Briar schickt seine Klientenansage
+                    // nicht noch einmal, nur weil wir eine hoehere
+                    // Nebenfassung melden; ohne diesen Eintrag bliebe die
+                    // Anzeige fuer alle aelteren Kontakte fuer immer bei
+                    // "meldet die Fassung nicht".
+                    if let Some(c) = store.contact_mut(contact_id) {
+                        let eintrag = c
+                            .fremde_fassungen
+                            .entry(sync::MESSAGING_CLIENT_ID.to_string())
+                            .or_insert(3);
+                        *eintrag = (*eintrag).max(3);
+                    }
+                    loeschdauer_empfangen(store, contact_id, dauer, timestamp);
+                }
                 let stored = store.add_message(
                     contact_id,
                     Message {
@@ -2332,6 +2469,9 @@ impl Node {
                         acked: false,
                         attachment,
                         attachment_type,
+                        anhaenge,
+                        loesch_dauer: dauer,
+                        loesch_frist: None,
                     },
                 );
                 if stored {
@@ -2577,6 +2717,86 @@ impl Node {
         }
     }
 
+    /// Einem Mitglied sagen, dass wir auch in der Gruppe sind -- Briars
+    /// PEER-Rolle (PeerProtocolEngine, onMemberAddedAction).
+    ///
+    /// Gebraucht wird das fuer jedes Mitglied, das weder uns eingeladen hat noch
+    /// von uns eingeladen wurde: zwei Leute, die derselben Gruppe angehoeren und
+    /// einander als Kontakt haben, ohne dass einer den anderen geholt hat. Fuer
+    /// ein echtes Briar ist die Gruppe zwischen solchen zweien unsichtbar,
+    /// solange nicht beide dort ein JOIN geschickt haben -- und was in einer
+    /// unsichtbaren Gruppe ankommt, wird verworfen und nicht quittiert.
+    /// Zwischen unseren eigenen Geraeten fiel das nie auf, weil dort niemand
+    /// Sichtbarkeit prueft.
+    ///
+    /// Geschickt wird es einmal: danach steht die Sitzung auf Beigetreten.
+    fn peer_join_schicken(&self, store: &mut Store, contact_id: u32, group_hex: &str) {
+        use crate::store::Sitzungszustand;
+        let (unsere, ihre) = match (store.identity(), store.contact(contact_id)) {
+            (Some(i), Some(c)) => (key_from_hex(&i.author_id), c.author_id_bytes()),
+            _ => return,
+        };
+        let (schon, anker, sind_wir_erstellerin, eingeladen_von) = match store.group(group_hex) {
+            Some(g) => {
+                let s = g.einladungen.get(&contact_id);
+                (
+                    // "Schon geschickt" heisst: es liegt eine eigene Nachricht
+                    // in dieser Sitzung. Am Zustand laesst sich das nicht
+                    // ablesen -- er steht auf "beigetreten", sobald IHR JOIN
+                    // eingetragen ist, also auch dann, wenn wir selbst noch
+                    // nichts gesagt haben. Genau daran scheiterte die Antwort
+                    // auf ein PEER-JOIN von Briar: der Zustand war gesetzt,
+                    // der Riegel fiel, und die Beziehung blieb halb offen.
+                    s.and_then(|s| s.letzte_eigene.as_ref()).is_some(),
+                    s.and_then(|s| s.letzte_eigene.clone()),
+                    g.creator_author_id == to_hex(&unsere),
+                    g.invited_by,
+                )
+            }
+            None => return,
+        };
+        // Wer eingeladen hat oder eingeladen wurde, laeuft ueber die andere
+        // Rolle -- dort ist das JOIN schon geschickt oder wird es noch.
+        if schon || sind_wir_erstellerin || eingeladen_von == Some(contact_id) {
+            return;
+        }
+        let einladungsgruppe = groups::invite_group_id(&unsere, &ihre);
+        let zeitstempel = store
+            .sitzung(group_hex, contact_id)
+            .map(|s| s.naechster_zeitstempel())
+            .unwrap_or_else(now_ms);
+        let rumpf = groups::einladung_join_body(
+            &key_from_hex(group_hex),
+            anker.as_deref().and_then(from_hex).as_deref(),
+        );
+        let kennung = to_hex(&crate::ids::message_id(
+            &einladungsgruppe,
+            zeitstempel,
+            &rumpf,
+        ));
+        store.queue(
+            contact_id,
+            OutMessage {
+                id: kennung.clone(),
+                group: to_hex(&einladungsgruppe),
+                timestamp: zeitstempel,
+                body: to_hex(&rumpf),
+                acked: false,
+                intern: true,
+                loesch_dauer: None,
+            },
+        );
+        if let Some(s) = store.sitzung_mut(group_hex, contact_id) {
+            s.letzte_eigene = Some(kennung);
+            s.eigener_zeitstempel = zeitstempel;
+            s.zustand = Sitzungszustand::Beigetreten;
+        }
+        log(&format!(
+            "Kontakt {} ist auch in Gruppe {} -- JOIN als Mitglied geschickt",
+            contact_id, group_hex
+        ));
+    }
+
     /// Die Eingeladene hat zugesagt. Sind wir die Erstellerin, schickt Briar
     /// jetzt sein eigenes JOIN, und erst damit stellt die Gegenseite die
     /// Gruppe auf "geteilt" und laesst ihre Beitraege heraus
@@ -2708,6 +2928,7 @@ impl Node {
                     body: m.body.clone(),
                     acked: false,
                     intern: false,
+                    loesch_dauer: None,
                 })
                 .collect(),
             None => Vec::new(),
@@ -2718,6 +2939,23 @@ impl Node {
         if !sind_wir_erstellerin {
             // Als Eingeladene ist das JOIN der Erstellerin nur die Nachricht,
             // dass sie die Gruppe jetzt mit uns teilt. Nichts zu tun.
+            //
+            // Zwei Mitglieder aber, von denen keines das andere eingeladen hat,
+            // stehen in der PEER-Rolle zueinander: dort ist ein JOIN kein
+            // Nachsatz zu einer Einladung, sondern die Frage "wir beide sind in
+            // dieser Gruppe -- bestaetigst du das?" (Briars
+            // PeerProtocolEngine, revealRelationship). Sie bleibt halb offen,
+            // solange wir nicht mit einem eigenen JOIN antworten: drueben
+            // steht die Beziehung dann fuer immer auf AWAIT_MEMBER, und wir
+            // werden in der Mitgliederliste nicht als bestaetigt gefuehrt.
+            // Bisher wurde so ein JOIN quittiert und verbraucht.
+            //
+            // Nur wenn wir noch nichts geschickt haben (kein Anker) und es
+            // keine Zusage auf eine eigene Einladung war -- sonst antwortete
+            // jede Zusage mit einem zweiten JOIN.
+            if !eine_zusage && anker.is_none() {
+                self.peer_join_schicken(store, contact_id, &group_hex);
+            }
             return true;
         }
         // Und unser eigenes JOIN zurueck, wie Briars onRemoteAccept: erst damit
@@ -2801,6 +3039,7 @@ impl Node {
                 body: to_hex(&rumpf),
                 acked: false,
                 intern: false,
+                loesch_dauer: None,
             },
         );
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
@@ -2967,6 +3206,7 @@ impl Node {
                 body: to_hex(&rumpf),
                 acked: false,
                 intern: false,
+                loesch_dauer: None,
             },
         );
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
@@ -3012,6 +3252,7 @@ impl Node {
             GroupMessage::Post { text, .. } => (text.clone(), false),
         };
         let others: Vec<u32>;
+        let mut neu_dabei = false;
         {
             let group_entry = match store.group_mut(&group_hex) {
                 Some(g) => g,
@@ -3054,7 +3295,8 @@ impl Node {
                 Some(crate::store::Sitzungszustand::Gegangen)
                     | Some(crate::store::Sitzungszustand::Fehler)
             ) || group_entry.aufgeloest;
-            if !abgemeldet && !group_entry.contacts.contains(&contact_id) {
+            neu_dabei = !abgemeldet && !group_entry.contacts.contains(&contact_id);
+            if neu_dabei {
                 group_entry.contacts.push(contact_id);
             }
             others = group_entry
@@ -3063,6 +3305,12 @@ impl Node {
                 .copied()
                 .filter(|c| *c != contact_id)
                 .collect();
+        }
+        // Neu dabei und weder von uns eingeladen noch unser Einladender: dann
+        // sind wir fuereinander bloss Mitglieder, und ein echtes Briar teilt die
+        // Gruppe erst, wenn beide dort ein JOIN geschickt haben.
+        if neu_dabei {
+            self.peer_join_schicken(store, contact_id, &group_hex);
         }
         // Pass it on to the other members, unchanged: that is what makes a
         // group work when not everyone can reach everyone.
@@ -3076,6 +3324,7 @@ impl Node {
                     body: to_hex(body),
                     acked: false,
                     intern: false,
+                    loesch_dauer: None,
                 },
             );
         }
@@ -3667,6 +3916,9 @@ pub fn new_outgoing_message(group_id: &SecretKey, text: &str) -> (Message, OutMe
             acked: false,
             attachment: None,
             attachment_type: None,
+            anhaenge: Vec::new(),
+            loesch_dauer: None,
+            loesch_frist: None,
         },
         OutMessage {
             id,
@@ -3675,6 +3927,7 @@ pub fn new_outgoing_message(group_id: &SecretKey, text: &str) -> (Message, OutMe
             body: to_hex(&body),
             acked: false,
             intern: false,
+            loesch_dauer: None,
         },
     )
 }
@@ -3828,6 +4081,11 @@ mod versionsansage_tests {
             sent_properties: None,
             props_sent_version: 0,
             last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
         }
     }
 
@@ -3928,6 +4186,11 @@ mod einladungsantwort_tests {
             sent_properties: None,
             props_sent_version: 0,
             last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
         });
         store
     }
@@ -4107,6 +4370,7 @@ mod einladungsantwort_tests {
                 body: String::new(),
                 acked: false,
                 intern: false,
+                loesch_dauer: None,
             },
         );
         store.queue(
@@ -4118,6 +4382,7 @@ mod einladungsantwort_tests {
                 body: String::new(),
                 acked: false,
                 intern: false,
+                loesch_dauer: None,
             },
         );
         let n = knoten();
@@ -4320,27 +4585,20 @@ mod stromnummer_tests {
         }
     }
 
-    /// Und derselbe Lauf gegen eine Gegenseite, deren Fenster NICHT mitlaeuft:
-    /// jede Fassung bis 0.26.0 haelt den Fusspunkt fest auf null und erkennt
-    /// darum nur 0..31. Darum ist die vergebene Nummer gedeckelt -- ohne die
-    /// Deckelung waere der Handschlag nach einer halben Stunde nicht mehr
-    /// moeglich, denn der Taktgeber waehlt jede Minute an.
+    /// Die Stromnummer eines Handschlags steigt ohne Deckel.
+    ///
+    /// Bis 0.29.1 war sie auf 31 gedeckelt und wurde danach wiederholt. Gegen
+    /// ein echtes Briar ist das toedlich: es streicht jede erkannte Marke aus
+    /// seiner Tabelle und schiebt seinen Fusspunkt mit. Die wiederholte 31
+    /// liegt dann unter dem Fenster, Briar verwirft still, und der Handschlag
+    /// ist bis zum naechsten Abschnitt -- gut einen Tag -- tot.
     #[test]
-    fn gegen_eine_alte_gegenseite_bleibt_die_nummer_im_fenster() {
+    fn die_handschlagnummer_steigt_ohne_deckel() {
         let mut sender = TransportState::default();
         for runde in 0..200u64 {
-            let n = naechste_stromnummer(&sender, 100).min(WINDOW - 1);
+            let n = naechste_stromnummer(&sender, 100);
             stromnummer_vormerken(&mut sender, 100, n);
-            assert!(
-                n < WINDOW,
-                "Runde {}: Nummer {} liegt neben dem starren Fenster 0..31",
-                runde,
-                n
-            );
-            // Bis dahin steigt sie, danach bleibt sie stehen -- und stehen
-            // bleiben heisst: dieselbe Marke wiederholen, genau wie 0.26.0.
-            let erwartet = runde.min(WINDOW - 1);
-            assert_eq!(n, erwartet, "Runde {}", runde);
+            assert_eq!(n, runde, "Runde {}: jede Runde eine neue Marke", runde);
         }
     }
 
@@ -4367,4 +4625,893 @@ mod stromnummer_tests {
         let z = p.transport_mut(BLUETOOTH_TRANSPORT_ID);
         assert_eq!(naechste_stromnummer(z, 100), 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// BQP -- nebeneinander hinzufuegen, wie Briar es tut.
+//
+// Beide Geraete zeigen einen Code und lesen den des anderen. Danach kennt jede
+// Seite beide Rumpfe, weiss also, wer Alice ist (die kleinere Verpflichtung),
+// und eine von beiden waehlt an, waehrend die andere lauscht. Was zuerst
+// zustande kommt, gewinnt.
+// ---------------------------------------------------------------------------
+
+/// Was zwischen "Code zeigen" und "Code gelesen" gemerkt werden muss. Nur im
+/// Arbeitsspeicher und nur so lange, wie der Code sichtbar ist: die Schluessel
+/// sind fluechtig, genau darum geht es bei diesem Verfahren.
+pub struct BqpLauf {
+    pub privat: SecretKey,
+    pub oeffentlich: [u8; 32],
+    pub rumpf: Vec<u8>,
+    pub port: u16,
+    /// Gesetzt, sobald einer der beiden Wege geglueckt ist -- dann hoert der
+    /// andere auf.
+    pub fertig: Arc<std::sync::atomic::AtomicBool>,
+    /// Die Nummer des angelegten Kontakts, sobald es einen gibt. Null heisst
+    /// keiner. Damit kann der anwaehlende Faden melden, dass es geklappt hat,
+    /// auch wenn der Lauscher schneller war.
+    pub kontakt: Arc<std::sync::atomic::AtomicU32>,
+}
+
+pub static BQP: std::sync::Mutex<Option<BqpLauf>> = std::sync::Mutex::new(None);
+
+impl Node {
+    /// Den eigenen Code bauen und auf eine Verbindung warten.
+    ///
+    /// Der Lauscher haengt an einem eigenen, fluechtigen Port: was hier kommt,
+    /// ist ein roher Schluesselaustausch und kein Abgleich, der Lauscher von
+    /// Port 7327 wuerde damit nichts anfangen koennen.
+    pub fn bqp_start(&self) -> std::io::Result<Vec<u8>> {
+        // Einen alten Lauf zuerst abraeumen. Sonst haengt dessen Lauscher am
+        // fluechtigen Port weiter, und schlimmer: sein Faden raeumt beim
+        // Aufhoeren den frischen Lauf mit weg.
+        Self::bqp_stop();
+        let privat = crate::crypto::generate_agreement_private_key();
+        let oeffentlich = crate::crypto::agreement_public_key(&privat);
+        let lauscher = std::net::TcpListener::bind(("0.0.0.0", 0))?;
+        let port = lauscher.local_addr()?.port();
+
+        // Die Beschreiber: unsere LAN-Adresse mit dem fluechtigen Port, und die
+        // Bluetooth-Adresse, falls es eine gibt.
+        let mut beschreiber: Vec<crate::bdf::Bdf> = Vec::new();
+        if let Some(ip) = local_ips().into_iter().find_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        {
+            beschreiber.push(crate::bdf::Bdf::List(vec![
+                crate::bdf::Bdf::Int(crate::bqp::TRANSPORT_LAN),
+                crate::bdf::Bdf::Raw(ip.octets().to_vec()),
+                crate::bdf::Bdf::Int(port as i64),
+            ]));
+        }
+        // Kein Bluetooth-Beschreiber. Briar probiert die Beschreiber in
+        // fester Reihenfolge durch -- Bluetooth zuerst, dann LAN -- und
+        // horcht dabei auf einer UUID, die aus der Verpflichtung abgeleitet
+        // ist. Wer eine Adresse nennt, aber keinen solchen Dienst anbietet,
+        // laesst die Gegenseite bei jedem Versuch in eine lange Wartezeit
+        // laufen, bevor sie es ueber LAN probiert. Solange wir den
+        // BQP-Lauscher auf Bluetooth nicht haben, nennen wir ihn nicht.
+        let rumpf = crate::bqp::encode(&crate::bqp::Payload {
+            commitment: crate::bqp::commitment(&oeffentlich),
+            descriptors: beschreiber,
+        });
+        let fertig = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kontakt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        *BQP.lock().unwrap() = Some(BqpLauf {
+            privat,
+            oeffentlich,
+            rumpf: rumpf.clone(),
+            port,
+            fertig: Arc::clone(&fertig),
+            kontakt: Arc::clone(&kontakt),
+        });
+
+        let node = Node {
+            store: Arc::clone(&self.store),
+        };
+        let rumpf_fuer_lauscher = rumpf.clone();
+        let fertig_fuer_schluss = Arc::clone(&fertig);
+        std::thread::spawn(move || {
+            let _ = lauscher.set_nonblocking(true);
+            // Kein Zeitlimit am Lauscher: bei Briar laeuft er, solange der
+            // Bildschirm offen ist, und die Minute zaehlt erst ab dem Scannen
+            // (KeyAgreementConnector). Wer sich zwei Minuten Zeit laesst, die
+            // Kameras auszurichten, soll keinen toten Code vor sich haben.
+            // Schluss macht der Erfolg oder /bqp/stop.
+            while !fertig.load(std::sync::atomic::Ordering::Relaxed) {
+                match lauscher.accept() {
+                    Ok((strom, gegen)) => {
+                        let _ = strom.set_nonblocking(false);
+                        // Je Verbindung ein eigener Faden: die erste haelt
+                        // womoeglich lange, weil der Code der Gegenseite noch
+                        // fehlt, und darf die zweite nicht aufhalten.
+                        let knoten = Node {
+                            store: Arc::clone(&node.store),
+                        };
+                        let fertig2 = Arc::clone(&fertig);
+                        let kontakt2 = Arc::clone(&kontakt);
+                        let rumpf2 = rumpf_fuer_lauscher.clone();
+                        std::thread::spawn(move || {
+                            match knoten.bqp_bedienen(
+                                strom,
+                                gegen.ip().to_string(),
+                                privat,
+                                oeffentlich,
+                                rumpf2,
+                                &fertig2,
+                            ) {
+                                Ok(id) => {
+                                    log(&format!("BQP: Kontakt {} nebeneinander angelegt", id));
+                                    kontakt2.store(id, std::sync::atomic::Ordering::Relaxed);
+                                    fertig2.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    log(&format!("BQP: eingehender Versuch scheiterte: {}", e))
+                                }
+                            }
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => {
+                        log(&format!("BQP: Lauscher scheiterte: {}", e));
+                        break;
+                    }
+                }
+            }
+            // Nur den eigenen Lauf abraeumen. Steht dort laengst ein
+            // neuerer, gehoert er ihm -- und wer ihn wegwirft, laesst den
+            // Benutzer vor einem Code stehen, zu dem es keinen Schluessel
+            // mehr gibt.
+            let mut lauf = BQP.lock().unwrap();
+            if lauf
+                .as_ref()
+                .map(|l| Arc::ptr_eq(&l.fertig, &fertig_fuer_schluss))
+                .unwrap_or(false)
+            {
+                *lauf = None;
+            }
+        });
+        Ok(rumpf)
+    }
+
+    /// Den Lauf beenden: die Oberflaeche hat den Bildschirm zugemacht. Der
+    /// Lauscher haengt sonst am fluechtigen Port, bis jemand anwaehlt.
+    pub fn bqp_stop() {
+        if let Some(lauf) = BQP.lock().unwrap().as_ref() {
+            lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        *BQP_GEGENUEBER.lock().unwrap() = None;
+    }
+
+    /// Eine eingehende Verbindung bedienen.
+    ///
+    /// Der Rumpf der Gegenseite fehlt hier oft noch: die andere Seite hat
+    /// unseren Code schon gelesen und waehlt an, wir haben ihren noch nicht.
+    /// Briars Bob haelt die Verbindung genau dafuer offen und schaut alle
+    /// halbe Sekunde nach, ob etwas da ist (KeyAgreementConnector.ReadableTask).
+    /// Wer sie stattdessen zumacht, laesst die Gegenseite ins Leere schreiben
+    /// -- auf Android endet der ganze Versuch dann mit einem Fehler.
+    fn bqp_bedienen(
+        &self,
+        strom: std::net::TcpStream,
+        gegen_ip: String,
+        privat: SecretKey,
+        oeffentlich: [u8; 32],
+        unser_rumpf: Vec<u8>,
+        fertig: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<u32> {
+        let bis = std::time::Instant::now() + Duration::from_secs(300);
+        let ihr_rumpf = loop {
+            if let Some(r) = BQP_GEGENUEBER.lock().unwrap().clone() {
+                break r;
+            }
+            if fertig.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(bad("schon auf einem anderen Weg erledigt"));
+            }
+            if BQP.lock().unwrap().is_none() {
+                return Err(bad("der Lauf ist zu Ende"));
+            }
+            if std::time::Instant::now() >= bis {
+                return Err(bad("der Code der Gegenseite kam nicht"));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        self.bqp_durchfuehren(strom, privat, oeffentlich, unser_rumpf, ihr_rumpf, Some(gegen_ip))
+    }
+
+    /// Den Code der Gegenseite annehmen und selbst anwaehlen.
+    pub fn bqp_gelesen(&self, ihr_rumpf: Vec<u8>) -> std::io::Result<u32> {
+        let payload = crate::bqp::parse(&ihr_rumpf).ok_or_else(|| bad("kein BQP-Code"))?;
+        *BQP_GEGENUEBER.lock().unwrap() = Some(ihr_rumpf.clone());
+        let (privat, oeffentlich, unser_rumpf) = {
+            let lauf = BQP.lock().unwrap();
+            let lauf = lauf
+                .as_ref()
+                .ok_or_else(|| bad("erst den eigenen Code zeigen"))?;
+            (lauf.privat, lauf.oeffentlich, lauf.rumpf.clone())
+        };
+        // Anwaehlen, was der Code nennt. Briar gibt nach einem Fehlschlag
+        // nicht auf, sondern versucht es alle zwei Sekunden neu, bis die
+        // Minute um ist (KeyAgreementConnector.ConnectorTask) -- wer zuerst
+        // scannt, wartet damit einfach, bis die Gegenseite ihren Code zeigt.
+        // Ohne das muesste der Benutzer noch einmal scannen.
+        let mut letzter = bad("keine Adresse im Code");
+        let Some(adresse) = payload.lan() else {
+            return Err(letzter);
+        };
+        let bis = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match dial(LAN_TRANSPORT_ID, &adresse, None) {
+                Ok(Conn::Tcp(strom)) => {
+                    return self.bqp_durchfuehren(
+                        strom,
+                        privat,
+                        oeffentlich,
+                        unser_rumpf,
+                        ihr_rumpf,
+                        adresse.rsplit_once(':').map(|(ip, _)| ip.to_string()),
+                    )
+                }
+                Ok(_) => {}
+                Err(e) => letzter = e,
+            }
+            // Hat unser eigener Lauscher derweil eine Verbindung angenommen
+            // und den Austausch erledigt, ist hier nichts mehr zu tun.
+            let schon = BQP.lock().unwrap().as_ref().map(|l| {
+                (
+                    l.fertig.load(std::sync::atomic::Ordering::Relaxed),
+                    l.kontakt.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            });
+            match schon {
+                // Der Lauscher war schneller und hat den Kontakt schon
+                // angelegt -- das ist ein Erfolg, kein Fehlschlag.
+                Some((true, id)) if id > 0 => return Ok(id),
+                Some((true, _)) => return Err(bad("der Lauf wurde beendet")),
+                None => return Err(bad("der Lauf wurde beendet")),
+                Some((false, _)) => {}
+            }
+            if std::time::Instant::now() >= bis {
+                return Err(letzter);
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// Der Kontaktaustausch mit dem Hauptschluessel aus BQP -- derselbe wie
+    /// nach einem Handschlag, nur ohne schwebenden Kontakt und ohne
+    /// Handschlagschluessel: beim Treffen nebeneinander gibt es beides nicht.
+    /// Doppelte erkennt darum die Autorenkennung, nicht der Handschlagschluessel.
+    fn bqp_austausch(
+        &self,
+        conn: Conn,
+        master_key: SecretKey,
+        alice: bool,
+        gegen_ip: Option<String>,
+    ) -> std::io::Result<u32> {
+        let (our_seed, our_name, our_signature_public, port, recent, recent6, bluetooth,
+             bt_uuid, onion) = {
+            let mut store = self.store.lock().unwrap();
+            note_local_addresses(&mut store.state);
+            note_local_addresses6(&mut store.state);
+            let identity = store.identity().ok_or_else(|| bad("no identity yet"))?;
+            (
+                key_from_hex(&identity.signature_seed),
+                identity.name.clone(),
+                key_from_hex(&identity.signature_public),
+                store.state.listen_port,
+                store.state.lan_recent.clone(),
+                store.state.lan6_recent.clone(),
+                store.state.bluetooth,
+                store.state.bt_uuid.clone(),
+                store.state.tor_onion.clone(),
+            )
+        };
+        let mut schreiber = StreamWriter::untagged(
+            conn.try_clone()?,
+            exchange::derive_header_key(&master_key, alice),
+        );
+        let mut leser = StreamReader::new(
+            conn.try_clone()?,
+            exchange::derive_header_key(&master_key, !alice),
+            0,
+        );
+        let signature = exchange::sign_nonce(&our_seed, &master_key, alice);
+        let local = ContactInfo {
+            name: our_name,
+            public_key: our_signature_public.to_vec(),
+            properties: local_properties(
+                port,
+                &recent,
+                &recent6,
+                bluetooth,
+                bt_uuid.as_deref(),
+                onion,
+            ),
+            timestamp: now_ms(),
+        };
+        let local_timestamp = local.timestamp;
+        let (remote, remote_signature) =
+            exchange::exchange(&mut leser, &mut schreiber, &local, &signature, alice)?;
+        schreiber.send_end_of_stream()?;
+        let mut eimer = Vec::new();
+        let _ = leser.read_to_end(&mut eimer);
+        if !exchange::verify_nonce(&remote.public_key, &master_key, !alice, &remote_signature) {
+            return Err(bad("the contact's signature did not verify"));
+        }
+
+        let timestamp = local_timestamp.min(remote.timestamp);
+        if timestamp < MIN_VERNUENFTIGE_ZEIT_MS {
+            // Genau Briars Pruefung (ContactExchangeManagerImpl: "Timestamp is
+            // too old" -> FormatException). Lieber kein Kontakt als ein
+            // Kontakt, den nur eine Seite hat.
+            return Err(bad(
+                "die Uhr eines der beiden Geraete steht vor 2021 -- erst die Zeit stellen",
+            ));
+        }
+        let addresses = addresses_from_properties(&remote.properties, gegen_ip.as_deref());
+        let author_id = ids::author_id(&remote.name, &remote.public_key);
+        let creation_period = timestamp / time_period_length(LAN_MAX_LATENCY_MS);
+        let mut store = self.store.lock().unwrap();
+        // Schon da? Dann bleibt der alte Eintrag samt Verlauf und lernt nur
+        // dazu -- zweimal nebeneinander stehen macht keinen zweiten Menschen.
+        if let Some(i) = store
+            .state
+            .contacts
+            .iter()
+            .position(|c| c.author_id == to_hex(&author_id))
+        {
+            let contact = &mut store.state.contacts[i];
+            let id = contact.id;
+            for (transport, address) in &addresses {
+                contact
+                    .transports
+                    .entry(transport.clone())
+                    .or_insert_with(|| TransportState {
+                        address: Some(address.clone()),
+                        ..Default::default()
+                    });
+            }
+            contact.last_seen = now_ms();
+            store.save()?;
+            return Ok(id);
+        }
+        let id = store.state.next_contact_id.max(1);
+        store.state.next_contact_id = id + 1;
+        let mut transports = BTreeMap::new();
+        for (transport, address) in addresses {
+            let gemeldet = remote.properties.get(&transport);
+            transports.insert(
+                transport.clone(),
+                TransportState {
+                    address: Some(address),
+                    port: gemeldet
+                        .and_then(|w| w.get("port"))
+                        .and_then(|p| p.parse::<u16>().ok()),
+                    ipv6: gemeldet
+                        .and_then(|w| w.get("ipv6"))
+                        .map(|v| clean_ipv6_list(v))
+                        .filter(|v| !v.is_empty()),
+                    bt_uuid: gemeldet.and_then(|w| w.get("uuid")).cloned(),
+                    ..Default::default()
+                },
+            );
+        }
+        store.state.contacts.push(Contact {
+            id,
+            name: remote.name.clone(),
+            author_id: to_hex(&author_id),
+            signature_public: to_hex(&remote.public_key),
+            // Kein Handschlagschluessel: BQP tauscht keinen aus. Verbunden wird
+            // danach ueber die Abgleichschluessel aus dem Hauptschluessel.
+            handshake_public: None,
+            master_key: to_hex(&master_key),
+            alice,
+            creation_period,
+            transports,
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: now_ms(),
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        });
+        store.save()?;
+        log(&format!("BQP: neuer Kontakt {} ({})", id, remote.name));
+        Ok(id)
+    }
+
+    /// Der gemeinsame Teil: Sitzung, dann Kontaktaustausch.
+    fn bqp_durchfuehren(
+        &self,
+        strom: std::net::TcpStream,
+        privat: SecretKey,
+        oeffentlich: [u8; 32],
+        unser_rumpf: Vec<u8>,
+        ihr_rumpf: Vec<u8>,
+        gegen_ip: Option<String>,
+    ) -> std::io::Result<u32> {
+        let ihr = crate::bqp::parse(&ihr_rumpf).ok_or_else(|| bad("kein BQP-Code"))?;
+        let unser = crate::bqp::parse(&unser_rumpf).ok_or_else(|| bad("eigener Code kaputt"))?;
+        let alice = crate::bqp::ist_alice(&unser.commitment, &ihr.commitment);
+        strom.set_read_timeout(Some(BQP_IO_TIMEOUT))?;
+        strom.set_write_timeout(Some(BQP_IO_TIMEOUT))?;
+        let mut strom = strom;
+        let master = crate::bqp::sitzung(
+            &mut strom,
+            &privat,
+            &oeffentlich,
+            &unser_rumpf,
+            &ihr_rumpf,
+            &ihr.commitment,
+            alice,
+        )?;
+        log("BQP: die Einigung steht");
+        let conn = Conn::Tcp(strom);
+        let id = self.bqp_austausch(conn, master, alice, gegen_ip)?;
+        if let Some(lauf) = BQP.lock().unwrap().as_ref() {
+            lauf.kontakt.store(id, std::sync::atomic::Ordering::Relaxed);
+            lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(id)
+    }
+}
+
+/// Der gelesene Code der Gegenseite. Getrennt vom eigenen Lauf, weil er auch
+/// eintrifft, waehrend der Lauscher schon laeuft.
+pub static BQP_GEGENUEBER: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+mod bqp_dienst_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::{Arc, Mutex};
+
+    /// BQP.. und BQP_GEGENUEBER sind prozessweit. Zwei Pruefungen, die beide
+    /// daran ruehren, duerfen nicht nebeneinander laufen.
+    static PRUEFSPERRE: Mutex<()> = Mutex::new(());
+
+    fn knoten(name: &str) -> Node {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-bqp-dienst-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity(name).unwrap();
+        Node::new(Arc::new(Mutex::new(store)))
+    }
+
+    /// Ein Schluesselpaar samt Rumpf, wie `bqp_start` ihn baut -- nur ohne
+    /// Lauscher: die Verbindung stellt der Test selbst her.
+    fn seite() -> (SecretKey, [u8; 32], Vec<u8>) {
+        let privat = crate::crypto::generate_agreement_private_key();
+        let oeffentlich = crate::crypto::agreement_public_key(&privat);
+        let rumpf = crate::bqp::encode(&crate::bqp::Payload {
+            commitment: crate::bqp::commitment(&oeffentlich),
+            descriptors: vec![crate::bdf::Bdf::List(vec![
+                crate::bdf::Bdf::Int(crate::bqp::TRANSPORT_LAN),
+                crate::bdf::Bdf::Raw(vec![127, 0, 0, 1]),
+                crate::bdf::Bdf::Int(1234),
+            ])],
+        });
+        (privat, oeffentlich, rumpf)
+    }
+
+    /// Der ganze Weg auf Dienstebene: Einigung, Bestaetigung und
+    /// Kontaktaustausch ueber eine Verbindung. Das Anwaehlen bleibt aussen
+    /// vor -- zwei Dienste auf demselben Rechner koennen einander nicht
+    /// anwaehlen, weil `dial` die eigene Adresse aussiebt.
+    #[test]
+    fn zwei_dienste_werden_kontakte() {
+        let _sperre = PRUEFSPERRE.lock().unwrap_or_else(|e| e.into_inner());
+        *BQP.lock().unwrap() = None;
+        *BQP_GEGENUEBER.lock().unwrap() = None;
+        let a = knoten("a");
+        let b = knoten("b");
+        let (a_privat, a_oeff, a_rumpf) = seite();
+        let (b_privat, b_oeff, b_rumpf) = seite();
+
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let b_rumpf2 = b_rumpf.clone();
+        let a_rumpf2 = a_rumpf.clone();
+        let laeufer = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            b.bqp_durchfuehren(strom, b_privat, b_oeff, b_rumpf2, a_rumpf2, None)
+                .map(|id| (id, b))
+        });
+
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let ergebnis_a = a.bqp_durchfuehren(strom, a_privat, a_oeff, a_rumpf, b_rumpf, None);
+        let (id_b, b) = laeufer.join().unwrap().expect("B scheitert nicht");
+        let id_a = ergebnis_a.expect("A scheitert nicht");
+        assert_eq!(id_a, 1);
+        assert_eq!(id_b, 1);
+
+        let sa = a.store.lock().unwrap();
+        let sb = b.store.lock().unwrap();
+        assert_eq!(sa.state.contacts.len(), 1);
+        assert_eq!(sb.state.contacts.len(), 1);
+        assert_eq!(sa.state.contacts[0].name, "b");
+        assert_eq!(sb.state.contacts[0].name, "a");
+        // Derselbe Hauptschluessel auf beiden Seiten, und genau eine Seite
+        // ist Alice -- sonst passten die Abgleichschluessel nicht zusammen.
+        assert_eq!(sa.state.contacts[0].master_key, sb.state.contacts[0].master_key);
+        assert_ne!(sa.state.contacts[0].alice, sb.state.contacts[0].alice);
+        // Kein Handschlagschluessel: BQP tauscht keinen aus.
+        assert!(sa.state.contacts[0].handshake_public.is_none());
+    }
+
+    /// Die Gegenseite hat unseren Code schon gelesen und waehlt an, wir haben
+    /// ihren noch nicht. Die Verbindung muss halten, bis gescannt ist -- wer
+    /// sie zumacht, laesst den anderen ins Leere schreiben.
+    #[test]
+    fn verbindung_haelt_bis_der_code_gescannt_ist() {
+        let _sperre = PRUEFSPERRE.lock().unwrap_or_else(|e| e.into_inner());
+        let a = knoten("halt-a");
+        let b = knoten("halt-b");
+        let (a_privat, a_oeff, a_rumpf) = seite();
+        let (b_privat, b_oeff, b_rumpf) = seite();
+
+        // Der Lauf von B steht, aber der Code von A ist noch nicht gescannt.
+        let fertig = Arc::new(AtomicBool::new(false));
+        *BQP.lock().unwrap() = Some(BqpLauf {
+            privat: b_privat,
+            oeffentlich: b_oeff,
+            rumpf: b_rumpf.clone(),
+            port: 0,
+            fertig: Arc::clone(&fertig),
+            kontakt: Arc::new(AtomicU32::new(0)),
+        });
+        *BQP_GEGENUEBER.lock().unwrap() = None;
+
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let b_rumpf_fuer_b = b_rumpf.clone();
+        let fertig_fuer_b = Arc::clone(&fertig);
+        let bedienen = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            b.bqp_bedienen(
+                strom,
+                "127.0.0.1".to_string(),
+                b_privat,
+                b_oeff,
+                b_rumpf_fuer_b,
+                &fertig_fuer_b,
+            )
+            .map(|id| (id, b))
+        });
+
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let a_rumpf_fuer_b = a_rumpf.clone();
+        let anwaehlen = std::thread::spawn(move || {
+            a.bqp_durchfuehren(strom, a_privat, a_oeff, a_rumpf, b_rumpf, None)
+                .map(|id| (id, a))
+        });
+
+        // Erst jetzt scannt der Benutzer -- die Verbindung steht da schon.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        *BQP_GEGENUEBER.lock().unwrap() = Some(a_rumpf_fuer_b);
+
+        let (id_b, b) = bedienen.join().unwrap().expect("B legt an");
+        let (id_a, a) = anwaehlen.join().unwrap().expect("A legt an");
+        assert_eq!((id_a, id_b), (1, 1));
+        let sa = a.store.lock().unwrap();
+        let sb = b.store.lock().unwrap();
+        assert_eq!(sa.state.contacts[0].master_key, sb.state.contacts[0].master_key);
+        *BQP.lock().unwrap() = None;
+        *BQP_GEGENUEBER.lock().unwrap() = None;
+    }
+}
+
+/// Die Zuenddauer der Gegenseite uebernehmen.
+///
+/// Sie wird nicht ausgehandelt, sondern gespiegelt: wer eine Nachricht mit
+/// anderer Dauer bekommt, stellt um. Nur wenn die eigene Aenderung noch in
+/// keiner Nachricht draussen war und die Gegenseite dieselbe Dauer meldet,
+/// bleibt es bei der eigenen -- sonst gewinnt die gesendete Aenderung. Genau
+/// so haelt es Briar (AutoDeleteManagerImpl.receiveAutoDeleteTimer).
+pub fn loeschdauer_empfangen(
+    store: &mut Store,
+    contact_id: u32,
+    dauer: Option<u64>,
+    timestamp: u64,
+) {
+    let neu = dauer.map(|d| d as i64).unwrap_or_else(crate::store::kein_timer);
+    let Some(contact) = store.contact_mut(contact_id) else {
+        return;
+    };
+    // Eine aeltere Meldung als die zuletzt gesehene zaehlt nicht mehr.
+    if timestamp <= contact.loesch_stempel {
+        return;
+    }
+    let vorher = contact.loesch_vorher;
+    if vorher == crate::store::keine_vorige() {
+        // Keine offene eigene Aenderung: einfach uebernehmen.
+        contact.loesch_timer = neu;
+    } else if neu != vorher {
+        // Ihre gesendete Aenderung schlaegt unsere ungesendete.
+        contact.loesch_timer = neu;
+        contact.loesch_vorher = crate::store::keine_vorige();
+    }
+    contact.loesch_stempel = timestamp;
+}
+
+/// Die Uhr einer verschwindenden Nachricht starten.
+///
+/// Briar startet sie nicht beim Schreiben, sondern wenn die Nachricht
+/// angekommen ist: bei einer eigenen mit der Bestaetigung der Gegenseite
+/// (DatabaseComponentImpl.receiveAck -> startCleanupTimer), bei einer fremden
+/// mit dem Lesen (ConversationManagerImpl). Eine ungelesene Nachricht
+/// verschwindet also nicht unter der Hand.
+pub fn loeschuhr_starten(nachricht: &mut crate::store::Message, jetzt: u64) {
+    if nachricht.loesch_frist.is_some() {
+        return;
+    }
+    if let Some(dauer) = nachricht.loesch_dauer {
+        nachricht.loesch_frist = Some(jetzt.saturating_add(dauer));
+    }
+}
+
+/// Alles wegraeumen, dessen Frist um ist. Gibt zurueck, ob sich etwas
+/// geaendert hat -- dann muss der Speicher geschrieben werden.
+pub fn verschwundenes_fegen(store: &mut Store, jetzt: u64) -> bool {
+    let mut anhaenge: Vec<String> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    for contact in store.state.contacts.iter_mut() {
+        contact.messages.retain(|m| {
+            let weg = m.loesch_frist.map(|f| f <= jetzt).unwrap_or(false);
+            if weg {
+                for kopf in &m.anhaenge {
+                    anhaenge.push(kopf.id.clone());
+                }
+                if m.anhaenge.is_empty() {
+                    if let Some(a) = &m.attachment {
+                        anhaenge.push(a.clone());
+                    }
+                }
+                ids.push(m.id.clone());
+            }
+            !weg
+        });
+        // Die eigene Kopie im Korb geht mit -- sie ist quittiert, sonst liefe
+        // die Uhr gar nicht.
+        contact.outbox.retain(|o| !ids.contains(&o.id));
+    }
+    for a in &anhaenge {
+        let _ = store.anhang_loeschen(a);
+    }
+    if !ids.is_empty() {
+        log(&format!("{} verschwundene Nachrichten weggeraeumt", ids.len()));
+    }
+    !ids.is_empty()
+}
+
+#[cfg(test)]
+mod verschwinden_tests {
+    use super::*;
+    use crate::store::{kein_timer, keine_vorige, Message};
+
+    fn speicher(name: &str) -> Store {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-verschwinden-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        store.state.contacts.push(Contact {
+            id: 1,
+            name: "Gegenueber".to_string(),
+            author_id: "22".to_string(),
+            signature_public: "22".to_string(),
+            handshake_public: None,
+            master_key: "22".to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: kein_timer(),
+            loesch_vorher: keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        });
+        store
+    }
+
+    /// Die Dauer wird nicht ausgehandelt, sondern gespiegelt: was ankommt,
+    /// gilt ab sofort auch fuer die eigenen Nachrichten.
+    #[test]
+    fn dauer_wird_gespiegelt() {
+        let mut store = speicher("spiegel");
+        loeschdauer_empfangen(&mut store, 1, Some(60_000), 100);
+        assert_eq!(store.contact(1).unwrap().loesch_timer, 60_000);
+
+        // Eine aeltere Meldung zaehlt nicht mehr.
+        loeschdauer_empfangen(&mut store, 1, None, 50);
+        assert_eq!(store.contact(1).unwrap().loesch_timer, 60_000);
+
+        // Eine neuere schon.
+        loeschdauer_empfangen(&mut store, 1, None, 200);
+        assert_eq!(store.contact(1).unwrap().loesch_timer, kein_timer());
+    }
+
+    /// Stellen beide gleichzeitig um, gewinnt die Aenderung, die schon in
+    /// einer Nachricht draussen war.
+    #[test]
+    fn ihre_gesendete_aenderung_schlaegt_unsere_ungesendete() {
+        let mut store = speicher("gleichzeitig");
+        {
+            let c = store.contact_mut(1).unwrap();
+            c.loesch_vorher = c.loesch_timer; // ungesendete Aenderung
+            c.loesch_timer = 3_600_000;
+        }
+        loeschdauer_empfangen(&mut store, 1, Some(60_000), 100);
+        let c = store.contact(1).unwrap();
+        assert_eq!(c.loesch_timer, 60_000, "ihre gilt");
+        assert_eq!(c.loesch_vorher, keine_vorige(), "unsere ist vergessen");
+    }
+
+    /// Die Uhr laeuft erst, wenn die Nachricht angekommen ist -- und der
+    /// Besen raeumt weg, was ueberfaellig ist.
+    #[test]
+    fn uhr_laeuft_erst_ab_der_zustellung() {
+        let mut store = speicher("uhr");
+        let mut m = Message {
+            id: "a1".to_string(),
+            timestamp: 1,
+            text: "geht wieder".to_string(),
+            outgoing: true,
+            acked: false,
+            attachment: None,
+            attachment_type: None,
+            anhaenge: Vec::new(),
+            loesch_dauer: Some(60_000),
+            loesch_frist: None,
+        };
+        // Ohne Zustellung keine Frist, also faellt nichts weg.
+        store.contact_mut(1).unwrap().messages.push(m.clone());
+        assert!(!verschwundenes_fegen(&mut store, 10_000_000));
+        assert_eq!(store.contact(1).unwrap().messages.len(), 1);
+
+        // Mit der Bestaetigung faengt sie an zu laufen.
+        loeschuhr_starten(&mut m, 1_000);
+        assert_eq!(m.loesch_frist, Some(61_000));
+        // Zweimal starten ruehrt sie nicht an.
+        loeschuhr_starten(&mut m, 500_000);
+        assert_eq!(m.loesch_frist, Some(61_000));
+
+        store.contact_mut(1).unwrap().messages[0] = m;
+        assert!(!verschwundenes_fegen(&mut store, 60_999), "noch nicht faellig");
+        assert!(verschwundenes_fegen(&mut store, 61_000), "jetzt faellig");
+        assert!(store.contact(1).unwrap().messages.is_empty());
+    }
+
+    /// Eine Nachricht ohne Dauer bleibt liegen, auch nach Jahren.
+    #[test]
+    fn ohne_dauer_bleibt_alles() {
+        let mut store = speicher("bleibt");
+        store.contact_mut(1).unwrap().messages.push(Message {
+            id: "b1".to_string(),
+            timestamp: 1,
+            text: "bleibt".to_string(),
+            outgoing: false,
+            acked: true,
+            attachment: None,
+            attachment_type: None,
+            anhaenge: Vec::new(),
+            loesch_dauer: None,
+            loesch_frist: None,
+        });
+        assert!(!verschwundenes_fegen(&mut store, u64::MAX / 2));
+        assert_eq!(store.contact(1).unwrap().messages.len(), 1);
+    }
+
+    /// Die Dauer geht nur an eine Gegenseite, die sie auch liest.
+    #[test]
+    fn nur_wer_es_ansagt_bekommt_die_dauer() {
+        let mut store = speicher("ansage");
+        // Ohne jede Ansage darf sie hinaus -- wir sagen 3 an, also erwartet
+        // Briar sie von uns. Bestaetigt ist sie damit aber noch nicht.
+        assert!(store.contact(1).unwrap().darf_zuenddauer_bekommen());
+        assert!(!store.contact(1).unwrap().zuenddauer_bestaetigt());
+        store
+            .contact_mut(1)
+            .unwrap()
+            .fremde_fassungen
+            .insert(crate::sync::MESSAGING_CLIENT_ID.to_string(), 2);
+        // Wer ausdruecklich weniger ansagt, bekommt die alte Form.
+        assert!(!store.contact(1).unwrap().darf_zuenddauer_bekommen(), "2 reicht nicht");
+        assert!(!store.contact(1).unwrap().zuenddauer_bestaetigt());
+        store
+            .contact_mut(1)
+            .unwrap()
+            .fremde_fassungen
+            .insert(crate::sync::MESSAGING_CLIENT_ID.to_string(), 3);
+        assert!(store.contact(1).unwrap().darf_zuenddauer_bekommen());
+        assert!(store.contact(1).unwrap().zuenddauer_bestaetigt());
+    }
+}
+
+#[cfg(test)]
+mod zusage_tests {
+    use super::*;
+
+    /// Wir sagen Nebenfassung 3 an. Dann muss die Zuenddauer auch an einen
+    /// Kontakt gehen, dessen Gegenansage wir nie gesehen haben -- sonst liest
+    /// Briar unsere dreigliedrige Nachricht als "keine Dauer" und schaltet
+    /// dem Benutzer drueben seine verschwindenden Nachrichten ab.
+    #[test]
+    fn ohne_gegenansage_geht_die_dauer_trotzdem_hinaus() {
+        let leer = crate::store::Contact {
+            id: 1,
+            name: "X".to_string(),
+            author_id: "11".to_string(),
+            signature_public: "11".to_string(),
+            handshake_public: None,
+            master_key: "11".to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: 60_000,
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        };
+        assert!(leer.darf_zuenddauer_bekommen(), "keine Ansage heisst nicht 'kann es nicht'");
+        assert!(!leer.zuenddauer_bestaetigt(), "bestaetigt ist sie deshalb nicht");
+
+        let mut alt = leer.clone();
+        alt.fremde_fassungen
+            .insert(sync::MESSAGING_CLIENT_ID.to_string(), 2);
+        assert!(
+            !alt.darf_zuenddauer_bekommen(),
+            "wer ausdruecklich 2 ansagt, bekommt die alte Form"
+        );
+    }
+}
+
+/// Steht die Uhr dieses Geraets so falsch, dass die Gegenseite uns nicht
+/// glauben kann?
+///
+/// Geprueft wird nur die Richtung, die sich ohne fremde Zeitquelle pruefen
+/// laesst: eine Uhr vor dem 1. Januar 2021. Briar haelt jeden frueheren
+/// Zeitpunkt fuer unmoeglich -- es verweigert damit den Kontaktaustausch
+/// (ContactExchangeManagerImpl) und startet auf Android gar nicht erst
+/// (LifecycleManagerImpl). Auf N9 und N950 ist das der haeufige Fall: kein
+/// Zeitdienst, und eine leere Pufferbatterie setzt die Uhr auf 1970.
+///
+/// Die andere Richtung -- eine Uhr, die mehr als einen Tag VORgeht -- ist
+/// von hier aus nicht zu erkennen: alles, was von der Gegenseite kommt,
+/// stammt aus deren Vergangenheit und taugt nur als untere Schranke. Wer sie
+/// erkennen will, braucht eine Zeitquelle von aussen.
+pub fn uhr_steht_falsch() -> bool {
+    now_ms() < MIN_VERNUENFTIGE_ZEIT_MS
 }

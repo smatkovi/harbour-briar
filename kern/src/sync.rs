@@ -17,17 +17,20 @@ pub const PRIORITY: u8 = 5;
 
 pub const MESSAGING_CLIENT_ID: &str = "org.briarproject.briar.messaging";
 pub const MESSAGING_MAJOR_VERSION: u32 = 0;
-/// Absichtlich 2 und nicht 3.
+/// Seit 0.29.0 drei, und das ist eine Zusage: ab Nebenfassung 3 haengt Briar
+/// seinen Privatnachrichten eine Zuenddauer an und erwartet dasselbe zurueck.
 ///
-/// Ab Nebenversion 3 sagt man zu, verschwindende Nachrichten zu koennen.
-/// Android nimmt das beim Wort, haengt seinen Nachrichten eine Zuenddauer an
-/// -- und wir behalten sie fuer immer, weil unser Leser das vierte
-/// Listenglied gar nicht ansieht. Eine Zusage, die man bricht, ist schlimmer
-/// als eine, die man nicht macht: der Absender glaubt, seine Nachricht sei
-/// verschwunden. Briar selbst sagt in genau dieser Lage 2 an
-/// (MessagingModule.java:71). Auf 3 gehoben wird erst, wenn das Auto-Loeschen
-/// wirklich gebaut ist.
-pub const MESSAGING_MINOR_VERSION: u32 = 2;
+/// Wer sie ansagt, muss sie auch einhalten -- und zwar gegenueber JEDEM
+/// Kontakt, nicht nur gegenueber denen, deren Gegenansage man zufaellig
+/// gespeichert hat. Genau daran hing 0.29.0: die Dauer ging nur hinaus, wenn
+/// die Karte der fremden Fassungen gefuellt war, und Briar erneuert seine
+/// Ansage nicht wegen einer fremden Nebenfassung. Fuer alle aelteren Kontakte
+/// schrieben wir also dreigliedrige Rumpfe, Briar las das als "keine Dauer"
+/// und schaltete dem Benutzer seine verschwindenden Nachrichten ab -- mit der
+/// Meldung, WIR haetten sie abgeschaltet. Jetzt gilt die Dauer als erlaubt,
+/// solange die Gegenseite nicht ausdruecklich weniger angesagt hat
+/// (Contact::darf_zuenddauer_bekommen).
+pub const MESSAGING_MINOR_VERSION: u32 = 3;
 pub const VERSIONING_CLIENT_ID: &str = "org.briarproject.bramble.versioning";
 pub const VERSIONING_MAJOR_VERSION: u32 = 0;
 pub const PROPERTIES_CLIENT_ID: &str = "org.briarproject.bramble.properties";
@@ -99,14 +102,18 @@ pub fn messaging_group_id(author_a: &SecretKey, author_b: &SecretKey) -> SecretK
 /// A private message body: message type, text, attachment headers --
 /// client version 0.1 to 0.2 shape, which 1.5 still accepts.
 pub fn private_message_body(text: &str) -> Vec<u8> {
-    private_message_body_with(Some(text), &[])
+    private_message_body_with(Some(text), &[], None)
 }
 
 /// The same, with attachment headers: each names the identifier of an
 /// attachment message and its content type.
+/// Die Zuenddauer steht als viertes Glied dahinter, wenn es eine gibt --
+/// Briar schreibt an dieser Stelle sonst NULL (PrivateMessageFactoryImpl) und
+/// liest beides (checkSize(body, 3, 4), getOptionalLong(3)).
 pub fn private_message_body_with(
     text: Option<&str>,
     attachments: &[(SecretKey, String)],
+    loesch_dauer: Option<u64>,
 ) -> Vec<u8> {
     let headers = attachments
         .iter()
@@ -117,14 +124,91 @@ pub fn private_message_body_with(
             ])
         })
         .collect();
-    crate::bdf::to_bytes(&Bdf::List(vec![
+    let mut glieder = vec![
         Bdf::Int(PRIVATE_MESSAGE),
         match text {
             Some(t) => Bdf::Str(t.to_string()),
             None => Bdf::Null,
         },
         Bdf::List(headers),
-    ]))
+    ];
+    // Das vierte Glied nur, wenn es eine Dauer gibt. Briar macht es genauso:
+    // die dreigliedrige Form geht an alle, die vierte nur an eine Gegenseite,
+    // die sie angesagt hat (PrivateMessageFactoryImpl -- die Fassung mit
+    // Zuenddauer ist eine eigene). Ein viertes Glied einfach immer
+    // mitzuschicken haette die Pruefung vor dem Senden umgangen.
+    if let Some(ms) = loesch_dauer {
+        glieder.push(Bdf::Int(ms as i64));
+    }
+    crate::bdf::to_bytes(&Bdf::List(glieder))
+}
+
+/// Traegt die Nachricht ueberhaupt ein viertes Glied?
+///
+/// Der Unterschied zaehlt: eine dreigliedrige Nachricht sagt nichts ueber die
+/// Zuenddauer -- die Gegenseite kennt die Form vielleicht gar nicht --, ein
+/// viertes Glied mit NULL sagt ausdruecklich "keine Dauer". Nur das zweite
+/// darf die eigene Einstellung umstellen.
+pub fn hat_zuenddauer_glied(body: &[u8]) -> bool {
+    let Ok(list) = crate::bdf::from_bytes(body) else {
+        return false;
+    };
+    let Some(items) = list.as_list() else {
+        return false;
+    };
+    items.len() >= 4 && items[0].as_int() == Some(PRIVATE_MESSAGE)
+}
+
+/// Die Klientenliste der Gegenseite, wie sie in ihrer Ansage steht:
+/// Kennung, Hauptfassung, Nebenfassung -- dazu die Nummer der Ansage.
+///
+/// Briar merkt sich das und fragt vor dem Senden nach, was die Gegenseite
+/// von einem Klienten kann (getClientMinorVersion). Ohne das wuesste man
+/// nicht, ob eine Zuenddauer drueben gelesen oder als Formfehler verworfen
+/// wird.
+pub fn parse_versioning_update(body: &[u8]) -> Option<(i64, Vec<(String, u32, u32)>)> {
+    let list = crate::bdf::from_bytes(body).ok()?;
+    let items = list.as_list()?;
+    if items.len() != 2 {
+        return None;
+    }
+    let nummer = items[1].as_int()?;
+    let mut klienten = Vec::new();
+    for eintrag in items[0].as_list()? {
+        let teile = eintrag.as_list()?;
+        if teile.len() < 3 {
+            continue;
+        }
+        let (Some(id), Some(haupt), Some(neben)) =
+            (teile[0].as_str(), teile[1].as_int(), teile[2].as_int())
+        else {
+            continue;
+        };
+        if haupt < 0 || neben < 0 {
+            continue;
+        }
+        klienten.push((id.to_string(), haupt as u32, neben as u32));
+    }
+    Some((nummer, klienten))
+}
+
+/// Die Zuenddauer aus einer Privatnachricht, falls eine drinsteht.
+///
+/// Briar nimmt nur Dauern zwischen einer Minute und einem Jahr an und
+/// verwirft die Nachricht sonst (validateAutoDeleteTimer). Wir verwerfen sie
+/// nicht -- eine Nachricht wegzuwerfen, weil ihre Zuenddauer krumm ist, waere
+/// der schlechtere Tausch --, aber wir uebernehmen die Dauer dann nicht.
+pub fn private_message_timer(body: &[u8]) -> Option<u64> {
+    let list = crate::bdf::from_bytes(body).ok()?;
+    let items = list.as_list()?;
+    if items.len() < 4 || items[0].as_int() != Some(PRIVATE_MESSAGE) {
+        return None;
+    }
+    let ms = items[3].as_int()?;
+    if !(crate::store::MIN_LOESCHDAUER_MS..=crate::store::MAX_LOESCHDAUER_MS).contains(&ms) {
+        return None;
+    }
+    Some(ms as u64)
 }
 
 /// An attachment message: a two-element list saying what it is, and then the
@@ -497,7 +581,7 @@ mod laengen_tests {
         assert_eq!(
             gefunden,
             vec![
-                ("org.briarproject.briar.messaging".to_string(), 0, 2, true),
+                ("org.briarproject.briar.messaging".to_string(), 0, 3, true),
                 ("org.briarproject.bramble.properties".to_string(), 0, 0, true),
                 ("org.briarproject.briar.privategroup".to_string(), 0, 0, true),
                 (
@@ -510,13 +594,14 @@ mod laengen_tests {
         );
     }
 
-    /// Zwei Nebenfassungen sind absichtlich kleiner als Briars eigene: beide
-    /// hoeheren Nummern versprechen verschwindende Nachrichten, und dieser Port
-    /// sieht das Glied mit der Zuenddauer nicht an. Briar fragt vor dem Senden
-    /// nach (getClientMinorVersion) und schickt dann die alte Form.
+    /// Die Nachrichtenfassung sagt jetzt 3 an: verschwindende Nachrichten
+    /// werden gelesen und geschrieben. Die Einladungsfassung bleibt bei 0 --
+    /// dort verspraeche 1 dasselbe fuer Gruppeneinladungen, und das kann
+    /// dieser Port noch nicht. Briar fragt vor dem Senden nach
+    /// (getClientMinorVersion) und schickt dann die alte Form.
     #[test]
     fn keine_zusage_die_wir_brechen() {
-        assert_eq!(MESSAGING_MINOR_VERSION, 2, "Briar sagt 3 an");
+        assert_eq!(MESSAGING_MINOR_VERSION, 3, "wie Briar: Zuenddauer wird gelesen");
         assert_eq!(INVITE_MINOR_VERSION, 0, "Briar sagt 1 an");
     }
 
@@ -580,5 +665,62 @@ mod laengen_tests {
         assert_eq!(zweiter.record_type, ACK);
         assert_eq!(parse_ids(&erster.payload).len(), MAX_MESSAGE_IDS);
         assert_eq!(parse_ids(&zweiter.payload).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod zuenddauer_tests {
+    use super::*;
+
+    /// Die Dauer steht als viertes Glied in der Nachricht -- und eine
+    /// Nachricht ohne Dauer hat dort NULL, nicht gar nichts. Briar liest
+    /// beides (checkSize(body, 3, 4)).
+    #[test]
+    fn dauer_steht_an_vierter_stelle() {
+        let mit = private_message_body_with(Some("hallo"), &[], Some(60_000));
+        assert_eq!(private_message_timer(&mit), Some(60_000));
+        assert_eq!(private_message_text(&mit).as_deref(), Some("hallo"));
+
+        let ohne = private_message_body_with(Some("hallo"), &[], None);
+        assert_eq!(private_message_timer(&ohne), None);
+        assert_eq!(private_message_text(&ohne).as_deref(), Some("hallo"));
+
+        // Ohne Dauer bleibt es bei drei Gliedern -- ein viertes bekommt nur,
+        // wer die Form angesagt hat.
+        let liste = crate::bdf::from_bytes(&ohne).unwrap();
+        assert_eq!(liste.as_list().unwrap().len(), 3);
+        assert!(!hat_zuenddauer_glied(&ohne));
+        assert!(hat_zuenddauer_glied(&mit));
+    }
+
+    /// Eine krumme Dauer wird nicht uebernommen -- Briars Grenzen sind eine
+    /// Minute bis ein Jahr.
+    #[test]
+    fn krumme_dauer_zaehlt_nicht() {
+        let zu_kurz = private_message_body_with(Some("x"), &[], Some(59_999));
+        assert_eq!(private_message_timer(&zu_kurz), None);
+        let zu_lang = private_message_body_with(
+            Some("x"),
+            &[],
+            Some(crate::store::MAX_LOESCHDAUER_MS as u64 + 1),
+        );
+        assert_eq!(private_message_timer(&zu_lang), None);
+    }
+
+    /// Die Ansage der Gegenseite wird gelesen, wie wir sie selbst schreiben.
+    #[test]
+    fn ansage_hin_und_zurueck() {
+        let rumpf = versioning_update_body(7);
+        let (nummer, klienten) = parse_versioning_update(&rumpf).expect("lesbar");
+        assert_eq!(nummer, 7);
+        assert_eq!(klienten.len(), 4);
+        assert_eq!(
+            klienten[0],
+            (
+                MESSAGING_CLIENT_ID.to_string(),
+                MESSAGING_MAJOR_VERSION,
+                MESSAGING_MINOR_VERSION
+            )
+        );
     }
 }

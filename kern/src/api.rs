@@ -285,12 +285,23 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 })
                 .unwrap_or_default();
             let mut locked = store.lock().unwrap();
-            let betroffen: Vec<(String, Option<String>)> = match locked.contact(contact_id) {
+            // Je Nachricht ihre Kennung und ALLE ihre Anhaenge -- bis 0.29.2
+            // blieb alles ausser dem ersten als verwaiste Datei liegen.
+            let betroffen: Vec<(String, Vec<String>)> = match locked.contact(contact_id) {
                 Some(c) => c
                     .messages
                     .iter()
                     .filter(|m| alle || m.id == kennung || liste.contains(&m.id))
-                    .map(|m| (m.id.clone(), m.attachment.clone()))
+                    .map(|m| {
+                        let mut anhaenge: Vec<String> =
+                            m.anhaenge.iter().map(|k| k.id.clone()).collect();
+                        if anhaenge.is_empty() {
+                            if let Some(a) = &m.attachment {
+                                anhaenge.push(a.clone());
+                            }
+                        }
+                        (m.id.clone(), anhaenge)
+                    })
                     .collect(),
                 None => return json!({"error": "no such contact"}),
             };
@@ -301,8 +312,8 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 betroffen.iter().map(|(id, _)| id.clone()).collect();
             // Erst die Anhaenge, dann die Eintraege: nach dem Streichen wuesste
             // niemand mehr, welche Datei gemeint war.
-            for (_, anhang) in &betroffen {
-                if let Some(anhang) = anhang {
+            for (_, anhaenge) in &betroffen {
+                for anhang in anhaenge {
                     locked.anhang_loeschen(anhang);
                 }
             }
@@ -313,6 +324,77 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             }
             let _ = locked.save();
             json!({"ok": true, "removed": ids.len()})
+        }
+
+        // Nebeneinander hinzufuegen, wie Briar es tut (BQP).
+        //
+        // Zwei Schritte: erst den eigenen Code zeigen -- dabei entsteht ein
+        // fluechtiges Schluesselpaar und ein Lauscher --, dann den Code der
+        // Gegenseite lesen. Beide Geraete tun beides; wer zuerst durchkommt,
+        // gewinnt, der andere Versuch laeuft ins Leere.
+        ("POST", "/bqp/start") => {
+            let node = net::Node::new(Arc::clone(&store));
+            match node.bqp_start() {
+                Ok(rumpf) => json!({"ok": true, "payload": to_hex(&rumpf)}),
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
+
+        ("POST", "/bqp/scan") => {
+            let rumpf = match from_hex(body["payload"].as_str().unwrap_or("")) {
+                Some(r) => r,
+                None => return json!({"error": "der Code ist nicht lesbar"}),
+            };
+            let node = net::Node::new(Arc::clone(&store));
+            // Nebenher: das Anwaehlen kann bis zu einer Minute dauern, und die
+            // Oberflaeche soll derweil weiterlaufen. Ob es geglueckt ist, sagt
+            // die naechste Statusabfrage -- der Kontakt steht dann in der Liste.
+            std::thread::spawn(move || match node.bqp_gelesen(rumpf) {
+                Ok(id) => crate::net::log(&format!("BQP: Kontakt {} steht", id)),
+                Err(e) => crate::net::log(&format!("BQP: gescheitert: {}", e)),
+            });
+            json!({"ok": true})
+        }
+
+        // Verschwindende Nachrichten fuer einen Kontakt einstellen. Die
+        // Dauer steht in Millisekunden; 0 oder -1 schaltet sie ab. Sie geht
+        // nicht als eigene Nachricht hinaus, sondern faehrt in der naechsten
+        // Privatnachricht mit -- so macht es Briar auch.
+        ("POST", "/autodelete") => {
+            let Some(id) = body["contact"].as_u64() else {
+                return json!({"error": "no contact given"});
+            };
+            let dauer = body["timer"].as_i64().unwrap_or(-1);
+            let dauer = if dauer <= 0 {
+                crate::store::kein_timer()
+            } else if !(crate::store::MIN_LOESCHDAUER_MS..=crate::store::MAX_LOESCHDAUER_MS)
+                .contains(&dauer)
+            {
+                return json!({"error": "the timer must be between a minute and a year"});
+            } else {
+                dauer
+            };
+            let mut locked = store.lock().unwrap();
+            match locked.contact_mut(id as u32) {
+                Some(contact) => {
+                    if contact.loesch_timer != dauer {
+                        // Die vorige Dauer merken, solange die Aenderung noch
+                        // in keiner Nachricht draussen war -- daran entscheidet
+                        // sich, wessen Aenderung gilt, wenn beide gleichzeitig
+                        // umstellen.
+                        contact.loesch_vorher = contact.loesch_timer;
+                        contact.loesch_timer = dauer;
+                    }
+                    let _ = locked.save();
+                    json!({"ok": true, "timer": dauer})
+                }
+                None => json!({"error": "no such contact"}),
+            }
+        }
+
+        ("POST", "/bqp/stop") => {
+            net::Node::bqp_stop();
+            json!({"ok": true})
         }
 
         ("POST", "/account/delete") => {
@@ -521,14 +603,56 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             body: to_hex(&attachment_body),
                             acked: false,
                             intern: false,
+                            loesch_dauer: None,
                         },
                     );
                     attachments.push((attachment_id, content_type));
                 }
-                let timestamp = now_ms();
+                // Der Zeitstempel muss ueber dem liegen, den die Gegenseite
+                // zuletzt von uns gesehen hat -- sonst zaehlt unsere
+                // Zuenddauer drueben nicht.
+                //
+                // Briar verwirft eine gemeldete Dauer, deren Zeitstempel nicht
+                // groesser ist als der zuletzt gespeicherte
+                // (AutoDeleteManagerImpl.receiveAutoDeleteTimer: "if (timestamp
+                // <= oldTimestamp) return"). Geht unsere Uhr nach -- auf N9 und
+                // N950 laeuft sie ohne Zeitdienst --, traegt jede Nachricht
+                // einen kleineren Stempel als die vorige der Gegenseite, und
+                // unsere Einstellung kaeme drueben nie an. Die Uhr wird dafuer
+                // nicht verstellt, nur dieser eine Wert vorgerueckt.
+                let timestamp = {
+                    let zuletzt = locked
+                        .contact(contact_id)
+                        .map(|c| c.loesch_stempel)
+                        .unwrap_or(0);
+                    now_ms().max(zuletzt.saturating_add(1))
+                };
+                // Die Zuenddauer faehrt mit -- ausser die Gegenseite hat
+                // ausdruecklich eine aeltere Nebenfassung angesagt. Wir sagen
+                // 3 an, also erwartet Briar sie von uns; eine dreigliedrige
+                // Nachricht liest es als "keine Dauer" und spiegelt sie
+                // zurueck.
+                let dauer = {
+                    let kann = locked
+                        .contact(contact_id)
+                        .map(|c| c.darf_zuenddauer_bekommen())
+                        .unwrap_or(false);
+                    let t = locked.contact(contact_id).map(|c| c.loesch_timer).unwrap_or(-1);
+                    if kann && t > 0 {
+                        Some(t as u64)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(c) = locked.contact_mut(contact_id) {
+                    // Die Aenderung ist jetzt draussen.
+                    c.loesch_stempel = timestamp;
+                    c.loesch_vorher = crate::store::keine_vorige();
+                }
                 let message_body = crate::sync::private_message_body_with(
                     if text.trim().is_empty() { None } else { Some(text.trim()) },
                     &attachments,
+                    dauer,
                 );
                 let message_id = crate::ids::message_id(&group, timestamp, &message_body);
                 let hex = to_hex(&message_id);
@@ -542,6 +666,15 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         acked: false,
                         attachment: attachments.first().map(|(id, _)| to_hex(id)),
                         attachment_type: attachments.first().map(|(_, t)| t.clone()),
+                        anhaenge: attachments
+                            .iter()
+                            .map(|(id, t)| crate::store::Anhangskopf {
+                                id: to_hex(id),
+                                content_type: Some(t.clone()),
+                            })
+                            .collect(),
+                        loesch_dauer: dauer,
+                        loesch_frist: None,
                     },
                 );
                 locked.queue(
@@ -553,6 +686,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         body: to_hex(&message_body),
                         acked: false,
                         intern: false,
+                        loesch_dauer: dauer,
                     },
                 );
                 if let Err(e) = locked.save() {
@@ -585,6 +719,18 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     "messages": contact.messages.iter().map(|m| {
                         let attachment = m.attachment.as_ref()
                             .and_then(|id| locked.attachment(id));
+                        // Alle Anhaenge -- die vier Felder darueber nennen
+                        // weiterhin den ersten, damit eine aeltere Oberflaeche
+                        // unveraendert weiterlaeuft.
+                        let anhaenge: Vec<Value> = m.anhaenge.iter().map(|kopf| {
+                            let datei = locked.attachment(&kopf.id);
+                            json!({
+                                "id": kopf.id,
+                                "type": kopf.content_type,
+                                "path": datei.map(|a| a.path.clone()),
+                                "size": datei.map(|a| a.size),
+                            })
+                        }).collect();
                         json!({
                             "id": m.id,
                             "timestamp": m.timestamp,
@@ -595,8 +741,15 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             "attachmentType": m.attachment_type,
                             "attachmentPath": attachment.map(|a| a.path.clone()),
                             "attachmentSize": attachment.map(|a| a.size),
+                            "attachments": anhaenge,
+                            // Verschwindende Nachricht: die Dauer und, wenn
+                            // die Uhr schon laeuft, der Zeitpunkt.
+                            "autoDelete": m.loesch_dauer,
+                            "deleteAt": m.loesch_frist,
                         })
                     }).collect::<Vec<Value>>(),
+                    "autoDelete": contact.loesch_timer,
+                    "autoDeleteReady": contact.zuenddauer_bestaetigt(),
                 }),
                 None => json!({"error": "no such contact"}),
             }
@@ -714,6 +867,14 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 let id = id as u32;
                 if let Some(contact) = locked.contact_mut(id) {
                     contact.last_read = now;
+                    // Gelesen heisst: die Uhr einer verschwindenden Nachricht
+                    // laeuft. Briar macht es an derselben Stelle
+                    // (ConversationManagerImpl.setReadFlag).
+                    for m in contact.messages.iter_mut() {
+                        if !m.outgoing {
+                            net::loeschuhr_starten(m, now);
+                        }
+                    }
                 }
                 let _ = locked.save();
                 drop(locked);
@@ -929,6 +1090,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     body: to_hex(&invite),
                     acked: false,
                     intern: false,
+                    loesch_dauer: None,
                 },
             );
             // Die Kennung DIESER INVITE ist der erste Anker der Kette zu
@@ -1042,6 +1204,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         body: to_hex(&join),
                         acked: false,
                         intern: false,
+                        loesch_dauer: None,
                     },
                 );
             }
@@ -1077,6 +1240,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             body: to_hex(&rumpf),
                             acked: false,
                             intern: false,
+                            loesch_dauer: None,
                         },
                     );
                     // Fortschreiben in DER Sitzung, aus der die Kette kommt --
@@ -1186,6 +1350,7 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         body: to_hex(&post),
                         acked: false,
                         intern: false,
+                        loesch_dauer: None,
                     },
                 );
             }
@@ -1281,14 +1446,34 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                     locked.queue(
                         *kontakt,
                         OutMessage {
-                            id: kennung,
+                            id: kennung.clone(),
                             group: to_hex(&einladungsgruppe),
                             timestamp,
                             body: to_hex(&rumpf),
                             acked: false,
                             intern: false,
+                            loesch_dauer: None,
                         },
                     );
+                    // Die Kette fortschreiben -- das LEAVE ist ab jetzt unsere
+                    // letzte eigene Nachricht in dieser Sitzung.
+                    //
+                    // Ohne diese Zeile stand hier fuer eine nie angenommene
+                    // Einladung weiterhin None. Briars Ersteller merkt sich
+                    // dagegen die Kennung unseres LEAVE (CreatorProtocolEngine
+                    // onRemoteDecline) und macht sie zur Vorbedingung des
+                    // naechsten JOIN (isValidDependency). Unser JOIN nach einer
+                    // zweiten Einladung nannte also die falsche vorige
+                    // Nachricht, Briar brach die Sitzung ab (ABORT) und stellte
+                    // die Gruppe fuer uns auf unsichtbar: jeder weitere Beitrag
+                    // von uns wurde dort weder gespeichert noch quittiert, und
+                    // von drueben kam nichts mehr. Ein Weg zurueck gab es
+                    // nicht. Der Kommentar darunter beschrieb die Regel schon,
+                    // der Code hielt sie nur nicht ein.
+                    if let Some(s) = locked.sitzung_mut(&group_hex, *kontakt) {
+                        s.letzte_eigene = Some(kennung);
+                        s.eigener_zeitstempel = timestamp;
+                    }
                 }
             }
             // Die Sitzungen ueberleben die Gruppe. Entfernen ist auf der
@@ -1404,6 +1589,11 @@ fn status(store: &Shared) -> Value {
                 // der Benutzer geschrieben hat.
                 "unsent": c.outbox.iter().filter(|m| !m.acked && !m.intern).count(),
                 "lastText": c.messages.last().map(|m| m.text.clone()),
+                // Verschwindende Nachrichten: die Dauer in Millisekunden,
+                // -1 heisst aus. "autoDeleteReady" sagt, ob die Gegenseite
+                // sie ueberhaupt liest.
+                "autoDelete": c.loesch_timer,
+                "autoDeleteReady": c.zuenddauer_bestaetigt(),
             })
         })
         .collect();
@@ -1478,6 +1668,14 @@ fn status(store: &Shared) -> Value {
         "tor": locked.state.tor,
         "onion": locked.state.tor_onion,
         "revision": locked.state.revision,
+        // Steht die Uhr dieses Geraets erkennbar falsch? Dann kommt nichts an,
+        // ohne dass es jemand merkt: Briar verwirft eine Nachricht, deren
+        // Zeitstempel mehr als einen Tag in seiner Zukunft liegt -- quittiert
+        // sie aber vorher, also gilt sie bei uns als zugestellt. Und ein
+        // Kontaktaustausch mit einer Uhr vor 2021 scheitert drueben ganz.
+        // N9 und N950 haben keinen Zeitdienst; eine leere Pufferbatterie
+        // setzt sie auf 1970.
+        "clockWrong": net::uhr_steht_falsch(),
         "contacts": contacts,
         "pending": pending,
         "groups": groups,
@@ -1595,5 +1793,195 @@ fn bridge_send(store: &Shared, to: &str, text: &str) -> Value {
             "",
             &json!({"contact": contact_id, "text": text}),
         )
+    }
+}
+
+#[cfg(test)]
+mod gruppenablehnung_tests {
+    use super::*;
+    use crate::store::{Einladungssitzung, PrivateGroup, Sitzungszustand};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    const IHR: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const GRUPPE: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn speicher() -> Shared {
+        let mut p = std::env::temp_dir();
+        p.push("briar-gruppenablehnung.json");
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        store.state.contacts.push(crate::store::Contact {
+            id: 1,
+            name: "Einladende".to_string(),
+            author_id: IHR.to_string(),
+            signature_public: IHR.to_string(),
+            handshake_public: Some(IHR.to_string()),
+            master_key: IHR.to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        });
+        let mut einladungen = BTreeMap::new();
+        einladungen.insert(
+            1u32,
+            Einladungssitzung {
+                letzte_eigene: None,
+                letzte_fremde: Some("ff01".to_string()),
+                eigener_zeitstempel: 1_700_000_000_000,
+                einladungs_zeitstempel: 1_700_000_000_000,
+                zustand: Sitzungszustand::Eingeladen,
+            },
+        );
+        store.state.groups.push(PrivateGroup {
+            id: GRUPPE.to_string(),
+            name: "Testgruppe".to_string(),
+            salt: "44".to_string(),
+            creator_name: "Einladende".to_string(),
+            creator_public: IHR.to_string(),
+            creator_author_id: IHR.to_string(),
+            joined: false,
+            invited_by: Some(1),
+            invite_timestamp: Some(1_700_000_000_000),
+            invite_signature: None,
+            member_names: BTreeMap::new(),
+            last_read: 0,
+            messages: Vec::new(),
+            our_previous: None,
+            einladungen,
+            einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
+            contacts: vec![1],
+        });
+        Arc::new(Mutex::new(store))
+    }
+
+    /// Eine Einladung abzulehnen heisst hier, die Gruppe zu entfernen -- auf
+    /// der Leitung ist das ein LEAVE. Dessen Kennung MUSS in der Sitzung
+    /// stehenbleiben: Briars Ersteller macht sie zur Vorbedingung des
+    /// naechsten JOIN (isValidDependency). Stand dort weiter None, brach Briar
+    /// die Sitzung nach einer zweiten Einladung ab und stellte die Gruppe fuer
+    /// uns auf unsichtbar -- ohne Weg zurueck.
+    #[test]
+    fn ablehnen_merkt_sich_die_kennung_des_leave() {
+        let store = speicher();
+        let antwort = handle(
+            Arc::clone(&store),
+            "POST",
+            "/group/remove",
+            "",
+            &json!({"group": GRUPPE}),
+        );
+        assert!(antwort.get("error").is_none(), "{}", antwort);
+
+        let locked = store.lock().unwrap();
+        let sitzung = locked
+            .state
+            .verlassene_einladungen
+            .get(GRUPPE)
+            .and_then(|m| m.get(&1))
+            .expect("die Sitzung ueberlebt die Gruppe");
+        let kennung = sitzung
+            .letzte_eigene
+            .clone()
+            .expect("das LEAVE steht als letzte eigene Nachricht");
+
+        // Und es ist wirklich die Kennung der Nachricht, die hinausgeht.
+        let korb = &locked.state.contacts[0].outbox;
+        assert!(
+            korb.iter().any(|m| m.id == kennung),
+            "die gemerkte Kennung liegt so auch im Korb: {:?}",
+            korb.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(sitzung.eigener_zeitstempel, korb.iter().find(|m| m.id == kennung).unwrap().timestamp);
+    }
+}
+
+#[cfg(test)]
+mod zeitstempel_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Der Zeitstempel einer Privatnachricht rueckt ueber den zuletzt an diese
+    /// Gegenseite gemeldeten hinaus. Sonst verwirft Briar unsere Zuenddauer,
+    /// weil sie nicht neuer ist als die zuletzt gesehene.
+    #[test]
+    fn zeitstempel_rueckt_ueber_den_zuletzt_gemeldeten() {
+        let mut p = std::env::temp_dir();
+        p.push("briar-zeitstempel-test.json");
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        store.state.contacts.push(crate::store::Contact {
+            id: 1,
+            name: "Gegenueber".to_string(),
+            author_id: "22".to_string(),
+            signature_public: "22".to_string(),
+            handshake_public: None,
+            master_key: "22".to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: Default::default(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: 60_000,
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        });
+        // Die Gegenseite hat zuletzt einen Stempel weit in der Zukunft
+        // gesehen -- so sieht es aus, wenn unsere eigene Uhr nachgeht.
+        let weit = now_ms() + 3_600_000;
+        store.contact_mut(1).unwrap().loesch_stempel = weit;
+        let store: Shared = Arc::new(Mutex::new(store));
+
+        let antwort = handle(
+            Arc::clone(&store),
+            "POST",
+            "/send",
+            "",
+            &json!({"contact": 1, "text": "hallo"}),
+        );
+        assert!(antwort.get("error").is_none(), "{}", antwort);
+
+        let locked = store.lock().unwrap();
+        let nachricht = locked.state.contacts[0]
+            .messages
+            .last()
+            .expect("die Nachricht steht im Verlauf");
+        assert!(
+            nachricht.timestamp > weit,
+            "{} muss ueber {} liegen",
+            nachricht.timestamp,
+            weit
+        );
+        assert_eq!(locked.state.contacts[0].loesch_stempel, nachricht.timestamp);
+        assert_eq!(nachricht.loesch_dauer, Some(60_000));
     }
 }

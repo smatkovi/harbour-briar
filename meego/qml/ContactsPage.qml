@@ -31,6 +31,11 @@ Page {
         id: menue
         MenuLayout {
             MenuItem {
+                text: fenster.tr("meetAction")
+                enabled: !!fenster.zustand.identity
+                onClicked: pageStack.push(Qt.resolvedUrl("MeetPage.qml"))
+            }
+            MenuItem {
                 text: fenster.tr("scanQr")
                 enabled: !!fenster.zustand.identity
                 onClicked: pageStack.push(Qt.resolvedUrl("ScanPage.qml"))
@@ -150,6 +155,18 @@ Page {
         Label {
             visible: fenster.fehler.length > 0
             text: fenster.fehler
+            width: parent.width
+            wrapMode: Text.Wrap
+            color: "#ff6666"
+            font.pixelSize: 20
+        }
+
+        // Auf diesen Geraeten gibt es keinen Zeitdienst, und eine leere
+        // Pufferbatterie setzt die Uhr auf 1970. Dann kommt nichts mehr an,
+        // ohne dass es jemand merkt -- die Gegenseite quittiert und verwirft.
+        Label {
+            visible: !!fenster.zustand.clockWrong
+            text: fenster.tr("clockWrong")
             width: parent.width
             wrapMode: Text.Wrap
             color: "#ff6666"

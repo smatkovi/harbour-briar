@@ -11,11 +11,33 @@ Page {
     property int contactId: 0
     property string contactName: ""
     property var messages: []
+    // Verschwindende Nachrichten: die Dauer in Millisekunden, -1 heisst aus.
+    property int autoDelete: -1
+    property bool autoDeleteReady: false
+    // Wieviele fremde Nachrichten schon als gelesen gemeldet sind.
+    property int fremdeGesehen: 0
 
     function reload() {
         Briar.messages(contactId, function(answer) {
-            if (!answer.error)
+            if (!answer.error) {
+                // Ist etwas Neues gekommen, waehrend das Gespraech offen war,
+                // gilt es als gelesen -- sonst liefe die Uhr einer
+                // verschwindenden Nachricht erst beim naechsten Oeffnen an.
+                var fremde = 0
+                for (var i = 0; i < answer.messages.length; i++)
+                    if (!answer.messages[i].outgoing)
+                        fremde++
+                if (fremde > page.fremdeGesehen) {
+                    page.fremdeGesehen = fremde
+                    if (page.messages.length > 0)
+                        Briar.markRead({"contact": page.contactId},
+                                       function() { app.refresh() })
+                }
                 page.messages = answer.messages
+                page.autoDelete = answer.autoDelete !== undefined
+                        ? answer.autoDelete : -1
+                page.autoDeleteReady = !!answer.autoDeleteReady
+            }
         })
     }
 
@@ -43,6 +65,60 @@ Page {
             field.text = ""
             page.reload()
         })
+    }
+
+    // Wie lange eine neue Nachricht in diesem Gespraech stehen bleibt. Die
+    // Einstellung gilt fuer beide Seiten: sie faehrt in der naechsten
+    // Nachricht mit, und die Gegenseite uebernimmt sie.
+    Component {
+        id: zuenddauer
+        Page {
+            allowedOrientations: Orientation.All
+            Column {
+                width: parent.width
+                spacing: Theme.paddingMedium
+
+                PageHeader { title: app.tr("autoDelete") }
+
+                Label {
+                    x: Theme.horizontalPageMargin
+                    width: parent.width - 2 * Theme.horizontalPageMargin
+                    wrapMode: Text.Wrap
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    color: Theme.secondaryColor
+                    text: page.autoDeleteReady ? app.tr("autoDeleteHint")
+                                               : app.tr("autoDeleteNotYet")
+                }
+
+                Repeater {
+                    model: [ { "t": -1,      "k": "autoDeleteOff" },
+                             { "t": 60000,   "k": "autoDelete1Min" },
+                             { "t": 3600000, "k": "autoDelete1Hour" },
+                             { "t": 86400000, "k": "autoDelete1Day" },
+                             { "t": 604800000, "k": "autoDelete1Week" } ]
+                    ListItem {
+                        width: parent.width
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: app.tr(modelData.k)
+                            color: modelData.t === page.autoDelete
+                                   ? Theme.highlightColor : Theme.primaryColor
+                        }
+                        onClicked: {
+                            Briar.setAutoDelete(page.contactId, modelData.t,
+                                                function(antwort) {
+                                if (antwort.error)
+                                    app.lastError = antwort.error
+                                else
+                                    page.autoDelete = modelData.t
+                                pageStack.pop()
+                            })
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Bild oder Datei -- zwei Wege, weil die Galerie anders aussieht als
@@ -134,7 +210,22 @@ Page {
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: input.top }
         model: page.messages
         clip: true
-        header: PageHeader { title: page.contactName }
+        header: Column {
+            width: parent.width
+            PageHeader { title: page.contactName }
+            // Steht die Zuenddauer, soll man das sehen, ohne ins Menue zu
+            // gehen -- sonst schreibt man ahnungslos etwas, das wieder geht.
+            Label {
+                visible: page.autoDelete > 0
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                horizontalAlignment: Text.AlignRight
+                font.pixelSize: Theme.fontSizeExtraSmall
+                color: Theme.highlightColor
+                text: app.tr("autoDeleteOn")
+                      + Briar.autoDeleteName(page.autoDelete, app.tr)
+            }
+        }
         onCountChanged: positionViewAtEnd()
 
         PullDownMenu {
@@ -159,6 +250,11 @@ Page {
                     else
                         page.auswahl = true
                 }
+            }
+            MenuItem {
+                text: app.tr("autoDelete") + ": "
+                      + Briar.autoDeleteName(page.autoDelete, app.tr)
+                onClicked: pageStack.push(zuenddauer)
             }
             MenuItem {
                 text: app.tr("deleteAllMessages")
@@ -213,11 +309,12 @@ Page {
                                 page.auswahlUmschalten(modelData.id)
                                 return
                             }
-                            if (modelData.attachmentPath)
+                            var liste = Briar.attachmentsOf(modelData)
+                            if (liste.length > 0 && liste[0].path)
                                 pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
-                                    "pfad": modelData.attachmentPath,
-                                    "typ": "" + modelData.attachmentType,
-                                    "groesse": modelData.attachmentSize || 0
+                                    "pfad": liste[0].path,
+                                    "typ": "" + liste[0].type,
+                                    "groesse": liste[0].size || 0
                                 })
                         }
                         // Halten loescht sie -- nur hier, die Gegenseite
@@ -230,28 +327,49 @@ Page {
                             })
                     }
 
-                    Image {
-                        id: picture
-                        visible: modelData.attachmentPath
-                                 && ("" + modelData.attachmentType).indexOf("image/") === 0
-                        source: modelData.attachmentPath
-                                ? "file://" + modelData.attachmentPath : ""
-                        width: Math.min(sourceSize.width, view.width * 0.6)
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                    }
+                    // Alle Anhaenge, nicht nur der erste: Briar haengt bis
+                    // zu zehn Bilder an eine Nachricht. Jeder laesst sich
+                    // einzeln antippen.
+                    Repeater {
+                        model: Briar.attachmentsOf(modelData)
 
-                    Label {
-                        id: other
-                        visible: modelData.attachmentPath && !picture.visible
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        color: Theme.highlightColor
-                        font.pixelSize: Theme.fontSizeExtraSmall
-                        text: app.tr("attach") + ": "
-                              + ("" + modelData.attachmentType)
-                              + " (" + Math.round((modelData.attachmentSize || 0) / 1024)
-                              + " KB)"
+                        Item {
+                            width: parent.width
+                            height: bild.visible ? bild.height : sonstiges.height
+
+                            Image {
+                                id: bild
+                                visible: Briar.isImage(modelData) && !!modelData.path
+                                source: modelData.path ? "file://" + modelData.path : ""
+                                width: Math.min(sourceSize.width, view.width * 0.6)
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+
+                            Label {
+                                id: sonstiges
+                                visible: !bild.visible
+                                width: parent.width
+                                wrapMode: Text.Wrap
+                                color: Theme.highlightColor
+                                font.pixelSize: Theme.fontSizeExtraSmall
+                                text: app.tr("attach") + ": "
+                                      + ("" + modelData.type)
+                                      + " (" + Math.round((modelData.size || 0) / 1024)
+                                      + " KB)"
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: !page.auswahl && !!modelData.path
+                                onClicked: pageStack.push(
+                                    Qt.resolvedUrl("AttachmentPage.qml"), {
+                                        "pfad": modelData.path,
+                                        "typ": "" + modelData.type,
+                                        "groesse": modelData.size || 0
+                                    })
+                            }
+                        }
                     }
 
                     Label {
