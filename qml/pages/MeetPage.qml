@@ -190,7 +190,13 @@ Page {
     Connections {
         target: app
         onStatusChanged: {
-            if (page.lage >= 2)
+            // Nur ein wirklicher Erfolg haelt uns hier auf. Nach einem
+            // gemeldeten Fehlschlag schauen wir weiter: der Dienst hat den
+            // Kontakt womoeglich doch angelegt -- genau so ist es passiert,
+            // "Kontakt angelegt" und "gescheitert" standen in derselben
+            // Sekunde im Protokoll -- und dann soll die Seite das sagen,
+            // statt "hat nicht geklappt" stehenzulassen.
+            if (page.lage === 2)
                 return
             var jetzt = app.status.contacts ? app.status.contacts.length : 0
             if (jetzt > page.kontakteVorher) {

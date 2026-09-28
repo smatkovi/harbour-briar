@@ -4783,6 +4783,9 @@ impl Node {
         // fluechtigen Port weiter, und schlimmer: sein Faden raeumt beim
         // Aufhoeren den frischen Lauf mit weg.
         Self::bqp_stop();
+        // Ein frischer Lauf faengt ohne das Ergebnis des vorigen an, sonst
+        // meldete der zweite Versuch den Kontakt des ersten.
+        *BQP_ERGEBNIS.lock().unwrap() = None;
         let privat = crate::crypto::generate_agreement_private_key();
         let oeffentlich = crate::crypto::agreement_public_key(&privat);
         let lauscher = std::net::TcpListener::bind(("0.0.0.0", 0))?;
@@ -4908,6 +4911,7 @@ impl Node {
                             ) {
                                 Ok(id) => {
                                     log(&format!("BQP: Kontakt {} nebeneinander angelegt", id));
+                                    *BQP_ERGEBNIS.lock().unwrap() = Some(id);
                                     kontakt2.store(id, std::sync::atomic::Ordering::Relaxed);
                                     fertig2.store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
@@ -4999,6 +5003,7 @@ impl Node {
                 ) {
                     Ok(id) => {
                         log(&format!("BQP: Kontakt {} ueber Bluetooth angelegt", id));
+                        *BQP_ERGEBNIS.lock().unwrap() = Some(id);
                         kontakt.store(id, std::sync::atomic::Ordering::Relaxed);
                         fertig.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -5265,6 +5270,11 @@ impl Node {
             }
             // Hat unser eigener Lauscher derweil eine Verbindung angenommen
             // und den Austausch erledigt, ist hier nichts mehr zu tun.
+            // Zuerst das Ergebnis, dann den Lauf: der Lauf verschwindet, sobald
+            // der Lauscher fertig ist, das Ergebnis bleibt.
+            if let Some(id) = *BQP_ERGEBNIS.lock().unwrap() {
+                return Ok(id);
+            }
             let schon = BQP.lock().unwrap().as_ref().map(|l| {
                 (
                     l.fertig.load(std::sync::atomic::Ordering::Relaxed),
@@ -5464,6 +5474,7 @@ impl Node {
         )?;
         log("BQP: die Einigung steht");
         let id = self.bqp_austausch(strom, master, alice, gegen_ip)?;
+        *BQP_ERGEBNIS.lock().unwrap() = Some(id);
         if let Some(lauf) = BQP.lock().unwrap().as_ref() {
             lauf.kontakt.store(id, std::sync::atomic::Ordering::Relaxed);
             lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5476,15 +5487,30 @@ impl Node {
 /// eintrifft, waehrend der Lauscher schon laeuft.
 pub static BQP_GEGENUEBER: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
+/// Die Nummer des Kontakts, den der letzte Lauf angelegt hat.
+///
+/// Getrennt von BQP, weil der Lauf selbst zu frueh verschwindet: der Lauscher
+/// setzt bei Erfolg `fertig` und `kontakt`, verlaesst dann seine Schleife und
+/// raeumt BQP weg. Der anwaehlende Faden schaute gleich darauf nach -- fand
+/// None -- und meldete "der Lauf wurde beendet", obwohl der Kontakt eine
+/// Zeile darueber angelegt worden war. Im Protokoll stand beides in
+/// derselben Sekunde:
+///
+///     BQP: Kontakt 1 nebeneinander angelegt
+///     BQP: gescheitert: der Lauf wurde beendet
+///
+/// und die Oberflaeche sagte "hat nicht geklappt", obwohl es geklappt hatte.
+pub static BQP_ERGEBNIS: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
 #[cfg(test)]
-mod bqp_dienst_tests {
+pub(crate) mod bqp_dienst_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::sync::{Arc, Mutex};
 
     /// BQP.. und BQP_GEGENUEBER sind prozessweit. Zwei Pruefungen, die beide
     /// daran ruehren, duerfen nicht nebeneinander laufen.
-    static PRUEFSPERRE: Mutex<()> = Mutex::new(());
+    pub(crate) static PRUEFSPERRE: Mutex<()> = Mutex::new(());
 
     fn knoten(name: &str) -> Node {
         let mut p = std::env::temp_dir();
@@ -5921,4 +5947,36 @@ mod zusage_tests {
 /// erkennen will, braucht eine Zeitquelle von aussen.
 pub fn uhr_steht_falsch() -> bool {
     now_ms() < MIN_VERNUENFTIGE_ZEIT_MS
+}
+
+#[cfg(test)]
+mod bqp_ergebnis_tests {
+    use super::*;
+
+    /// Das Ergebnis eines Treffens muss den Lauf ueberleben.
+    ///
+    /// Der Lauscher setzt bei Erfolg `fertig` und `kontakt`, verlaesst dann
+    /// seine Schleife und raeumt BQP weg. Der anwaehlende Faden schaute
+    /// gleich darauf nach, fand None und meldete "der Lauf wurde beendet" --
+    /// obwohl der Kontakt eine Zeile darueber angelegt worden war. Im
+    /// Protokoll stand beides in derselben Sekunde, und die Oberflaeche sagte
+    /// "hat nicht geklappt".
+    #[test]
+    fn das_ergebnis_ueberlebt_den_aufgeraeumten_lauf() {
+        let _sperre = crate::net::bqp_dienst_tests::PRUEFSPERRE.lock().unwrap();
+        *BQP_ERGEBNIS.lock().unwrap() = None;
+        *BQP.lock().unwrap() = None;
+
+        // Der Lauscher war erfolgreich und hat den Lauf danach weggeraeumt.
+        *BQP_ERGEBNIS.lock().unwrap() = Some(7);
+        assert!(
+            BQP.lock().unwrap().is_none(),
+            "der Lauf ist weg -- genau der Zustand, um den es geht"
+        );
+
+        // Wer jetzt fragt, muss den Erfolg sehen und nicht den leeren Lauf.
+        let gesehen = *BQP_ERGEBNIS.lock().unwrap();
+        assert_eq!(gesehen, Some(7));
+        *BQP_ERGEBNIS.lock().unwrap() = None;
+    }
 }

@@ -138,7 +138,13 @@ Page {
     Connections {
         target: fenster
         onZustandChanged: {
-            if (seite.lage >= 2) return
+            // Nur ein wirklicher Erfolg haelt uns hier auf. Nach einem
+            // gemeldeten Fehlschlag schauen wir weiter: der Dienst hat den
+            // Kontakt womoeglich doch angelegt -- genau so ist es passiert,
+            // "Kontakt angelegt" und "gescheitert" standen in derselben
+            // Sekunde im Protokoll -- und dann soll die Seite das sagen,
+            // statt "hat nicht geklappt" stehenzulassen.
+            if (seite.lage === 2) return
             var jetzt = fenster.zustand.contacts
                     ? fenster.zustand.contacts.length : 0
             if (jetzt > seite.kontakteVorher) {

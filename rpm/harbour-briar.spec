@@ -1,6 +1,6 @@
 Name:       harbour-briar
 Summary:    Briar for Sailfish OS
-Version:    0.35.0
+Version:    0.35.2
 Release:    1
 License:    GPLv3
 URL:        https://github.com/smatkovi/harbour-briar
@@ -35,6 +35,16 @@ briar:// link and address.
 
 %install
 %qmake5_install
+
+%post
+# Den alten Dienst beenden. Er ist ein eigener, langlebiger Prozess: die App
+# startet ihn nur, wenn keiner laeuft, und nach einer Aktualisierung liefe
+# sonst der alte weiter -- mit dem alten Verhalten, waehrend die neue
+# Binaerdatei danebenliegt. Das hat schon mehrere Fehlersuchen gekostet.
+# Beim naechsten Oeffnen der App startet der neue; das Passwort wird dabei
+# einmal wieder gebraucht, weil der Speicher versiegelt.
+pkill -x harbour-briar-briard 2>/dev/null || :
+exit 0
 
 %files
 %defattr(-,root,root,-)

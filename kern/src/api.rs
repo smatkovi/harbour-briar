@@ -1733,6 +1733,10 @@ fn status(store: &Shared) -> Value {
         // N9 und N950 haben keinen Zeitdienst; eine leere Pufferbatterie
         // setzt sie auf 1970.
         "clockWrong": net::uhr_steht_falsch(),
+        // Welche Fassung hier wirklich laeuft. Das Paket zu lesen sagt nur,
+        // was auf der Platte liegt -- der Dienst ueberlebt eine
+        // Aktualisierung, wenn ihn niemand beendet.
+        "version": env!("CARGO_PKG_VERSION"),
         "contacts": contacts,
         "pending": pending,
         "groups": groups,

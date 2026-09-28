@@ -47,6 +47,17 @@ text = text.replace("@ICON@", "\n".join(" " + line for line in textwrap.wrap(ico
 io.open("build/stage/DEBIAN/control", "w", encoding="utf-8").write(text)
 PY
 
+# Nach dem Einspielen den alten Dienst beenden -- siehe die Begruendung im
+# RPM-Rezept. busybox kennt kein pkill -x, also ueber pgrep.
+cat > "$STAGE/DEBIAN/postinst" <<'SH'
+#!/bin/sh
+for p in $(pgrep briard 2>/dev/null); do
+    kill "$p" 2>/dev/null
+done
+exit 0
+SH
+chmod 755 "$STAGE/DEBIAN/postinst"
+
 DEB="briar_${VERSION}_armel.deb"
 python3 meego/mkdeb.py "$STAGE" "$DEB"
 echo "== $DEB"
