@@ -107,8 +107,9 @@ impl Payload {
     ///
     /// Briar selbst nennt eine (LanTcpPlugin.createKeyAgreementListener) und
     /// behaelt beim Lesen die letzte je Verkehrsweg
-    /// (KeyAgreementConnector:122) -- mehrere zu nennen schadet ihm also
-    /// nicht, und mehrere zu lesen kostet uns nichts.
+    /// (KeyAgreementConnector:122) -- von mehreren waehlt es also nur die
+    /// letzte an. Darum nennt unser Code das engste Netz zuletzt
+    /// (net::lan_beschreiber); mehrere zu lesen kostet uns nichts.
     pub fn lan_alle(&self) -> Vec<String> {
         let mut gefunden = Vec::new();
         for d in &self.descriptors {

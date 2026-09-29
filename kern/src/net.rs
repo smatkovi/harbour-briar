@@ -138,6 +138,29 @@ pub(crate) fn anforderungen_fortschreiben(
     }
 }
 
+/// Die WLAN-Beschreiber fuer den eigenen Code, in der Reihenfolge, in der sie
+/// hinausgehen. `adressen` kommt engste Maske zuerst (local_ips); Briar
+/// behaelt je Verkehrsweg den LETZTEN Beschreiber (KeyAgreementConnector:122,
+/// HashMap.put) und waehlt nur den an -- also dreht die Liste hier um, damit
+/// das engste Netz zuletzt steht. Vorher stand es vorne, und ein Briar in
+/// zwei Netzen bekam das weiteste angeboten.
+pub(crate) fn lan_beschreiber(
+    adressen: &[std::net::Ipv4Addr],
+    port: u16,
+) -> Vec<crate::bdf::Bdf> {
+    adressen
+        .iter()
+        .rev()
+        .map(|ip| {
+            crate::bdf::Bdf::List(vec![
+                crate::bdf::Bdf::Int(crate::bqp::TRANSPORT_LAN),
+                crate::bdf::Bdf::Raw(ip.octets().to_vec()),
+                crate::bdf::Bdf::Int(port as i64),
+            ])
+        })
+        .collect()
+}
+
 /// Einen Kontakt in die Verteilliste einer Gruppe nehmen -- wenn die Gruppe
 /// noch steht und er nicht gegangen ist.
 fn mitglied_eintragen(store: &mut Store, group_hex: &str, contact_id: u32) {
@@ -4991,22 +5014,17 @@ impl Node {
         // zwischen Jolla und N9 passiert.
         //
         // Briar legt die Beschreiber in eine HashMap nach Verkehrsweg
-        // (KeyAgreementConnector:122), dort gewinnt also der LETZTE. Unser
-        // eigener Anwaehler probiert alle. Mehrere zu nennen ist damit nie
-        // schlechter als einer und fuer zwei eigene Geraete deutlich besser.
-        let mut beschreiber: Vec<crate::bdf::Bdf> = Vec::new();
-        let mut genannte: Vec<String> = Vec::new();
-        for ip in local_ips()
+        // (KeyAgreementConnector:122), dort gewinnt also der LETZTE -- und nur
+        // den waehlt es an. Darum steht bei uns das engste Netz zuletzt
+        // (lan_beschreiber): bei zwei Geraeten nebeneinander ist es das
+        // aussichtsreichste. Unser eigener Anwaehler probiert alle; fuer Briar
+        // zaehlt allein die Reihenfolge.
+        let adressen: Vec<std::net::Ipv4Addr> = local_ips()
             .into_iter()
             .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
-        {
-            genannte.push(ip.to_string());
-            beschreiber.push(crate::bdf::Bdf::List(vec![
-                crate::bdf::Bdf::Int(crate::bqp::TRANSPORT_LAN),
-                crate::bdf::Bdf::Raw(ip.octets().to_vec()),
-                crate::bdf::Bdf::Int(port as i64),
-            ]));
-        }
+            .collect();
+        let genannte: Vec<String> = adressen.iter().map(|ip| ip.to_string()).collect();
+        let mut beschreiber = lan_beschreiber(&adressen, port);
         log(&format!(
             "BQP: im Code stehen {} ({})",
             if genannte.is_empty() {
@@ -6273,5 +6291,25 @@ mod abgleich_tests {
         assert_eq!(ruhe_fuer(LAN_TRANSPORT_ID), RUHE);
         assert_eq!(ruhe_fuer(BLUETOOTH_TRANSPORT_ID), RUHE);
         assert!(nachfrist(RUHE) > RUHE);
+    }
+
+    /// local_ips liefert das engste Netz zuerst; im Code muss es zuletzt
+    /// stehen, weil Briar den letzten Beschreiber je Verkehrsweg behaelt.
+    #[test]
+    fn engstes_netz_steht_im_code_zuletzt() {
+        let adressen: Vec<std::net::Ipv4Addr> =
+            vec!["10.0.0.5".parse().unwrap(), "192.168.1.5".parse().unwrap()];
+        let b = lan_beschreiber(&adressen, 4321);
+        assert_eq!(b.len(), 2);
+        let letzte = b[1].as_list().unwrap();
+        assert_eq!(letzte[0].as_int(), Some(crate::bqp::TRANSPORT_LAN));
+        assert_eq!(letzte[1].as_raw().unwrap(), &[10, 0, 0, 5]);
+        assert_eq!(letzte[2].as_int(), Some(4321));
+        // Unser eigener Leser sieht beide, Briar naehme die letzte.
+        let p = crate::bqp::Payload {
+            commitment: vec![0; 32],
+            descriptors: b,
+        };
+        assert_eq!(p.lan_alle(), vec!["192.168.1.5:4321", "10.0.0.5:4321"]);
     }
 }
