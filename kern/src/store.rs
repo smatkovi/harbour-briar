@@ -39,8 +39,19 @@ pub struct TransportState {
     /// und zwar dauerhaft, weil er nur steigt.
     #[serde(default)]
     pub out_streams: BTreeMap<String, u64>,
-    /// Next expected incoming stream number, per time period
+    /// Der Fusspunkt (base) unseres Empfangsfensters je Zeitabschnitt: die
+    /// kleinste Nummer, die noch erkannt werden kann. Das Fenster reicht von
+    /// hier 32 Nummern weit (ReorderingWindow.java).
     pub in_stream: BTreeMap<String, u64>,
+    /// Welche Nummern im Fenster schon gesehen sind, je Zeitabschnitt: Bit i
+    /// gesetzt heisst `in_stream + i` ist verbraucht. Briar fuehrt dasselbe
+    /// als Bitfeld von 32 (ReorderingWindow.java:17-18); ohne es liesse sich
+    /// ein mitgeschnittener Strom erneut einspielen, solange seine Nummer
+    /// ueber dem Fusspunkt liegt. Nur bei Kontakten gefuehrt -- bei Wartenden
+    /// bleibt es leer (siehe `net::fenster_nachziehen`). Fehlt es in einer
+    /// alten Datei, gilt alles als ungesehen: das ist der alte Stand.
+    #[serde(default)]
+    pub in_gesehen: BTreeMap<String, u32>,
     /// Der Lauschport, den die Gegenseite gemeldet hat. Briar wuerfelt ihn
     /// beim ersten Start aus 32768..65535 und behaelt ihn -- eine feste
     /// Nummer gibt es dort nicht. Ohne diesen Wert laesst sich weder eine
@@ -161,8 +172,360 @@ pub struct Anhangskopf {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attachment {
     pub content_type: String,
+    /// Die Datei unter `attachments/`. Bei einem versiegelten Anhang ist das
+    /// die `.siegel`-Datei -- die Oberflaeche bekommt stattdessen die Kopie
+    /// aus `Store::anhang_pfad`.
     pub path: String,
+    /// Groesse des Klartexts.
     pub size: u64,
+    /// Liegt die Datei mit dem Siegel verschluesselt? Ein eigenes Feld statt
+    /// eines Blicks auf die Endung; alte Staende kennen es nicht und sind
+    /// damit richtig als Klartext eingetragen.
+    #[serde(default)]
+    pub versiegelt: bool,
+}
+
+/// Was die Magic-Bytes ueber einen Inhalt sagen. Ein Typ je Signatur; Ogg,
+/// MP4 und Matroska/WebM tragen Ton wie Bild und stehen hier unter einem
+/// Vertreter -- die Familienpruefung beim Empfang (`empfangener_typ`) zaehlt
+/// sie fuer audio/* und video/*.
+///
+/// Nur noch in den Tests: sie belegen damit, dass jede Signatur, die
+/// `empfangener_typ` je Familie prueft, auch erkannt wird.
+#[cfg(test)]
+fn typ_aus_inhalt(daten: &[u8]) -> Option<&'static str> {
+    let d = daten;
+    if d.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if d.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if d.starts_with(b"GIF87a") || d.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if d.len() >= 12 && d.starts_with(b"RIFF") {
+        match &d[8..12] {
+            b"WEBP" => return Some("image/webp"),
+            b"WAVE" => return Some("audio/wav"),
+            _ => {}
+        }
+    }
+    if d.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if d.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if d.len() >= 8 && &d[4..8] == b"ftyp" {
+        return Some("video/mp4");
+    }
+    if d.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("video/webm");
+    }
+    if ist_mpeg_ton(d) {
+        return Some("audio/mpeg");
+    }
+    // Zwei Bytes sind eine schwache Signatur; deshalb erst nach allen
+    // laengeren.
+    if d.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if ist_text(d) {
+        return Some("text/plain");
+    }
+    None
+}
+
+/// ID3-Kopf oder ein MPEG-Rahmen (11 gesetzte Sync-Bits: FF Ex / FF Fx).
+fn ist_mpeg_ton(d: &[u8]) -> bool {
+    d.starts_with(b"ID3") || (d.len() >= 2 && d[0] == 0xFF && d[1] & 0xE0 == 0xE0)
+}
+
+fn ist_text(d: &[u8]) -> bool {
+    !d.contains(&0) && std::str::from_utf8(d).is_ok()
+}
+
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// Einen gemeldeten Typ in die Form `[a-z0-9.+-]+/[a-z0-9.+-]+` bringen
+/// (kleingeschrieben, ohne Leerraum und ohne Parameter wie "; charset=...",
+/// hoechstens 100 Zeichen); was sich so nicht schreiben laesst, wird
+/// application/octet-stream. Der Typ steht spaeter in der Oberflaeche, in der
+/// Bruecke und -- als Familie -- im Protokoll: frei gewaehlter Text der
+/// Gegenseite (Zeilenumbrueche!) gehoert an keine dieser Stellen (7b, C7).
+pub fn typ_normalisieren(gemeldet: &str) -> String {
+    let grund = gemeldet.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let teil_gut = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"+-.".contains(&b))
+    };
+    let gut = grund.len() <= 100
+        && grund
+            .split_once('/')
+            .is_some_and(|(art, unterart)| teil_gut(art) && teil_gut(unterart));
+    if gut {
+        grund
+    } else {
+        OCTET_STREAM.to_string()
+    }
+}
+
+/// Die Familie eines (normalisierten) Typs -- mehr kommt nicht ins Protokoll.
+pub fn typ_familie(typ: &str) -> &'static str {
+    match typ.split('/').next().unwrap_or("") {
+        "image" => "image",
+        "audio" => "audio",
+        "video" => "video",
+        "text" => "text",
+        _ => "other",
+    }
+}
+
+/// Der Typ, der von einem empfangenen Anhang gespeichert wird (Befund M7).
+///
+/// Der gemeldete Typ kommt von der Gegenseite und verteilt in der
+/// Oberflaeche auf die Anzeige: image/* an Qts Bildlader, audio/* und
+/// video/* an den Abspieler (erst nach Antippen), sonst "Datei". Passt der
+/// Inhalt nicht zur gemeldeten Familie, wird daraus
+/// application/octet-stream. Das verhindert nur, dass ein falsch
+/// deklarierter Anhang in einer anderen Anzeige landet; einen Decoder mit
+/// passender Signatur, aber boesem Inhalt haelt es nicht auf -- Qt und
+/// gstreamer waehlen ihren Leser selbst am Inhalt (7b, C2). Andere Typen
+/// (application/pdf ...) gehen an keinen Decoder.
+///
+/// Geprueft wird je Familie und nicht gegen den einen Treffer von
+/// `typ_aus_inhalt`: ein Text, der mit "BM" anfaengt, ist trotzdem Text.
+/// Gespeichert wird der normalisierte Typ (`typ_normalisieren`).
+pub fn empfangener_typ(gemeldet: &str, daten: &[u8]) -> String {
+    let klein = typ_normalisieren(gemeldet);
+    let d = daten;
+    let riff = |art: &[u8]| d.len() >= 12 && d.starts_with(b"RIFF") && &d[8..12] == art;
+    let ogg = d.starts_with(b"OggS");
+    let mp4 = d.len() >= 8 && &d[4..8] == b"ftyp";
+    let ebml = d.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]);
+    let passt = if klein.starts_with("image/") {
+        d.starts_with(&[0xFF, 0xD8, 0xFF])
+            || d.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+            || d.starts_with(b"GIF87a")
+            || d.starts_with(b"GIF89a")
+            || riff(b"WEBP")
+            || d.starts_with(b"BM")
+    } else if klein.starts_with("audio/") {
+        // audio/webm (Opus in WebM) gibt es wirklich, deshalb zaehlt EBML
+        // auch hier.
+        ist_mpeg_ton(d) || riff(b"WAVE") || d.starts_with(b"fLaC") || ogg || mp4 || ebml
+    } else if klein.starts_with("video/") {
+        ogg || mp4 || ebml
+    } else if klein.starts_with("text/") {
+        ist_text(d)
+    } else {
+        return klein;
+    };
+    if passt {
+        klein
+    } else {
+        crate::net::log(&format!(
+            "attachment type did not match its content ({})",
+            typ_familie(&klein)
+        ));
+        OCTET_STREAM.to_string()
+    }
+}
+
+/// Die Dateiendung zum gespeicherten Typ. Gstreamer und Qt schauen zwar in
+/// den Inhalt, eine passende Endung schadet aber keinem Programm, das die
+/// Datei spaeter oeffnet.
+fn endung(content_type: &str) -> &'static str {
+    let klein = content_type.trim().to_ascii_lowercase();
+    let grund = klein.split(';').next().unwrap_or("").trim();
+    match grund {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "audio/ogg" => "oga",
+        "video/ogg" => "ogv",
+        "audio/mpeg" => "mp3",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/flac" => "flac",
+        "audio/mp4" => "m4a",
+        "video/mp4" => "mp4",
+        "audio/webm" | "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "text/plain" => "txt",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+/// Der Name der entschluesselten Kopie: Kennung und Endung, ohne `.siegel`.
+fn kopie_name(id: &str, anhang: &Attachment) -> String {
+    format!("{}.{}", id, endung(&anhang.content_type))
+}
+
+/// Wo die entschluesselten Kopien der Anhaenge liegen: im Laufzeitordner, der
+/// mit der Sitzung verschwindet. Auf Sailfish ist `XDG_RUNTIME_DIR`
+/// /run/user/<uid> (tmpfs, 0700). Harmattan setzt die Variable nicht; dort
+/// bleibt /tmp/harbour-briar-<uid> -- ob /tmp auf dem N9 ein tmpfs ist, ist
+/// ungeprueft, die Kopien koennen dort also auf dem Flash landen. Sie werden
+/// beim Start, beim Zusperren und beim Loeschen weggeraeumt.
+pub fn anhang_laufzeit_ordner() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d).join("harbour-briar").join("anhaenge"),
+        _ => {
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from(format!("/tmp/harbour-briar-{}", uid)).join("anhaenge")
+        }
+    }
+}
+
+/// Der Laufzeitordner, mit dem ein Speicher oeffnet. In Tests nie der echte:
+/// auch Tests, die ihn nicht umlenken, raeumen beim Passwortsetzen auf.
+#[cfg(not(test))]
+fn laufzeit_vorgabe() -> PathBuf {
+    anhang_laufzeit_ordner()
+}
+
+#[cfg(test)]
+fn laufzeit_vorgabe() -> PathBuf {
+    std::env::temp_dir().join(format!("briar-lauf-{}", std::process::id()))
+}
+
+/// Alle entschluesselten Kopien wegraeumen.
+pub fn anhang_kopien_leeren(ordner: &Path) {
+    let _ = std::fs::remove_dir_all(ordner);
+}
+
+/// Den Laufzeitordner anlegen und pruefen, dass er uns gehoert. Unter /tmp
+/// kann ein anderer Benutzer den Namen vorher belegen -- als Verweis auf
+/// seinen eigenen Ordner, oder als offenen Ordner. Dann keine Kopie.
+fn laufzeit_ordner_bereit(ordner: &Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(ordner)
+        .is_err()
+    {
+        return false;
+    }
+    let uid = unsafe { libc::getuid() };
+    // Der Ordner selbst und der eigene darueber (harbour-briar bzw.
+    // harbour-briar-<uid>); was darueber liegt, ist Sache des Systems.
+    for pfad in [Some(ordner), ordner.parent()].into_iter().flatten() {
+        let meta = match std::fs::symlink_metadata(pfad) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if !meta.file_type().is_dir() || meta.uid() != uid {
+            return false;
+        }
+        if meta.mode() & 0o077 != 0 {
+            set_mode(pfad, 0o700);
+            match std::fs::symlink_metadata(pfad) {
+                Ok(m) if m.mode() & 0o077 == 0 => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Schreibt erst daneben und rueckt dann an den Platz, mit 0600 von Anfang
+/// an -- es gibt keinen Augenblick mit halber Datei oder offenen Rechten.
+fn datei_schreiben(ziel: &Path, inhalt: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = ziel.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut datei = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    datei.write_all(inhalt)?;
+    drop(datei);
+    set_mode(&tmp, 0o600);
+    std::fs::rename(&tmp, ziel)
+}
+
+/// Eine vorbereitete Umlegung: die neue Fassung liegt unter `neu` und kommt
+/// nach `ziel`; `alt` ist die Datei, auf die der Eintrag bisher zeigt.
+struct Umlegung {
+    id: String,
+    neu: PathBuf,
+    ziel: PathBuf,
+    alt: PathBuf,
+}
+
+/// Einen Anhang fuer ein anderes Siegel vorbereiten: Klartext -> versiegelt,
+/// versiegelt -> Klartext oder versiegelt -> neu versiegelt. Die neue
+/// Fassung wird nur daneben gelegt (`<ziel>.neu`); an den Platz kommt sie
+/// erst, wenn alle Anhaenge vorbereitet sind (`passwort_setzen`).
+fn anhang_vorbereiten(
+    id: &str,
+    anhang: &Attachment,
+    ordner: &Path,
+    alt: Option<&crate::tresor::Siegel>,
+    neu: Option<&crate::tresor::Siegel>,
+) -> Result<Option<Umlegung>, String> {
+    let roh = match std::fs::read(&anhang.path) {
+        Ok(r) => r,
+        // Keine Datei, nichts umzulegen -- der Eintrag bleibt, wie er ist.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let klar = if anhang.versiegelt {
+        alt.ok_or_else(|| "kein Siegel fuer einen versiegelten Anhang".to_string())?
+            .entschluesseln(&roh)?
+    } else {
+        roh
+    };
+    let (ziel, inhalt) = match neu {
+        Some(siegel) => (
+            ordner.join(format!("{}.{}.siegel", id, endung(&anhang.content_type))),
+            siegel.verschluesseln(&klar),
+        ),
+        None => (ordner.join(format!("{}.{}", id, endung(&anhang.content_type))), klar),
+    };
+    let mut daneben = ziel.clone().into_os_string();
+    daneben.push(".neu");
+    let daneben = PathBuf::from(daneben);
+    datei_schreiben(&daneben, &inhalt).map_err(|e| e.to_string())?;
+    Ok(Some(Umlegung {
+        id: id.to_string(),
+        neu: daneben,
+        ziel,
+        alt: PathBuf::from(&anhang.path),
+    }))
+}
+
+/// Einen einzelnen Anhang gleich umlegen -- fuer das Nachholen beim Oeffnen,
+/// wo jeder Anhang fuer sich gelingt oder nicht. Die alte Datei (falls sie
+/// anders heisst) kommt zurueck und wird erst geloescht, wenn der Zustand
+/// gespeichert ist.
+fn anhang_umlegen(
+    id: &str,
+    anhang: &mut Attachment,
+    ordner: &Path,
+    alt: Option<&crate::tresor::Siegel>,
+    neu: Option<&crate::tresor::Siegel>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(u) = anhang_vorbereiten(id, anhang, ordner, alt, neu)? else {
+        return Ok(None);
+    };
+    if let Err(e) = std::fs::rename(&u.neu, &u.ziel) {
+        let _ = std::fs::remove_file(&u.neu);
+        return Err(e.to_string());
+    }
+    anhang.path = u.ziel.to_string_lossy().to_string();
+    anhang.versiegelt = neu.is_some();
+    Ok(if u.alt != u.ziel { Some(u.alt) } else { None })
 }
 
 /// A message waiting to be delivered to one contact: the bytes as they go on
@@ -451,7 +814,7 @@ impl Einladungssitzung {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PrivateGroup {
     pub id: String,
     pub name: String,
@@ -499,9 +862,122 @@ pub struct PrivateGroup {
     /// Contacts this group is synced with
     #[serde(default)]
     pub contacts: Vec<u32>,
+    /// Beitraege, deren Kette bei uns noch nicht steht: die vorige Nachricht
+    /// bzw. der Elternbeitrag fehlt. Briar fuehrt sie als Abhaengigkeiten
+    /// (GroupMessageValidator.validatePost) und stellt sie erst zu, wenn alles
+    /// da ist; bis dahin sieht sie niemand und sie werden nicht weitergereicht.
+    #[serde(default)]
+    pub wartend: Vec<WartenderBeitrag>,
+    /// Kennungen verworfener Beitraege, neueste zuletzt. Briar setzt eine
+    /// ungueltige Nachricht INVALID und mit ihr alles, was von ihr abhaengt
+    /// (ValidationManagerImpl.invalidateMessage, Z. 424-440). Ohne dieses
+    /// Gedaechtnis wartete ein Beitrag auf einen verworfenen Vorgaenger fuer
+    /// immer und belegte einen Platz auf der Warteliste.
+    #[serde(default)]
+    pub verworfen: Vec<String>,
 }
 
+/// Ein Beitrag auf der Warteliste einer Gruppe. `contact_id` ist der Kontakt,
+/// von dem er kam: an ihn geht er nicht zurueck, wenn er spaeter aufgeht.
+///
+/// Autor, Elternbeitrag und vorige Nachricht werden beim Einlegen einmal aus
+/// dem Rumpf gelesen und hier mitgefuehrt: die Nachlese sucht ueber sie, statt
+/// jeden Rumpf erneut zu dekodieren. Eintraege aus 0.42.0 haben sie nicht
+/// (`previous` leer); die traegt die Nachlese beim ersten Mal nach.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WartenderBeitrag {
+    pub id: String,
+    pub contact_id: u32,
+    pub timestamp: u64,
+    pub body: String,
+    #[serde(default)]
+    pub author_id: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub previous: String,
+}
+
+impl WartenderBeitrag {
+    /// Die Groesse des Rumpfs in Byte -- gespeichert ist er als Hexzahl.
+    pub fn rumpf_laenge(&self) -> usize {
+        self.body.len() / 2
+    }
+}
+
+/// So viele Beitraege wartet eine Gruppe hoechstens, und so viel Rumpf (in
+/// Byte, nicht Hexzeichen).
+pub const MAX_WARTEND: usize = 200;
+pub const MAX_WARTEND_BYTES: usize = 4 * 1024 * 1024;
+/// ... und je Ueberbringer. Ein Kontakt kann so nur die eigenen Plaetze
+/// fuellen, nicht die Beitraege verdraengen, die andere gebracht haben.
+pub const MAX_WARTEND_JE_KONTAKT: usize = 50;
+pub const MAX_WARTEND_BYTES_JE_KONTAKT: usize = 1024 * 1024;
+/// So viele verworfene Kennungen merkt sich eine Gruppe; die aelteste faellt.
+pub const MAX_VERWORFEN: usize = 500;
+
 impl PrivateGroup {
+    /// Legt einen Beitrag auf die Warteliste -- wenn Platz ist. Ist eine der
+    /// Grenzen erreicht (je Gruppe oder je Ueberbringer), bleibt die Liste,
+    /// wie sie ist, und die Antwort ist `false`: dann wird der NEUE Beitrag
+    /// zurueckgestellt, also nicht quittiert, und die Gegenseite schickt ihn
+    /// spaeter wieder. Frueher fiel stattdessen der aelteste Wartende -- der
+    /// war aber schon quittiert und damit fuer immer verloren, samt der
+    /// ganzen spaeteren Kette seines Autors (Gegenpruefung 7a, G1).
+    pub fn warten_lassen(&mut self, beitrag: WartenderBeitrag) -> bool {
+        let groesse = beitrag.rumpf_laenge();
+        let (mut anzahl, mut bytes) = (0usize, 0usize);
+        let (mut anzahl_kontakt, mut bytes_kontakt) = (0usize, 0usize);
+        for w in &self.wartend {
+            anzahl += 1;
+            bytes += w.rumpf_laenge();
+            if w.contact_id == beitrag.contact_id {
+                anzahl_kontakt += 1;
+                bytes_kontakt += w.rumpf_laenge();
+            }
+        }
+        if anzahl >= MAX_WARTEND
+            || bytes + groesse > MAX_WARTEND_BYTES
+            || anzahl_kontakt >= MAX_WARTEND_JE_KONTAKT
+            || bytes_kontakt + groesse > MAX_WARTEND_BYTES_JE_KONTAKT
+        {
+            return false;
+        }
+        self.wartend.push(beitrag);
+        true
+    }
+
+    /// Eine Kennung als verworfen merken, hoechstens MAX_VERWORFEN.
+    pub fn verworfen_merken(&mut self, id: &str) {
+        if self.verworfen.iter().any(|v| v == id) {
+            return;
+        }
+        self.verworfen.push(id.to_string());
+        if self.verworfen.len() > MAX_VERWORFEN {
+            let zuviel = self.verworfen.len() - MAX_VERWORFEN;
+            self.verworfen.drain(..zuviel);
+        }
+    }
+
+    /// Verwirft `id` und mit ihr jeden Wartenden, der darauf aufbaut, und so
+    /// fort -- Briars addDependentsToInvalidate. Gibt die Zahl der
+    /// mitverworfenen Wartenden zurueck.
+    pub fn verwerfen_mit_abhaengigen(&mut self, id: &str) -> usize {
+        let mut offen = vec![id.to_string()];
+        let mut mit = 0;
+        while let Some(id) = offen.pop() {
+            self.verworfen_merken(&id);
+            let (weg, bleibt): (Vec<WartenderBeitrag>, Vec<WartenderBeitrag>) =
+                std::mem::take(&mut self.wartend)
+                    .into_iter()
+                    .partition(|w| w.previous == id || w.parent.as_deref() == Some(id.as_str()));
+            self.wartend = bleibt;
+            mit += weg.len();
+            offen.extend(weg.into_iter().map(|w| w.id));
+        }
+        mit
+    }
+
     /// Der Zeitstempel unserer letzten eigenen Nachricht -- der, auf den
     /// `our_previous` zeigt. Der naechste Beitrag muss echt darueber liegen,
     /// sonst wirft Briar ihn beim Zustellen weg.
@@ -608,6 +1084,11 @@ pub struct State {
     /// "en" or "de" -- English unless the user switches, on both front ends
     #[serde(default)]
     pub language: Option<String>,
+    /// Ob Benachrichtigungen Absender und Text zeigen. Aus, wie bei Briar auf
+    /// Android: sonst liegt der Text im Benachrichtigungsspeicher des
+    /// Telefons, ausserhalb des verschluesselten Zustands.
+    #[serde(default)]
+    pub notification_preview: bool,
 }
 
 /// The newest layout this build knows.
@@ -641,6 +1122,9 @@ pub struct Store {
     /// und haelt danach den Schluessel. Genau das tut das Siegel; das
     /// Passwort selbst wird gar nicht mehr aufbewahrt.
     siegel: Option<crate::tresor::Siegel>,
+    /// Wohin die entschluesselten Kopien der Anhaenge kommen
+    /// (`anhang_laufzeit_ordner`); in Tests ein Wegwerfordner.
+    laufzeit: PathBuf,
 }
 
 impl Store {
@@ -666,7 +1150,7 @@ impl Store {
             }
         }
         let fehler = |e: String| std::io::Error::new(std::io::ErrorKind::Other, e);
-        self.siegel = if neu.is_empty() {
+        let neues = if neu.is_empty() {
             None
         } else {
             // Beim Wechsel wandert der Speicherschluessel mit, sonst waere
@@ -676,7 +1160,97 @@ impl Store {
                 None => crate::tresor::Siegel::frisch(neu).map_err(fehler)?,
             })
         };
-        self.save()
+        // Die Anhaenge mitnehmen: mit Passwort versiegelt, ohne im Klartext.
+        //
+        // Der Speicherschluessel bleibt beim Wechsel derselbe -- wie Briars
+        // DB-Schluessel, den ein neues Passwort nur neu verpackt
+        // (`neu_verpacken`). Wer eine alte Kopie der state.json oder einer
+        // Anhangsdatei UND das alte Passwort hat, entschluesselt damit also
+        // auch alles Neue; das ist gewollt, sonst waere jede Sicherung nach
+        // einem Wechsel unlesbar. Neu geschrieben wird trotzdem jede Datei:
+        // in ihrem Kopf steht das Paket des Passworts, unter dem sie
+        // geschrieben wurde, und mit dem alten Passwort liesse sich aus einer
+        // liegengebliebenen der Speicherschluessel holen.
+        //
+        // Darum alles oder nichts (7b, C6): erst jede neue Fassung neben die
+        // alte legen; scheitert eine, bleibt die alte Lage ganz stehen und
+        // der Fehler geht an die Oberflaeche. Frueher zaehlte ein Fehlschlag
+        // nur mit, und der Wechsel lief trotzdem durch -- die eine Datei trug
+        // dann weiter das alte Paket.
+        let ordner = self.attachment_dir();
+        let mut vorbereitet: Vec<Umlegung> = Vec::new();
+        let mut fehler_beim_umlegen = None;
+        for (id, anhang) in self.state.attachments.iter() {
+            if !anhang.versiegelt && neues.is_none() {
+                continue;
+            }
+            match anhang_vorbereiten(id, anhang, &ordner, self.siegel.as_ref(), neues.as_ref()) {
+                Ok(Some(u)) => vorbereitet.push(u),
+                Ok(None) => {}
+                Err(e) => {
+                    fehler_beim_umlegen = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = fehler_beim_umlegen {
+            for u in &vorbereitet {
+                let _ = std::fs::remove_file(&u.neu);
+            }
+            crate::net::log("an attachment could not be re-encrypted -- the password stays as it was");
+            return Err(fehler(format!("ein Anhang liess sich nicht umschluesseln: {}", e)));
+        }
+        // Jetzt an den Platz. Ein rename im selben Ordner scheitert kaum; tut
+        // er es doch, bleibt es beim alten Passwort, und die schon
+        // umgelegten Dateien sind mit demselben Schluessel lesbar.
+        let mut alte_dateien = Vec::new();
+        for (n, u) in vorbereitet.iter().enumerate() {
+            if let Err(e) = std::fs::rename(&u.neu, &u.ziel) {
+                for rest in &vorbereitet[n..] {
+                    let _ = std::fs::remove_file(&rest.neu);
+                }
+                // Was schon umgelegt ist und anders heisst, liegt neben
+                // der alten Datei, auf die der Eintrag noch zeigt.
+                for fertig in &vorbereitet[..n] {
+                    if fertig.ziel != fertig.alt {
+                        let _ = std::fs::remove_file(&fertig.ziel);
+                    }
+                }
+                crate::net::log("an attachment could not be moved into place -- the password stays as it was");
+                return Err(fehler(format!("ein Anhang liess sich nicht umlegen: {}", e)));
+            }
+        }
+        for u in vorbereitet {
+            if let Some(anhang) = self.state.attachments.get_mut(&u.id) {
+                anhang.path = u.ziel.to_string_lossy().to_string();
+                anhang.versiegelt = neues.is_some();
+            }
+            if u.alt != u.ziel {
+                alte_dateien.push(u.alt);
+            }
+        }
+        self.siegel = neues;
+        // Kopien aus der Zeit davor gelten nicht mehr.
+        self.anhang_kopien_leeren();
+        self.save()?;
+        // Erst jetzt: vorher zeigte der gespeicherte Zustand noch auf sie.
+        for datei in alte_dateien {
+            let _ = std::fs::remove_file(datei);
+        }
+        Ok(())
+    }
+
+    /// Die entschluesselten Kopien dieses Speichers wegraeumen -- beim
+    /// Zusperren und nach einem Passwortwechsel.
+    pub fn anhang_kopien_leeren(&self) {
+        anhang_kopien_leeren(&self.laufzeit);
+    }
+
+    /// Den Laufzeitordner umlenken, damit Tests nicht in den echten
+    /// schreiben (Umgebungsvariablen gelten fuer alle Tests zugleich).
+    #[cfg(test)]
+    pub fn laufzeit_setzen(&mut self, ordner: PathBuf) {
+        self.laufzeit = ordner;
     }
 
     /// Liegt der Speicher gerade verschluesselt vor?
@@ -772,10 +1346,20 @@ impl Store {
             // save() schrieb ihn darueber. Ein Lesefehler kostete alles --
             // Kontakte, Schluessel, Nachrichten. Jetzt bricht das Oeffnen ab
             // und die Datei bleibt, wie sie ist.
+            //
+            // Der Fehlertext von serde zitiert Werte aus dem schon
+            // entschluesselten Zustand ("invalid type: string \"...\"") und
+            // landet im Protokoll und auf stderr. Darum nur Zeile und Spalte;
+            // den vollen Text gibt es mit BRIAR_LOG_VOLL=1 (7b, D4).
             serde_json::from_str(&text).map_err(|e| {
+                let grund = if crate::net::log_voll() {
+                    e.to_string()
+                } else {
+                    format!("state does not parse, line {} column {}", e.line(), e.column())
+                };
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Speicher nicht lesbar ({}) -- Datei bleibt unangetastet", e),
+                    format!("Speicher nicht lesbar ({}) -- Datei bleibt unangetastet", grund),
                 )
             })?
         } else {
@@ -803,6 +1387,7 @@ impl Store {
                 ),
                 _ => None,
             },
+            laufzeit: laufzeit_vorgabe(),
         };
         // Einmal wuerfeln und behalten -- eine neue UUID waere fuer die
         // Kontakte ein neues Geraet.
@@ -914,9 +1499,32 @@ impl Store {
                 store.verwerfe_gruppenpost(contact_id, &group_hex);
             }
         }
-        if store.state.state_version != STATE_VERSION {
+        // Mit Passwort, aber noch Klartext-Anhaenge auf der Platte: aus einer
+        // Fassung, die sie nie versiegelt hat, oder ein Umlegen ist beim
+        // Passwortsetzen fehlgeschlagen. Jetzt nachholen. Kein eigener
+        // Fassungsschritt -- das Feld `versiegelt` sagt genug.
+        let mut alte_dateien = Vec::new();
+        if store.siegel.is_some() {
+            let ordner = store.attachment_dir();
+            let siegel = store.siegel.as_ref();
+            for (id, anhang) in store.state.attachments.iter_mut() {
+                if anhang.versiegelt {
+                    continue;
+                }
+                match anhang_umlegen(id, anhang, &ordner, siegel, siegel) {
+                    Ok(Some(alt)) => alte_dateien.push(alt),
+                    Ok(None) => {}
+                    Err(_) => crate::net::log("an attachment could not be encrypted"),
+                }
+            }
+        }
+        if store.state.state_version != STATE_VERSION || !alte_dateien.is_empty() {
             store.state.state_version = STATE_VERSION;
-            let _ = store.save();
+            if store.save().is_ok() {
+                for datei in alte_dateien {
+                    let _ = std::fs::remove_file(datei);
+                }
+            }
         }
         Ok(store)
     }
@@ -1047,7 +1655,11 @@ impl Store {
             .join("attachments")
     }
 
-    /// Writes an attachment's bytes to disk and remembers where.
+    /// Writes an attachment's bytes to disk and remembers where. With a
+    /// password the file is sealed (`<id>.<ext>.siegel`) like the state
+    /// itself; the returned path is the stored file, not a readable copy.
+    /// The type is taken as given -- this is the path for our own sends;
+    /// received attachments go through `anhang_empfangen`.
     pub fn store_attachment(
         &mut self,
         id: &str,
@@ -1056,37 +1668,109 @@ impl Store {
     ) -> std::io::Result<String> {
         let dir = self.attachment_dir();
         std::fs::create_dir_all(&dir)?;
-        let extension = match content_type {
-            "image/jpeg" => "jpg",
-            "image/png" => "png",
-            "image/gif" => "gif",
-            "text/plain" => "txt",
-            _ => "bin",
+        set_mode(&dir, 0o700);
+        let extension = endung(content_type);
+        let (file, inhalt) = match &self.siegel {
+            Some(siegel) => (
+                dir.join(format!("{}.{}.siegel", id, extension)),
+                siegel.verschluesseln(data),
+            ),
+            None => (dir.join(format!("{}.{}", id, extension)), data.to_vec()),
         };
-        let file = dir.join(format!("{}.{}", id, extension));
-        std::fs::write(&file, data)?;
+        datei_schreiben(&file, &inhalt)?;
         let path = file.to_string_lossy().to_string();
-        self.state.attachments.insert(
+        let vorher = self.state.attachments.insert(
             id.to_string(),
             Attachment {
                 content_type: content_type.to_string(),
                 path: path.clone(),
                 size: data.len() as u64,
+                versiegelt: self.siegel.is_some(),
             },
         );
+        // Kam derselbe Anhang schon einmal, unter anderem Namen: die alte
+        // Datei und eine alte Kopie nicht verwaist liegen lassen.
+        if let Some(vorher) = vorher {
+            if vorher.path != path {
+                let _ = std::fs::remove_file(&vorher.path);
+            }
+            let _ = std::fs::remove_file(self.laufzeit.join(kopie_name(id, &vorher)));
+        }
         Ok(path)
+    }
+
+    /// Ein empfangener Anhang: der gemeldete Typ wird am Inhalt geprueft
+    /// (`empfangener_typ`), dann wie `store_attachment`. Zurueck kommt der
+    /// Typ, der gespeichert wurde -- er gehoert auch in die Nachricht.
+    pub fn anhang_empfangen(
+        &mut self,
+        id: &str,
+        gemeldeter_typ: &str,
+        data: &[u8],
+    ) -> std::io::Result<String> {
+        let typ = empfangener_typ(gemeldeter_typ, data);
+        self.store_attachment(id, &typ, data)?;
+        Ok(typ)
     }
 
     pub fn attachment(&self, id: &str) -> Option<&Attachment> {
         self.state.attachments.get(id)
     }
 
+    /// Der Pfad, den die Oberflaeche laden kann. Ohne Passwort die Datei
+    /// selbst; versiegelt eine entschluesselte Kopie im Laufzeitordner, die
+    /// hier bei Bedarf entsteht. None, wenn es den Anhang nicht gibt, die
+    /// Kopie nicht sicher abzulegen ist -- oder die Oberflaeche zugesperrt
+    /// ist: hinter der Sperre entsteht keine Kopie mehr (7b, C3).
+    pub fn anhang_pfad(&self, id: &str) -> Option<String> {
+        self.anhang_pfad_wenn(id, crate::api::ist_gesperrt())
+    }
+
+    /// `anhang_pfad` mit der Sperre als Argument -- die echte ist ein
+    /// Prozessglobal, und ein Test, der sie umlegt, stoerte alle anderen.
+    fn anhang_pfad_wenn(&self, id: &str, gesperrt: bool) -> Option<String> {
+        if gesperrt {
+            return None;
+        }
+        let anhang = self.state.attachments.get(id)?;
+        if !anhang.versiegelt {
+            return Some(anhang.path.clone());
+        }
+        let siegel = self.siegel.as_ref()?;
+        if !laufzeit_ordner_bereit(&self.laufzeit) {
+            // Einmal je Lauf: die Oberflaeche fragt laufend, das waere sonst
+            // eine Zeile je Anhang und Abruf.
+            static GEMELDET: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !GEMELDET.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::net::log("the runtime directory for attachments is not safe to use");
+            }
+            return None;
+        }
+        let kopie = self.laufzeit.join(kopie_name(id, anhang));
+        if !kopie.is_file() {
+            let roh = std::fs::read(&anhang.path).ok()?;
+            let klar = siegel.entschluesseln(&roh).ok()?;
+            datei_schreiben(&kopie, &klar).ok()?;
+        }
+        Some(kopie.to_string_lossy().to_string())
+    }
+
     /// Einen Anhang samt Datei wegraeumen. Gebraucht beim Loeschen einer
     /// Nachricht: bliebe die Datei liegen, waere das Bild noch da, das man
-    /// gerade weghaben wollte.
+    /// gerade weghaben wollte. Alle drei Orte: die gespeicherte Datei, ein
+    /// Klartext-Rest daneben (aus einem abgebrochenen Umlegen) und die Kopie
+    /// im Laufzeitordner.
     pub fn anhang_loeschen(&mut self, id: &str) {
         if let Some(anhang) = self.state.attachments.remove(id) {
             let _ = std::fs::remove_file(&anhang.path);
+            let ordner = self.attachment_dir();
+            let klar = ordner.join(format!("{}.{}", id, endung(&anhang.content_type)));
+            let _ = std::fs::remove_file(&klar);
+            let mut versiegelt = klar.into_os_string();
+            versiegelt.push(".siegel");
+            let _ = std::fs::remove_file(versiegelt);
+            let _ = std::fs::remove_file(self.laufzeit.join(kopie_name(id, &anhang)));
         }
     }
 
@@ -1145,7 +1829,128 @@ mod gruppen_tests {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: Vec::new(),
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         }
+    }
+
+    fn wartender(n: usize) -> WartenderBeitrag {
+        wartender_von(n, 1, 0)
+    }
+
+    /// Ein Wartender von Kontakt `von` mit `bytes` Byte Rumpf.
+    fn wartender_von(n: usize, von: u32, bytes: usize) -> WartenderBeitrag {
+        WartenderBeitrag {
+            id: format!("w{}", n),
+            contact_id: von,
+            timestamp: n as u64,
+            body: "00".repeat(bytes),
+            ..Default::default()
+        }
+    }
+
+    /// Frueher fiel hier der aelteste -- der war aber schon quittiert und
+    /// damit verloren (7a, G1). Jetzt bleibt die Liste und der neue wird
+    /// abgewiesen; der Aufrufer quittiert ihn dann nicht.
+    #[test]
+    fn volle_warteliste_weist_den_neuen_ab() {
+        let mut g = gruppe(None, Vec::new());
+        // Vier Ueberbringer, damit die Grenze je Kontakt nicht zuerst greift.
+        for n in 0..MAX_WARTEND {
+            assert!(g.warten_lassen(wartender_von(n, (n % 4) as u32 + 1, 0)));
+        }
+        assert!(!g.warten_lassen(wartender_von(MAX_WARTEND, 5, 0)));
+        assert_eq!(g.wartend.len(), MAX_WARTEND);
+        assert_eq!(g.wartend[0].id, "w0", "der erste ist geblieben");
+    }
+
+    #[test]
+    fn grenze_je_ueberbringer_laesst_andere_herein() {
+        let mut g = gruppe(None, Vec::new());
+        for n in 0..MAX_WARTEND_JE_KONTAKT {
+            assert!(g.warten_lassen(wartender_von(n, 1, 0)));
+        }
+        assert!(!g.warten_lassen(wartender_von(900, 1, 0)), "Kontakt 1 ist voll");
+        assert!(g.warten_lassen(wartender_von(901, 2, 0)), "Kontakt 2 nicht");
+        assert_eq!(g.wartend.len(), MAX_WARTEND_JE_KONTAKT + 1);
+    }
+
+    #[test]
+    fn bytegrenze_je_ueberbringer_zaehlt_den_rumpf_nicht_die_hexzeichen() {
+        let mut g = gruppe(None, Vec::new());
+        let halb = MAX_WARTEND_BYTES_JE_KONTAKT / 2;
+        assert!(g.warten_lassen(wartender_von(0, 1, halb)));
+        // Genau bis an die Grenze geht noch -- als Hex waeren es doppelt so viele.
+        assert!(g.warten_lassen(wartender_von(1, 1, halb)));
+        assert!(!g.warten_lassen(wartender_von(2, 1, 1)), "ein Byte darueber nicht");
+        assert!(g.warten_lassen(wartender_von(3, 2, 1)));
+    }
+
+    #[test]
+    fn bytegrenze_je_gruppe_greift_ueber_alle_ueberbringer() {
+        let mut g = gruppe(None, Vec::new());
+        let je = MAX_WARTEND_BYTES_JE_KONTAKT;
+        let kontakte = (MAX_WARTEND_BYTES / je) as u32;
+        for k in 0..kontakte {
+            assert!(g.warten_lassen(wartender_von(k as usize, k + 1, je)));
+        }
+        assert!(!g.warten_lassen(wartender_von(99, kontakte + 1, 1)));
+    }
+
+    #[test]
+    fn verworfen_merkt_hoechstens_die_grenze() {
+        let mut g = gruppe(None, Vec::new());
+        for n in 0..=MAX_VERWORFEN {
+            g.verworfen_merken(&format!("v{}", n));
+        }
+        g.verworfen_merken("v3");
+        assert_eq!(g.verworfen.len(), MAX_VERWORFEN);
+        assert_eq!(g.verworfen[0], "v1", "der aelteste faellt");
+    }
+
+    #[test]
+    fn verwerfen_nimmt_die_ganze_abhaengige_kette_mit() {
+        let mut g = gruppe(None, Vec::new());
+        let mut a = wartender(1);
+        a.previous = "wurzel".to_string();
+        let mut b = wartender(2);
+        b.previous = "w1".to_string();
+        let mut c = wartender(3);
+        c.previous = "anders".to_string();
+        c.parent = Some("w2".to_string());
+        let mut d = wartender(4);
+        d.previous = "fremd".to_string();
+        for w in [a, b, c, d] {
+            assert!(g.warten_lassen(w));
+        }
+        assert_eq!(g.verwerfen_mit_abhaengigen("wurzel"), 3);
+        assert_eq!(g.wartend.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), vec!["w4"]);
+        for id in ["wurzel", "w1", "w2", "w3"] {
+            assert!(g.verworfen.iter().any(|v| v == id), "{} fehlt", id);
+        }
+    }
+
+    #[test]
+    fn wartender_aus_0_42_ohne_verweise_laedt() {
+        let alt = serde_json::json!({
+            "id": "w1", "contact_id": 2, "timestamp": 5, "body": "0102"
+        });
+        let w: WartenderBeitrag = serde_json::from_value(alt).unwrap();
+        assert!(w.previous.is_empty());
+        assert_eq!(w.parent, None);
+        assert_eq!(w.rumpf_laenge(), 2);
+    }
+
+    #[test]
+    fn gruppe_ohne_warteliste_in_der_datei_laedt() {
+        let g = gruppe(None, Vec::new());
+        let mut wert = serde_json::to_value(&g).unwrap();
+        wert.as_object_mut().unwrap().remove("wartend");
+        wert.as_object_mut().unwrap().remove("verworfen");
+        assert!(wert.get("wartend").is_none());
+        let geladen: PrivateGroup = serde_json::from_value(wert).unwrap();
+        assert!(geladen.wartend.is_empty());
+        assert!(geladen.verworfen.is_empty());
     }
 
     #[test]
@@ -1272,6 +2077,8 @@ mod korbwanderung_tests {
                 aufgeloest: false,
                 letztes_ereignis: None,
                 contacts: vec![1, 2],
+                wartend: Vec::new(),
+                verworfen: Vec::new(),
             });
             for (c, k) in [(1, "p1"), (1, "p2"), (2, "p3")] {
                 store.contact_mut(c).unwrap().outbox.push(eintrag(&gruppe, k));
@@ -1316,6 +2123,8 @@ mod wanderung_tests {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: Vec::new(),
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         }
     }
 
@@ -1737,5 +2546,500 @@ mod anhangs_tests {
         assert_eq!(m[0].attachment.as_deref(), Some("a1"));
         assert_eq!(store.state.state_version, STATE_VERSION);
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod vorschau_tests {
+    use super::*;
+
+    /// Eine state.json von vor der Einstellung kennt das Feld nicht. Sie muss
+    /// laden, und die Vorschau ist dann aus -- wie bei Briar.
+    #[test]
+    fn alte_datei_ohne_feld_laedt_mit_vorschau_aus() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-vorschau-alt-{}.json", std::process::id()));
+        std::fs::write(&p, r#"{"listen_port": 7327, "state_version": 6, "language": "de"}"#).unwrap();
+        let store = Store::open(&p, 7327).unwrap();
+        assert!(!store.state.notification_preview);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Einmal eingeschaltet, uebersteht sie das Schreiben und Wiederlesen.
+    #[test]
+    fn eingeschaltete_vorschau_uebersteht_neuladen() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-vorschau-an-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.state.notification_preview = true;
+        store.save().unwrap();
+        let wieder = Store::open(&p, 7327).unwrap();
+        assert!(wieder.state.notification_preview);
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod anhang_tests {
+    use super::*;
+
+    /// Ein eigener Wegwerfordner je Test: Speicher, Anhaenge und
+    /// Laufzeitordner liegen darin, nichts im echten XDG_RUNTIME_DIR.
+    fn ordner(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-anhang-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn laufzeit(o: &Path) -> PathBuf {
+        o.join("lauf").join("anhaenge")
+    }
+
+    fn speicher(o: &Path) -> Store {
+        let mut s = Store::open(&o.join("state.json"), 7327).unwrap();
+        s.laufzeit_setzen(laufzeit(o));
+        s
+    }
+
+    fn mit_passwort(o: &Path, pw: &str) -> Store {
+        let mut s = Store::open_mit_passwort(&o.join("state.json"), 7327, pw).unwrap();
+        s.laufzeit_setzen(laufzeit(o));
+        s
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-geheimes-bild-";
+    const MUSTER: &[u8] = b"-geheimes-bild-";
+
+    fn enthaelt(heu: &[u8], nadel: &[u8]) -> bool {
+        heu.windows(nadel.len()).any(|f| f == nadel)
+    }
+
+    // ---- M7: Typ aus dem Inhalt ----
+
+    #[test]
+    fn typ_aus_inhalt_erkennt_jede_signatur() {
+        let faelle: &[(&[u8], &str)] = &[
+            (b"\xFF\xD8\xFF\xE0rest", "image/jpeg"),
+            (b"\x89PNG\r\n\x1a\nrest", "image/png"),
+            (b"GIF87a...", "image/gif"),
+            (b"GIF89a...", "image/gif"),
+            (b"RIFF\x10\0\0\0WEBPVP8 ", "image/webp"),
+            (b"BM\x3a\0\0\0\0\0", "image/bmp"),
+            (b"OggS\0\x02", "audio/ogg"),
+            (b"ID3\x04\0", "audio/mpeg"),
+            (b"\xFF\xFB\x90\x00", "audio/mpeg"),
+            (b"\xFF\xF3\x90\x00", "audio/mpeg"),
+            (b"RIFF\x10\0\0\0WAVEfmt ", "audio/wav"),
+            (b"fLaC\0\0\0\x22", "audio/flac"),
+            (b"\0\0\0\x20ftypisom", "video/mp4"),
+            (b"\x1A\x45\xDF\xA3\x9f", "video/webm"),
+            ("Grüße".as_bytes(), "text/plain"),
+        ];
+        for (daten, typ) in faelle {
+            assert_eq!(typ_aus_inhalt(daten), Some(*typ), "{:?}", daten);
+        }
+    }
+
+    #[test]
+    fn typ_aus_inhalt_unerkannt() {
+        assert_eq!(typ_aus_inhalt(b"\x00\x01\x02\x03"), None, "Binaer mit NUL");
+        assert_eq!(typ_aus_inhalt(b"\xC3\x28"), None, "kaputtes UTF-8");
+        assert_eq!(typ_aus_inhalt(b"RIFF\x10\0\0\0AVI "), None, "RIFF ohne Bild/Ton");
+        assert_eq!(typ_aus_inhalt(b"\0\0ft"), None, "ftyp zu kurz");
+    }
+
+    #[test]
+    fn falscher_bildtyp_wird_octet_stream() {
+        assert_eq!(empfangener_typ("image/jpeg", b"OggS\0\x02"), "application/octet-stream");
+        assert_eq!(empfangener_typ("image/png", b"\x00\x01\x02"), "application/octet-stream");
+    }
+
+    #[test]
+    fn falscher_tontyp_wird_octet_stream() {
+        assert_eq!(empfangener_typ("audio/ogg", PNG), "application/octet-stream");
+    }
+
+    #[test]
+    fn falscher_videotyp_wird_octet_stream() {
+        // MP3 ist Ton, kein Bild -- fuer video/* zaehlt es nicht.
+        assert_eq!(empfangener_typ("video/mp4", b"ID3\x04\0"), "application/octet-stream");
+    }
+
+    #[test]
+    fn falscher_texttyp_wird_octet_stream() {
+        assert_eq!(empfangener_typ("text/plain", b"a\0b"), "application/octet-stream");
+    }
+
+    #[test]
+    fn grossschreibung_umgeht_die_pruefung_nicht() {
+        assert_eq!(empfangener_typ("IMAGE/JPEG", b"\0\0"), "application/octet-stream");
+        assert_eq!(empfangener_typ(" image/png", b"\0\0"), "application/octet-stream");
+    }
+
+    #[test]
+    fn passender_typ_bleibt() {
+        assert_eq!(empfangener_typ("image/png", PNG), "image/png");
+        assert_eq!(empfangener_typ("image/jpeg", b"\xFF\xD8\xFF\xE1"), "image/jpeg");
+        // Parameter fallen seit 7b C7 weg: gespeichert wird nur noch, was
+        // auf [a-z0-9.+-]+/[a-z0-9.+-]+ passt.
+        assert_eq!(empfangener_typ("text/plain; charset=utf-8", b"Hallo"), "text/plain");
+        assert_eq!(empfangener_typ("IMAGE/PNG", PNG), "image/png", "kleingeschrieben");
+    }
+
+    #[test]
+    fn typ_wird_auf_das_muster_gebracht() {
+        assert_eq!(typ_normalisieren(" Application/PDF "), "application/pdf");
+        assert_eq!(typ_normalisieren("application/vnd.oasis+xml"), "application/vnd.oasis+xml");
+        assert_eq!(typ_normalisieren("text/plain; charset=utf-8"), "text/plain");
+    }
+
+    #[test]
+    fn typ_ausserhalb_des_musters_wird_octet_stream() {
+        for schlecht in [
+            "",
+            "image",
+            "/png",
+            "image/",
+            "image/png/x",
+            "image/p ng",
+            "application/x\n[1790] eingeschleust",
+            "application/x\u{7f}",
+            "anwendung/ä",
+        ] {
+            assert_eq!(typ_normalisieren(&schlecht), OCTET_STREAM, "{:?}", schlecht);
+        }
+        let lang = format!("application/{}", "x".repeat(100));
+        assert_eq!(typ_normalisieren(&lang), OCTET_STREAM);
+        let genau = format!("application/{}", "x".repeat(100 - 12));
+        assert_eq!(typ_normalisieren(&genau), genau, "100 Zeichen gehen noch");
+    }
+
+    #[test]
+    fn fremder_typ_ohne_familie_wird_normalisiert_gespeichert() {
+        assert_eq!(empfangener_typ("application/x\nzeile", b"\0"), OCTET_STREAM);
+        assert_eq!(typ_familie("application/pdf"), "other");
+        assert_eq!(typ_familie("image/png"), "image");
+    }
+
+    #[test]
+    fn ogg_mp4_und_webm_zaehlen_fuer_ton_und_bild() {
+        for daten in [&b"OggS\0\x02"[..], b"\0\0\0\x18ftypmp42", b"\x1A\x45\xDF\xA3"] {
+            assert_eq!(empfangener_typ("audio/x", daten), "audio/x");
+            assert_eq!(empfangener_typ("video/x", daten), "video/x");
+        }
+    }
+
+    #[test]
+    fn text_der_wie_bmp_anfaengt_bleibt_text() {
+        assert_eq!(empfangener_typ("text/plain", b"BMW faehrt"), "text/plain");
+    }
+
+    #[test]
+    fn andere_typen_bleiben_unveraendert() {
+        assert_eq!(empfangener_typ("application/pdf", b"\0\0"), "application/pdf");
+        assert_eq!(empfangener_typ("application/octet-stream", PNG),
+                   "application/octet-stream");
+    }
+
+    #[test]
+    fn empfang_speichert_den_geprueften_typ() {
+        let o = ordner("empfang");
+        let mut s = speicher(&o);
+        let typ = s.anhang_empfangen("a1", "image/jpeg", b"\0\0\0").unwrap();
+        assert_eq!(typ, "application/octet-stream");
+        let a = s.attachment("a1").unwrap();
+        assert_eq!(a.content_type, "application/octet-stream");
+        assert!(a.path.ends_with("a1.bin"), "{}", a.path);
+        let typ = s.anhang_empfangen("a2", "image/png", PNG).unwrap();
+        assert_eq!(typ, "image/png");
+        assert!(s.attachment("a2").unwrap().path.ends_with("a2.png"));
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn endungen_zum_typ() {
+        assert_eq!(endung("image/webp"), "webp");
+        assert_eq!(endung("audio/ogg"), "oga");
+        assert_eq!(endung("video/mp4"), "mp4");
+        assert_eq!(endung("video/x-matroska"), "mkv");
+        assert_eq!(endung("application/pdf"), "pdf");
+        assert_eq!(endung("text/plain; charset=utf-8"), "txt");
+        assert_eq!(endung("application/octet-stream"), "bin");
+        assert_eq!(endung("../../x"), "bin");
+    }
+
+    // ---- M4: versiegelte Ablage ----
+
+    #[test]
+    fn ohne_passwort_klartext_wie_bisher() {
+        let o = ordner("klartext");
+        let mut s = speicher(&o);
+        let pfad = s.store_attachment("a1", "image/png", PNG).unwrap();
+        assert_eq!(std::fs::read(&pfad).unwrap(), PNG);
+        assert!(!s.attachment("a1").unwrap().versiegelt);
+        assert_eq!(s.anhang_pfad("a1").as_deref(), Some(pfad.as_str()));
+        assert!(!laufzeit(&o).exists(), "keine Kopie ohne Passwort");
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn mit_passwort_liegt_kein_klartext_auf_der_platte() {
+        let o = ordner("versiegelt");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        let pfad = s.store_attachment("a1", "image/png", PNG).unwrap();
+        assert!(pfad.ends_with("a1.png.siegel"), "{}", pfad);
+        let roh = std::fs::read(&pfad).unwrap();
+        assert!(!enthaelt(&roh, MUSTER));
+        assert!(crate::tresor::ist_verschluesselt(&roh));
+        assert!(!o.join("attachments").join("a1.png").exists());
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn anhang_pfad_liefert_eine_lesbare_kopie() {
+        let o = ordner("kopie");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        s.store_attachment("a1", "image/png", PNG).unwrap();
+        let kopie = s.anhang_pfad("a1").unwrap();
+        assert!(kopie.starts_with(&*laufzeit(&o).to_string_lossy()), "{}", kopie);
+        assert!(kopie.ends_with("a1.png"));
+        assert_eq!(std::fs::read(&kopie).unwrap(), PNG);
+        use std::os::unix::fs::PermissionsExt;
+        let modus = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modus(Path::new(&kopie)), 0o600);
+        assert_eq!(modus(&laufzeit(&o)), 0o700);
+        assert_eq!(s.anhang_pfad("gibtsnicht"), None);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn nach_dem_leeren_kommt_die_kopie_wieder() {
+        let o = ordner("leeren");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        s.store_attachment("a1", "image/png", PNG).unwrap();
+        let kopie = s.anhang_pfad("a1").unwrap();
+        s.anhang_kopien_leeren();
+        assert!(!Path::new(&kopie).exists(), "Kopie muss weg sein");
+        assert_eq!(s.anhang_pfad("a1").as_deref(), Some(kopie.as_str()));
+        assert_eq!(std::fs::read(&kopie).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn fremder_laufzeitordner_wird_nicht_benutzt() {
+        let o = ordner("verweis");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        s.store_attachment("a1", "image/png", PNG).unwrap();
+        // Ein Verweis an der Stelle des Laufzeitordners, wie ihn ein anderer
+        // unter /tmp legen koennte.
+        let woanders = o.join("woanders");
+        std::fs::create_dir_all(&woanders).unwrap();
+        std::fs::create_dir_all(o.join("lauf")).unwrap();
+        std::os::unix::fs::symlink(&woanders, laufzeit(&o)).unwrap();
+        assert_eq!(s.anhang_pfad("a1"), None);
+        assert!(std::fs::read_dir(&woanders).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn passwort_setzen_versiegelt_vorhandene_anhaenge() {
+        let o = ordner("umwandeln");
+        let mut s = speicher(&o);
+        let klar = s.store_attachment("a1", "image/png", PNG).unwrap();
+        s.passwort_setzen(None, "geheim").unwrap();
+        assert!(!Path::new(&klar).exists(), "Klartext muss weg sein");
+        let a = s.attachment("a1").unwrap().clone();
+        assert!(a.versiegelt);
+        assert!(a.path.ends_with(".siegel"));
+        assert!(!enthaelt(&std::fs::read(&a.path).unwrap(), MUSTER));
+        assert_eq!(std::fs::read(s.anhang_pfad("a1").unwrap()).unwrap(), PNG);
+        // Der Pfad ist auch im gespeicherten Zustand fortgeschrieben.
+        drop(s);
+        let s = mit_passwort(&o, "geheim");
+        assert_eq!(s.attachment("a1").unwrap().path, a.path);
+        assert_eq!(std::fs::read(s.anhang_pfad("a1").unwrap()).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn passwort_entfernen_wandelt_zurueck() {
+        let o = ordner("zurueck");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        let siegelpfad = s.store_attachment("a1", "image/png", PNG).unwrap();
+        let kopie = s.anhang_pfad("a1").unwrap();
+        s.passwort_setzen(Some("geheim"), "").unwrap();
+        assert!(!Path::new(&siegelpfad).exists(), ".siegel muss weg sein");
+        assert!(!Path::new(&kopie).exists(), "Kopie muss weg sein");
+        let a = s.attachment("a1").unwrap();
+        assert!(!a.versiegelt);
+        assert!(a.path.ends_with("a1.png"));
+        assert_eq!(std::fs::read(&a.path).unwrap(), PNG);
+        assert_eq!(s.anhang_pfad("a1").as_deref(), Some(a.path.as_str()));
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn passwortwechsel_schreibt_den_kopf_der_anhaenge_neu() {
+        // Sonst holte das alte Passwort den Speicherschluessel aus jeder
+        // Anhangsdatei.
+        let o = ordner("wechsel");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "alt").unwrap();
+        let pfad = s.store_attachment("a1", "image/png", PNG).unwrap();
+        s.passwort_setzen(Some("alt"), "neu").unwrap();
+        let roh = std::fs::read(&pfad).unwrap();
+        assert!(crate::tresor::Siegel::oeffnen(&roh, "alt").is_err());
+        assert_eq!(crate::tresor::Siegel::oeffnen(&roh, "neu").unwrap().0, PNG);
+        assert_eq!(std::fs::read(s.anhang_pfad("a1").unwrap()).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn scheitert_eine_umlegung_bleibt_das_alte_passwort() {
+        let o = ordner("wechsel-scheitert");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "alt").unwrap();
+        let gut = s.store_attachment("a1", "image/png", PNG).unwrap();
+        let kaputt = s.store_attachment("a2", "image/png", PNG).unwrap();
+        std::fs::write(&kaputt, b"kein Siegel").unwrap();
+        s.save().unwrap();
+        assert!(s.passwort_setzen(Some("alt"), "neu").is_err());
+        assert!(s.passwort_stimmt("alt"), "das alte gilt weiter");
+        assert!(!s.passwort_stimmt("neu"));
+        // Die gute Datei traegt weiter das alte Paket, keine halbe Lage.
+        let roh = std::fs::read(&gut).unwrap();
+        assert!(crate::tresor::Siegel::oeffnen(&roh, "alt").is_ok());
+        assert!(crate::tresor::Siegel::oeffnen(&roh, "neu").is_err());
+        let reste: Vec<_> = std::fs::read_dir(o.join("attachments"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".neu"))
+            .collect();
+        assert!(reste.is_empty(), "keine vorbereiteten Dateien bleiben liegen");
+        // Und auch auf der Platte: der Zustand oeffnet mit dem alten.
+        drop(s);
+        let s = mit_passwort(&o, "alt");
+        assert_eq!(s.attachment("a1").unwrap().path, gut);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn gesperrt_gibt_anhang_pfad_nichts_her() {
+        let o = ordner("gesperrt");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        s.store_attachment("a1", "image/png", PNG).unwrap();
+        assert_eq!(s.anhang_pfad_wenn("a1", true), None);
+        assert!(!laufzeit(&o).join("a1.png").exists(), "und legt keine Kopie an");
+        assert!(s.anhang_pfad_wenn("a1", false).is_some(), "entsperrt wieder");
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    /// Ohne Passwort gibt es keine Kopie, aber hinter der Sperre auch den
+    /// Pfad der Datei selbst nicht.
+    #[test]
+    fn gesperrt_gilt_auch_ohne_siegel() {
+        let o = ordner("gesperrt-klar");
+        let mut s = speicher(&o);
+        s.store_attachment("a1", "image/png", PNG).unwrap();
+        assert_eq!(s.anhang_pfad_wenn("a1", true), None);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn unlesbarer_zustand_zitiert_keine_werte() {
+        let o = ordner("zitat");
+        let p = o.join("state.json");
+        std::fs::write(&p, r#"{"identity": "GEHEIMER-NAME"}"#).unwrap();
+        let fehler = match Store::open(&p, 7327) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("darf nicht oeffnen"),
+        };
+        // Mit BRIAR_LOG_VOLL=1 in der Umgebung steht der volle Text da --
+        // so gewollt; dann gibt es hier nichts zu pruefen.
+        if !crate::net::log_voll() {
+            assert!(fehler.contains("state does not parse"), "{}", fehler);
+            assert!(!fehler.contains("GEHEIMER-NAME"), "{}", fehler);
+        }
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn anhang_loeschen_raeumt_alle_drei_orte() {
+        let o = ordner("loeschen");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "geheim").unwrap();
+        let siegelpfad = s.store_attachment("a1", "image/png", PNG).unwrap();
+        let kopie = s.anhang_pfad("a1").unwrap();
+        // Ein Klartext-Rest daneben, wie ihn ein abgebrochenes Umlegen
+        // hinterlaesst.
+        let rest = o.join("attachments").join("a1.png");
+        std::fs::write(&rest, PNG).unwrap();
+        s.anhang_loeschen("a1");
+        assert!(!Path::new(&siegelpfad).exists());
+        assert!(!Path::new(&kopie).exists());
+        assert!(!rest.exists());
+        assert!(s.attachment("a1").is_none());
+        assert_eq!(s.anhang_pfad("a1"), None);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    /// Ein Stand von vor dieser Fassung: ein Anhang ohne das Feld
+    /// `versiegelt`, die Datei im Klartext daneben.
+    fn alter_stand(o: &Path) -> PathBuf {
+        let dir = o.join("attachments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let datei = dir.join("a1.png");
+        std::fs::write(&datei, PNG).unwrap();
+        // Ein frischer Zustand, dem der Anhangseintrag in der alten Form
+        // (ohne `versiegelt`) von Hand eingesetzt wird.
+        let p = o.join("state.json");
+        Store::open(&p, 7327).unwrap().save().unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        json["attachments"] = serde_json::json!({
+            "a1": {"content_type": "image/png", "path": datei, "size": PNG.len()}
+        });
+        std::fs::write(&p, json.to_string()).unwrap();
+        datei
+    }
+
+    #[test]
+    fn alter_stand_mit_klartext_laedt() {
+        let o = ordner("altbestand");
+        let datei = alter_stand(&o);
+        let s = speicher(&o);
+        let a = s.attachment("a1").unwrap();
+        assert!(!a.versiegelt);
+        assert_eq!(s.anhang_pfad("a1").unwrap(), datei.to_string_lossy());
+        assert_eq!(std::fs::read(&datei).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    #[test]
+    fn alter_klartext_wird_beim_oeffnen_mit_passwort_versiegelt() {
+        let o = ordner("nachholen");
+        let datei = alter_stand(&o);
+        let s = mit_passwort(&o, "geheim");
+        assert!(!datei.exists(), "Klartext muss weg sein");
+        let a = s.attachment("a1").unwrap();
+        assert!(a.versiegelt);
+        assert!(!enthaelt(&std::fs::read(&a.path).unwrap(), MUSTER));
+        assert_eq!(std::fs::read(s.anhang_pfad("a1").unwrap()).unwrap(), PNG);
+        // Und der Zustand ist gespeichert -- verschluesselt, mit neuem Pfad.
+        let pfad = a.path.clone();
+        drop(s);
+        assert!(Store::ist_verschluesselt(&o.join("state.json")));
+        let s = mit_passwort(&o, "geheim");
+        assert_eq!(s.attachment("a1").unwrap().path, pfad);
+        let _ = std::fs::remove_dir_all(&o);
     }
 }

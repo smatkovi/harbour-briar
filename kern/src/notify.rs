@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use zbus::zvariant::Value;
@@ -144,7 +145,7 @@ pub fn close(key: &str) {
 /// The other direction: the interface lipstick calls when someone types into
 /// the notification's reply field.
 struct Backend {
-    api_port: u16,
+    sockel: PathBuf,
 }
 
 #[zbus::interface(name = "harbour.briar.Backend")]
@@ -159,7 +160,7 @@ impl Backend {
             contact_id,
             json_string(text.trim())
         );
-        post(self.api_port, "/send", &body);
+        post(&self.sockel, "/send", &body);
     }
 
     fn reply_group(&self, group: String, text: String) {
@@ -171,7 +172,7 @@ impl Backend {
             json_string(group.trim()),
             json_string(text.trim())
         );
-        post(self.api_port, "/group/send", &body);
+        post(&self.sockel, "/group/send", &body);
     }
 }
 
@@ -194,34 +195,34 @@ fn json_string(text: &str) -> String {
 
 /// Our own HTTP interface, so a reply from the notification takes exactly
 /// the same path as one typed in the app.
-fn post(port: u16, path: &str, body: &str) {
+fn post(sockel: &std::path::Path, path: &str, body: &str) {
     // Mit dem Geheimnis der Schnittstelle: wir sind zwar derselbe Prozess,
     // gehen aber denselben Weg wie die Oberflaeche.
     let request = format!(
-        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
         crate::api::geheimnis(),
         body.len(),
         body
     );
-    if let Ok(mut socket) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+    // Ueber den Sockel, den es immer gibt -- den TCP-Port nur mit --api-port.
+    if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(sockel) {
         let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(30)));
         let _ = socket.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let _ = socket.write_all(request.as_bytes());
-        // Begrenzt: die Gegenseite ist unser eigener Dienst -- es sei denn,
-        // ein Fremder hat den Port.
+        // Begrenzt, auch wenn die Gegenseite unser eigener Dienst ist.
         let mut answer = Vec::new();
         let _ = socket.take(64 * 1024).read_to_end(&mut answer);
     }
 }
 
 /// Holds the name on the session bus for as long as the daemon runs.
-pub fn serve(api_port: u16) {
+pub fn serve(sockel: PathBuf) {
     std::thread::spawn(move || {
         let built = zbus::blocking::connection::Builder::session()
             .and_then(|builder| builder.name("harbour.briar.backend"))
-            .and_then(|builder| builder.serve_at("/", Backend { api_port }))
+            .and_then(|builder| builder.serve_at("/", Backend { sockel }))
             .and_then(|builder| builder.build());
         match built {
             Ok(_connection) => {

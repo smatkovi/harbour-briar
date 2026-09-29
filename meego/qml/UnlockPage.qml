@@ -86,6 +86,7 @@ Page {
         Item { width: 1; height: 24 }
 
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             font.pixelSize: 28
             font.bold: true
@@ -93,6 +94,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             font.pixelSize: 18
@@ -121,6 +123,7 @@ Page {
         // Datei nicht zu oeffnen, und ein Hintertuerchen waere genau das, was
         // hier niemand will.
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             font.pixelSize: 18

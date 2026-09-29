@@ -12,10 +12,24 @@ PageStackWindow {
     // difference between readable and blinding.
     platformStyle: PageStackWindowStyle { background: "" }
 
+    // Kein Rich Text: Qt 4.7 deutet jeden Text mit AutoText, ein fremder
+    // Nachrichtentext <img src="http://..."> wuerde als HTML gelesen und das
+    // Bild am Tor vorbei geladen. Anders als Silica hat Harmattan keine
+    // Vorgabe fuer alle Labels -- darum setzt jedes Label und jeder Text in
+    // meego/qml sein textFormat selbst auf Klartext (PlainText). Wer ein neues anlegt, setzt
+    // es mit. Fremdes gehoert nie in Button-, Dialog- oder Menue-Texte, deren
+    // inneres Label wir nicht erreichen.
+
     property variant zustand: { "contacts": [], "pending": [], "groups": [], "identity": null }
     property string fehler: ""
     // Das Geheimnis der Schnittstelle, siehe harbour-briar.qml.
     property bool geheimnisVerdrahtet: Briar.geheimnisQuelleSetzen(function() { return dienst.token() })
+    // Die Bruecke zum Sockel des Dienstes, siehe harbour-briar.qml.
+    property bool brueckeVerdrahtet: Briar.brueckeSetzen(dienst)
+    Connections {
+        target: dienst
+        onAntwort: Briar.antwortErhalten(nummer, code, rumpf)
+    }
     property int sprachStand: 0
 
     // Alle Beschriftungen gehen hier durch, damit ein Sprachwechsel sofort

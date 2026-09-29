@@ -207,6 +207,7 @@ Page {
         PageHeader { title: app.tr("lockedTitle") }
 
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap
@@ -235,6 +236,7 @@ Page {
         // Was der Dienst gerade sagt, wenn es haengt -- damit ein Haenger
         // sich selbst erklaert.
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             visible: page.hinweis.length > 0
@@ -292,6 +294,7 @@ Page {
                 onClicked: pruefer.authenticate("briar-unlock")
             }
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
@@ -307,6 +310,7 @@ Page {
         // Hintertuerchen waere genau das, was hier niemand will. Briar bietet
         // an derselben Stelle dasselbe an.
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap
@@ -329,8 +333,11 @@ Page {
         Column {
             width: parent.width
             spacing: Theme.paddingLarge
+            // acceptText zeigt Silica immer als RichText (DialogHeader.qml:266-267,
+            // QTBUG-40161): hier nie fremden Text, nur eigene aus Strings.js.
             DialogHeader { acceptText: app.tr("deleteAccount") }
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap

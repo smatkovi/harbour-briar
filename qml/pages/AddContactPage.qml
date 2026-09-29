@@ -14,6 +14,8 @@ Dialog {
     property string prefillOnion: ""
     canAccept: linkField.text.indexOf("briar://") >= 0 || linkField.text.trim().length >= 53
 
+    // acceptText zeigt Silica immer als RichText (DialogHeader.qml:266-267,
+    // QTBUG-40161): hier nie fremden Text, nur eigene aus Strings.js.
     DialogHeader { id: header; acceptText: app.tr("add") }
 
     Column {
@@ -38,6 +40,7 @@ Dialog {
         // Die drei Adressfelder gehoeren zu den eigenen Fassungen: ein Briar
         // auf Android hat keine und findet den Weg ueber Tor selbst.
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap
@@ -74,6 +77,7 @@ Dialog {
         }
 
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap
@@ -87,6 +91,7 @@ Dialog {
         // Bluetooth. Die Meldung spaeter nachzureichen braucht einen Kanal,
         // den es dann nicht mehr gibt.
         Label {
+            textFormat: Text.PlainText
             visible: !app.status.tor
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin

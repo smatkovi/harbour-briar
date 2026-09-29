@@ -16,21 +16,26 @@ rm -rf "$WORK"; mkdir -p "$WORK/a" "$WORK/b"
 # the daemon's own tor/ directory, the second daemon cannot share the first
 # one's Tor any more. BRIAR_TOR names the Tor binary when none is installed
 # where the packages put it (tools/build-tor.sh leaves them in /tmp/tor-build).
+# Seit 0.42.0 ohne --api-port: die Schnittstelle liegt nur auf dem Sockel
+# $WORK/<seite>/api.sock, so wie auf dem Geraet. <api> bleibt als Name.
 start() {   # start <dir> <api> <lan> <torport> <torcontrol>
-    "$DAEMON" --state "$WORK/$1/state.json" --api-port "$2" \
+    "$DAEMON" --state "$WORK/$1/state.json" \
         --lan-port "$3" --tor-port "$4" --tor-control-port "$5" > "$WORK/$1.log" 2>&1 &
     echo $!
 }
 api() {     # api <port> <method> <path> [json]
     # Seit 0.41.0 verlangt die Schnittstelle das Geheimnis, das der Dienst
-    # neben seine state.json legt.
+    # neben seine state.json legt. Der "Port" nennt nur noch die Seite; es
+    # geht ueber den Sockel, mit Host localhost (die Host-Pruefung gilt auch
+    # dort, ein anderer Name gaebe 400).
     case $1 in 8301) seite=a ;; 8302) seite=b ;; *) echo "api: unbekannter Port $1" >&2; exit 1 ;; esac
     G=$(cat "$WORK/$seite/api-token" 2>/dev/null)
     if [ -n "$4" ]; then
-        curl -s -X "$2" -H "Authorization: Bearer $G" -H 'Content-Type: application/json' -d "$4" \
-            "http://127.0.0.1:$1$3"
+        curl -s --unix-socket "$WORK/$seite/api.sock" -X "$2" -H "Authorization: Bearer $G" \
+            -H 'Content-Type: application/json' -d "$4" "http://localhost$3"
     else
-        curl -s -X "$2" -H "Authorization: Bearer $G" "http://127.0.0.1:$1$3"
+        curl -s --unix-socket "$WORK/$seite/api.sock" -X "$2" -H "Authorization: Bearer $G" \
+            "http://localhost$3"
     fi
 }
 feld() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval('d'+sys.argv[1]) or '')" "$1"; }

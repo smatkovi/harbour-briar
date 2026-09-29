@@ -186,12 +186,14 @@ Page {
             spacing: 16
 
             Label {
+                textFormat: Text.PlainText
                 text: fenster.tr("meetTitle")
                 font.pixelSize: 32
                 color: "white"
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 font.pixelSize: 20
@@ -273,6 +275,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 font.pixelSize: 18

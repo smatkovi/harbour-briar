@@ -20,6 +20,8 @@
 #include <QImage>
 #include <QObject>
 #include <QString>
+#include <QTemporaryFile>
+#include <unistd.h>
 
 class ImagePrep : public QObject
 {
@@ -27,6 +29,47 @@ class ImagePrep : public QObject
 
 public:
     explicit ImagePrep(QObject *parent = 0) : QObject(parent) {}
+
+    /**
+     * Wohin die verkleinerten Kopien kommen: ein eigener Ordner, den beide
+     * main.cpp setzen (QStandardPaths gibt es unter Qt 4.7 nicht, darum
+     * nicht hier). Frueher lag jede Kopie als /tmp/briar-anhang.jpg da --
+     * fester Name, fuer alle lesbar, nie geloescht; ein anderes Konto konnte
+     * die Datei vorbelegen, mitlesen und den Inhalt vor dem Senden tauschen
+     * (Gegenpruefung 7b, C5). Beim Setzen wird geleert, was ein Absturz
+     * liegen liess.
+     */
+    void setVersandOrdner(const QString &ordner)
+    {
+        m_versand = ordner;
+        if (!versandBereit())
+            return;
+        const QFileInfoList reste = QDir(m_versand).entryInfoList(
+                QDir::Files | QDir::Hidden | QDir::System | QDir::NoSymLinks);
+        for (int i = 0; i < reste.size(); ++i)
+            QFile::remove(reste.at(i).absoluteFilePath());
+    }
+
+    /**
+     * Loescht eine Kopie aus prepare(), sobald /send sie gelesen hat. Nur
+     * Dateien direkt im eigenen versand-Ordner: QML ruft das auch mit dem
+     * Pfad des Originals auf, wenn das schon klein genug war -- das darf
+     * hier nie verschwinden.
+     */
+    Q_INVOKABLE void aufraeumen(const QString &pfad)
+    {
+        QString p = pfad;
+        if (p.startsWith(QLatin1String("file://")))
+            p = p.mid(7);
+        if (p.isEmpty() || m_versand.isEmpty())
+            return;
+        const QString ordner = QFileInfo(m_versand).canonicalFilePath();
+        const QFileInfo datei(p);
+        if (ordner.isEmpty() || datei.isSymLink() || !datei.isFile()
+                || datei.canonicalPath() != ordner)
+            return;
+        QFile::remove(datei.canonicalFilePath());
+    }
 
     /**
      * Der Text eines Anhangs, fuer den Betrachter in der App. QML kann keine
@@ -51,7 +94,8 @@ public:
     /**
      * Returns a path that fits in maxBytes: the file itself when it is
      * already small enough, a scaled JPEG copy when it is an image, and an
-     * empty string when neither is possible.
+     * empty string when neither is possible. Die Kopie liegt im
+     * versand-Ordner; wer sie gesendet hat, gibt sie an aufraeumen().
      */
     Q_INVOKABLE QString prepare(const QString &pfad, int maxBytes)
     {
@@ -84,16 +128,8 @@ public:
                 if (!klein.save(&puffer, "JPEG", guete))
                     return QString();
                 puffer.close();
-                if (daten.size() <= maxBytes) {
-                    const QString ziel = QDir::tempPath()
-                            + QLatin1String("/briar-anhang.jpg");
-                    QFile aus(ziel);
-                    if (!aus.open(QIODevice::WriteOnly))
-                        return QString();
-                    aus.write(daten);
-                    aus.close();
-                    return ziel;
-                }
+                if (daten.size() <= maxBytes)
+                    return ablegen(daten);
             }
             kante = kante / 2;
             if (kante < 64)
@@ -116,6 +152,52 @@ public:
             return QLatin1String("text/plain");
         return QLatin1String("application/octet-stream");
     }
+
+private:
+    /// Der versand-Ordner steht, ist ein echter Ordner (kein Link), gehoert
+    /// uns und steht auf 0700. Sonst nichts ablegen.
+    bool versandBereit() const
+    {
+        if (m_versand.isEmpty() || !QDir().mkpath(m_versand))
+            return false;
+        const QFileInfo vorher(m_versand);
+        if (vorher.isSymLink() || !vorher.isDir()
+                || vorher.ownerId() != uint(::getuid()))
+            return false;
+        const QFile::Permissions nurIch =
+                QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner;
+        if (!QFile::setPermissions(m_versand, nurIch))
+            return false;
+        // Neu gelesen: QFileInfo haelt die alten Rechte zwischengespeichert.
+        const QFileInfo nachher(m_versand);
+        return (nachher.permissions() & (QFile::ReadGroup | QFile::WriteGroup
+                | QFile::ExeGroup | QFile::ReadOther | QFile::WriteOther
+                | QFile::ExeOther)) == 0;
+    }
+
+    /// Die Bytes in eine frische Datei mit zufaelligem Namen: QTemporaryFile
+    /// legt sie mit O_EXCL und 0600 an. Das XXXXXX steht am Ende, weil Qt
+    /// 4.7 es nur dort ersetzt; den Typ bekommt /send ohnehin gesagt.
+    QString ablegen(const QByteArray &daten) const
+    {
+        if (!versandBereit())
+            return QString();
+        QTemporaryFile aus(m_versand + QLatin1String("/anhang-XXXXXX"));
+        aus.setAutoRemove(false);
+        if (!aus.open())
+            return QString();
+        const QString name = aus.fileName();
+        aus.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+        if (aus.write(daten) != daten.size() || !aus.flush()) {
+            aus.close();
+            QFile::remove(name);
+            return QString();
+        }
+        aus.close();
+        return name;
+    }
+
+    QString m_versand;
 };
 
 #endif

@@ -116,6 +116,7 @@ Page {
         Item { width: 1; height: 24 }
 
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter

@@ -52,6 +52,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 visible: app.lastError.length > 0
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 x: Theme.horizontalPageMargin
@@ -65,6 +66,7 @@ Page {
             // die Gegenseite verwirft unsere Nachrichten, quittiert sie aber
             // vorher -- bei uns stehen sie dann als zugestellt da.
             Label {
+                textFormat: Text.PlainText
                 visible: !!app.status.clockWrong
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 x: Theme.horizontalPageMargin
@@ -80,6 +82,7 @@ Page {
                 delegate: ListItem {
                     contentHeight: Theme.itemSizeSmall
                     Label {
+                        textFormat: Text.PlainText
                         x: Theme.horizontalPageMargin
                         anchors.verticalCenter: parent.verticalCenter
                         width: parent.width - 2 * Theme.horizontalPageMargin
@@ -197,6 +200,7 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
 
                 Label {
+                    textFormat: Text.PlainText
                     // Ungelesenes gehoert an den Namen. Der Dienst rechnet es
                     // je Kontakt (api.rs), angezeigt hat es bisher niemand.
                     text: modelData.unread > 0
@@ -208,6 +212,7 @@ Page {
                     width: parent.width
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: modelData.lastText
                           ? modelData.lastText
                           : (modelData.address ? modelData.address
@@ -222,6 +227,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 visible: modelData.unsent > 0
                 anchors.right: parent.right
                 anchors.rightMargin: Theme.horizontalPageMargin

@@ -16,6 +16,7 @@
 #include <QInputContext>
 #include <QInputContextFactory>
 #include <QLocale>
+#include <QLocalSocket>
 #include <QProcess>
 #include <QTcpSocket>
 #include <csignal>
@@ -25,7 +26,19 @@
 #include "../src/imageprep.h"
 #include "sha256.h"
 
-static const quint16 ApiPort = 8105;
+// Nur noch, um einen alten Dienst (bis 0.41.0) zu erkennen, der dort
+// lauscht statt auf dem Sockel -- siehe dienstStarten.
+static const quint16 AlterApiPort = 8105;
+// So lange wartet eine Anfrage auf ihre Antwort, wie ZEITGRENZE in Briar.js.
+static const int AnfrageZeitgrenze = 90000;
+// Mehr nimmt eine Anfrage nicht an: ein Fremder am Sockel soll den Speicher
+// nicht fuellen (frueher 64 MiB). Nicht die 4 MiB aus der Gegenpruefung 7b
+// (H): /messages und /group/messages geben den ganzen Verlauf zurueck, ohne
+// Grenze (kern/src/api.rs, "/messages"), rund 300 Byte je Nachricht -- ab
+// etwa 14000 Nachrichten waere ein Chat mit 4 MiB fuer immer Status 0.
+static const int MaxAntwort = 16 * 1024 * 1024;
+
+static QString datenOrdner();
 
 // Harmattan writes the session bus address here. A process started over ssh
 // or from a service does not inherit it, and without it nothing on the bus
@@ -56,10 +69,26 @@ static void sitzungsBusSetzen()
     }
 }
 
+/// Der Sockel der Schnittstelle, neben der state.json.
+static QString sockelPfad()
+{
+    return datenOrdner() + QLatin1String("/api.sock");
+}
+
 static bool dienstAntwortet()
 {
+    QLocalSocket socket;
+    socket.connectToServer(sockelPfad());
+    return socket.waitForConnected(300);
+}
+
+/// Lauscht auf dem alten Port noch ein Dienst bis 0.41.0? Der kennt den
+/// Sockel nicht, haelt aber die Instanzsperre -- ein neu gestarteter kaeme
+/// nie an die Reihe.
+static bool alterDienstAufPort()
+{
     QTcpSocket socket;
-    socket.connectToHost(QLatin1String("127.0.0.1"), ApiPort);
+    socket.connectToHost(QLatin1String("127.0.0.1"), AlterApiPort);
     return socket.waitForConnected(300);
 }
 
@@ -88,8 +117,8 @@ static QByteArray tokenDatei()
 /// GET /status, roh -- mit Geheimnis, wenn eines uebergeben wird.
 static QByteArray statusRoh(const QByteArray &geheimnis)
 {
-    QTcpSocket socket;
-    socket.connectToHost(QLatin1String("127.0.0.1"), ApiPort);
+    QLocalSocket socket;
+    socket.connectToServer(sockelPfad());
     if (!socket.waitForConnected(300))
         return QByteArray();
     QByteArray anfrage("GET /status HTTP/1.0\r\n");
@@ -168,6 +197,145 @@ void Dienst::starten()
     dienstStarten();
 }
 
+/// Die rohe Antwort in Status und Rumpf zerlegen. Falsch, wenn sie nicht
+/// vollstaendig ist -- der Dienst nennt immer Content-Length, und ein
+/// abgeschnittener Rumpf soll nicht als halbes JSON bei Briar.js ankommen.
+static bool antwortZerlegen(const QByteArray &roh, int *status, QByteArray *rumpf)
+{
+    const int kopfEnde = roh.indexOf("\r\n\r\n");
+    if (!roh.startsWith("HTTP/") || kopfEnde < 0)
+        return false;
+    const QList<QByteArray> zeilen = roh.left(kopfEnde).split('\n');
+    const QList<QByteArray> erste = zeilen.at(0).trimmed().split(' ');
+    bool zahl = false;
+    const int code = erste.size() > 1 ? erste.at(1).toInt(&zahl) : 0;
+    if (!zahl || code <= 0)
+        return false;
+    int laenge = -1;
+    for (int i = 1; i < zeilen.size(); ++i) {
+        const QByteArray z = zeilen.at(i).trimmed();
+        const int p = z.indexOf(':');
+        if (p > 0 && z.left(p).trimmed().toLower() == "content-length")
+            laenge = z.mid(p + 1).trimmed().toInt();
+    }
+    QByteArray r = roh.mid(kopfEnde + 4);
+    if (laenge >= 0) {
+        if (r.size() < laenge)
+            return false;
+        r.truncate(laenge);
+    }
+    *status = code;
+    *rumpf = r;
+    return true;
+}
+
+DienstAnfrage::DienstAnfrage(int id, const QString &sockel, const QByteArray &anfrage,
+                             int zeitgrenze, QObject *parent)
+    : QObject(parent), m_id(id), m_sockel(sockel), m_anfrage(anfrage),
+      m_socket(new QLocalSocket(this)), m_zeit(new QTimer(this)), m_erledigt(false)
+{
+    m_zeit->setSingleShot(true);
+    m_zeit->setInterval(zeitgrenze);
+    connect(m_zeit, SIGNAL(timeout()), this, SLOT(zeitUm()));
+    connect(m_socket, SIGNAL(connected()), this, SLOT(verbunden()));
+    connect(m_socket, SIGNAL(readyRead()), this, SLOT(lesen()));
+    connect(m_socket, SIGNAL(disconnected()), this, SLOT(getrennt()));
+    connect(m_socket, SIGNAL(error(QLocalSocket::LocalSocketError)),
+            this, SLOT(fehler(QLocalSocket::LocalSocketError)));
+}
+
+void DienstAnfrage::starten()
+{
+    if (m_anfrage.isEmpty()) {
+        abschliessen(false);
+        return;
+    }
+    m_zeit->start();
+    m_socket->connectToServer(m_sockel);
+}
+
+void DienstAnfrage::verbunden()
+{
+    m_socket->write(m_anfrage);
+}
+
+void DienstAnfrage::lesen()
+{
+    m_antwort += m_socket->readAll();
+    // Siehe MaxAntwort.
+    if (m_antwort.size() > MaxAntwort)
+        abschliessen(false);
+}
+
+void DienstAnfrage::getrennt()
+{
+    abschliessen(false);
+}
+
+void DienstAnfrage::fehler(QLocalSocket::LocalSocketError)
+{
+    // Auch das Schliessen durch den Dienst kommt als "Fehler"
+    // (PeerClosedError); abschliessen schaut, ob die Antwort ganz ist.
+    abschliessen(false);
+}
+
+void DienstAnfrage::zeitUm()
+{
+    abschliessen(true);
+}
+
+void DienstAnfrage::abschliessen(bool zeitUm)
+{
+    if (m_erledigt)
+        return;
+    m_erledigt = true;
+    m_zeit->stop();
+    if (!zeitUm && m_socket->bytesAvailable() > 0)
+        m_antwort += m_socket->readAll();
+    int status = 0;
+    QByteArray rumpf;
+    if (zeitUm || !antwortZerlegen(m_antwort, &status, &rumpf))
+        status = 0;
+    m_socket->abort();
+    emit fertig(m_id, status, status == 0 ? QString() : QString::fromUtf8(rumpf));
+    deleteLater();
+}
+
+void Dienst::anfrage(int nummer, const QString &method, const QString &path,
+                     const QString &body, const QString &geheimnis)
+{
+    const QByteArray verb = method.toLatin1();
+    const QByteArray weg = path.toUtf8();
+    const QByteArray g = geheimnis.toLatin1();
+    const QByteArray rumpf = body.toUtf8();
+    QByteArray a;
+    // Kein Zeilenumbruch in Anfragezeile oder Kopf, kein Leerzeichen in Verb
+    // oder Pfad:
+    // sonst liesse sich ein Kopf unterschieben. Leer heisst "gleich Status 0".
+    const QByteArray alles = verb + weg + g;
+    if (!verb.isEmpty() && !weg.isEmpty() && alles.indexOf('\r') < 0
+            && alles.indexOf('\n') < 0 && weg.indexOf(' ') < 0
+            && verb.indexOf(' ') < 0) {
+        a = verb + ' ' + weg + " HTTP/1.0\r\n";
+        a += "Content-Type: application/json\r\n";
+        a += "Content-Length: " + QByteArray::number(rumpf.size()) + "\r\n";
+        if (!g.isEmpty()) {
+            a += "Authorization: Bearer " + g + "\r\n";
+            a += "X-Briar-Geheimnis: " + g + "\r\n";
+        }
+        a += "\r\n";
+        a += rumpf;
+    }
+    DienstAnfrage *laeufer =
+        new DienstAnfrage(nummer, sockelPfad(), a, AnfrageZeitgrenze, this);
+    connect(laeufer, SIGNAL(fertig(int,int,QString)),
+            this, SIGNAL(antwort(int,int,QString)));
+    // Erst aus der Ereignisschleife: die Antwort kommt so immer spaeter als
+    // der Aufruf zurueckkehrt, wie bei XMLHttpRequest -- auch wenn der
+    // Sockel fehlt und QLocalSocket den Fehler sofort meldet.
+    QTimer::singleShot(0, laeufer, SLOT(starten()));
+}
+
 /// Siehe die Sailfish-Seite: nur an einen Dienst, der mit SHA-256 ueber das
 /// Geheimnis nachweist, dass er die Datei selbst kennt.
 QString Dienst::token()
@@ -184,6 +352,16 @@ QString Dienst::token()
 
 static void dienstStarten()
 {
+    if (!dienstAntwortet() && alterDienstAufPort()) {
+        // Nach der Aktualisierung auf 0.42.0 laeuft womoeglich noch der alte
+        // Dienst: er lauscht auf 8105, nicht auf dem Sockel. Eine Fassung
+        // laesst sich von ihm nicht mehr lesen, aber er ist es sicher --
+        // dienstBeenden trifft nur /opt/briar/bin/briard.
+        qWarning("alter Dienst auf Port %d -- neu starten", int(AlterApiPort));
+        dienstBeenden();
+        for (int i = 0; i < 20 && alterDienstAufPort(); ++i)
+            ::usleep(100 * 1000);
+    }
     if (dienstAntwortet()) {
         // Laeuft schon einer -- aber ist es der zur App gehoerende? Der
         // Dienst ueberlebt eine Aktualisierung des Pakets, und die App
@@ -210,8 +388,8 @@ static void dienstStarten()
     const QString daten = datenOrdner();
     QDir().mkpath(daten);
     QStringList argumente;
-    argumente << QLatin1String("--state") << daten + QLatin1String("/state.json")
-              << QLatin1String("--api-port") << QString::number(ApiPort);
+    // Ohne --api-port: die Schnittstelle liegt nur auf dem Sockel.
+    argumente << QLatin1String("--state") << daten + QLatin1String("/state.json");
     // Detached, so messages keep arriving after the interface is closed.
     QProcess::startDetached(QLatin1String("/opt/briar/bin/briard"), argumente);
 }
@@ -251,6 +429,10 @@ int main(int argc, char *argv[])
     view.rootContext()->setContextProperty(QLatin1String("systemSprache"),
                                            QLocale::system().name());
     ImagePrep imagePrep;
+    // Verkleinerte Bilder vor dem Senden: im Datenordner, der nur uns
+    // gehoert -- Harmattan hat keinen XDG_RUNTIME_DIR, und /tmp teilen sich
+    // alle Konten.
+    imagePrep.setVersandOrdner(datenOrdner() + QLatin1String("/versand"));
     view.rootContext()->setContextProperty(QLatin1String("ImagePrep"), &imagePrep);
     view.rootContext()->setContextProperty(QLatin1String("dienst"), &dienst);
     view.rootContext()->setContextProperty(QLatin1String("QrCode"), &qrCode);

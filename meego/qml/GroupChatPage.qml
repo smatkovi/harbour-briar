@@ -49,6 +49,7 @@ Page {
         Column {
             anchors.verticalCenter: parent.verticalCenter
             Label {
+                textFormat: Text.PlainText
                 text: seite.aufgeloest
                       ? seite.name + " (" + fenster.tr("dissolved") + ")"
                       : seite.name + " (" + seite.mitglieder.length + ")"
@@ -58,6 +59,7 @@ Page {
             // Die Namen, nicht bloss die Zahl -- die Hilfe verspricht sie, und
             // der Dienst liefert sie mit.
             Label {
+                textFormat: Text.PlainText
                 visible: !seite.aufgeloest && seite.mitglieder.length > 0
                 text: seite.mitglieder.join(", ")
                 color: "#a0a0a0"
@@ -101,6 +103,7 @@ Page {
 
             Text {
                 id: absender
+                textFormat: Text.PlainText
                 anchors {
                     top: parent.top
                     right: eigen ? parent.right : undefined
@@ -127,6 +130,7 @@ Page {
 
                 Text {
                     id: text
+                    textFormat: Text.PlainText
                     x: 14
                     y: 11
                     width: liste.width - 48
@@ -138,6 +142,7 @@ Page {
             }
 
             Text {
+                textFormat: Text.PlainText
                 anchors {
                     top: blase.bottom
                     right: eigen ? blase.right : undefined

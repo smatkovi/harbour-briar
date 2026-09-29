@@ -707,14 +707,17 @@ impl Tor {
     pub fn unpublish(&mut self, service_id: &str) -> std::io::Result<bool> {
         // Tor will den nackten v3-Namen; mit ".onion" kennt es ihn nicht.
         let id = service_id.trim_end_matches(".onion");
-        let (code, lines) = command(&mut self.control, &format!("DEL_ONION {}\r\n", id))?;
+        let (code, _) = command(&mut self.control, &format!("DEL_ONION {}\r\n", id))?;
         match code {
             250 => Ok(true),
             // 552 "Unknown Onion Service ID"
             552 => Ok(false),
+            // Ohne die Kennung und ohne Tors Antworttext: die Onion eines
+            // Treffpunkts laesst sich dem QR-Code zuordnen, und der Fehler
+            // landet im Protokoll (7b, D2). Der Antwortcode reicht zur Suche.
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Tor kept the hidden service {}: {:?}", id, lines),
+                format!("Tor kept the hidden service (reply {})", code),
             )),
         }
     }

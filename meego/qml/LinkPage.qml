@@ -24,6 +24,7 @@ Page {
         spacing: 16
 
         Label {
+            textFormat: Text.PlainText
             text: fenster.tr("myLink")
             font.pixelSize: 32
             color: "white"
@@ -35,6 +36,8 @@ Page {
             width: parent.width
             height: 160
             readOnly: true
+            // Klartext wie jedes Textfeld hier, siehe AddContactPage.
+            textFormat: TextEdit.PlainText
             text: fenster.zustand.link ? fenster.zustand.link : ""
         }
 
@@ -50,6 +53,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
@@ -73,11 +77,13 @@ Page {
             }
             Column {
                 Label {
+                    textFormat: Text.PlainText
                     text: fenster.tr("torSwitch")
                     color: "white"
                     font.pixelSize: 24
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: fenster.tr("torSwitchHint")
                     color: "#a0a0a0"
                     font.pixelSize: 18
@@ -87,6 +93,7 @@ Page {
                 // Vor dem ersten Lauf dazu, was der kostet: Tor holt sich
                 // das ganze Verzeichnis, und auf 2G dauert das.
                 Label {
+                    textFormat: Text.PlainText
                     visible: fenster.zustand.torFirstRun === true
                     text: fenster.tr("torFirstRun")
                     color: "#a0a0a0"
@@ -107,6 +114,7 @@ Page {
                 }
             }
             Label {
+                textFormat: Text.PlainText
                 text: fenster.tr("btSwitch")
                 color: "white"
                 font.pixelSize: 24
@@ -114,6 +122,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             color: "#a0a0a0"

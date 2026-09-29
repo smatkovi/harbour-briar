@@ -142,6 +142,12 @@ pub fn receive(reader: &mut impl Read) -> std::io::Result<(ContactInfo, Vec<u8>)
             .as_raw()
             .ok_or_else(|| bad("author key is not raw"))?
             .to_vec();
+        // Wie Briar (ContactExchangeManagerImpl.parseContactInfo ->
+        // parseAndValidateAuthor): ein Name ueber 50 Byte oder ein Schluessel
+        // falscher Laenge ist ein Formfehler.
+        if !crate::groups::autor_gueltig(&name, &public_key) {
+            return Err(bad("author name or key out of bounds"));
+        }
         let properties = properties_from_bdf(&items[1]);
         let signature = items[2]
             .as_raw()
@@ -162,4 +168,49 @@ pub fn receive(reader: &mut impl Read) -> std::io::Result<(ContactInfo, Vec<u8>)
 
 fn bad(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ein CONTACT_INFO-Satz, wie ihn die Gegenseite schickt.
+    fn satz(name: &str, schluessel: usize) -> Vec<u8> {
+        let payload = Bdf::List(vec![
+            Bdf::List(vec![
+                Bdf::Int(crate::ids::AUTHOR_FORMAT_VERSION as i64),
+                Bdf::Str(name.to_string()),
+                Bdf::Raw(vec![5u8; schluessel]),
+            ]),
+            Bdf::Dict(BTreeMap::new()),
+            Bdf::Raw(vec![1u8; 64]),
+            Bdf::Int(1000),
+        ]);
+        let mut aus = Vec::new();
+        write_record(
+            &mut aus,
+            &Record::new(PROTOCOL_VERSION, CONTACT_INFO, crate::bdf::to_bytes(&payload)),
+        )
+        .unwrap();
+        aus
+    }
+
+    #[test]
+    fn kontaktinfo_mit_gueltigem_autor_wird_gelesen() {
+        let roh = satz("Bob", 32);
+        let (info, _) = receive(&mut &roh[..]).unwrap();
+        assert_eq!(info.name, "Bob");
+    }
+
+    #[test]
+    fn kontaktinfo_mit_zu_langem_namen_ist_ein_formfehler() {
+        let roh = satz(&"b".repeat(51), 32);
+        assert!(receive(&mut &roh[..]).is_err());
+    }
+
+    #[test]
+    fn kontaktinfo_mit_falscher_schluessellaenge_ist_ein_formfehler() {
+        let roh = satz("Bob", 16);
+        assert!(receive(&mut &roh[..]).is_err());
+    }
 }

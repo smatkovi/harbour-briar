@@ -12,6 +12,8 @@ use briarkern::bdf;
 use briarkern::store::Store;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -93,9 +95,144 @@ fn fremder_qr_code_bringt_den_parser_nicht_zum_absturz() {
     assert!(matches!(r, Ok(true)), "bqp::parse panict an einem praeparierten QR-Inhalt");
 }
 
-/// Ein Dienst mit Geheimnis auf einem freien Port, mit Kontakt Bob und einer
-/// geheimen Nachricht. Liefert Port, Verzeichnis und das Geheimnis, wie die
-/// Oberflaeche es liest: aus der Datei neben der state.json.
+/// Bytes hinter dem obersten Wert: Briar verwirft den Rumpf
+/// (ClientHelperImpl.toList prueft `reader.eof()`).
+#[test]
+fn bdf_bytes_hinter_dem_wert_sind_ein_formfehler() {
+    assert!(bdf::from_bytes(&[0x60, 0x80]).is_ok(), "die leere Liste allein");
+    assert!(bdf::from_bytes(&[0x60, 0x80, 0x00]).is_err(), "ein NULL dahinter");
+    assert!(bdf::from_bytes(&[0x60, 0x80, 0x60, 0x80]).is_err(), "zwei Listen");
+}
+
+/// Ein gueltiger QR-Inhalt (16 Byte Verpflichtung, keine Beschreiber) mit
+/// einem Byte dahinter: PayloadParserImpl.parse wirft dann FormatException.
+#[test]
+fn qr_code_mit_bytes_dahinter_wird_verworfen() {
+    let mut roh = vec![0x04, 0x60, 0x51, 16];
+    roh.extend([9u8; 16]);
+    roh.push(0x80);
+    assert!(briarkern::bqp::parse(&roh).is_some(), "ohne Anhang gilt er");
+    roh.push(0x00);
+    assert!(briarkern::bqp::parse(&roh).is_none(), "mit Anhang nicht");
+}
+
+/// Ein Anhang traegt seine Daten hinter der Beschreibung -- der strenge
+/// Leser darf ihn nicht unkenntlich machen.
+#[test]
+fn anhang_mit_daten_bleibt_ein_anhang() {
+    use briarkern::sync;
+    let rumpf = sync::attachment_body("image/jpeg", &[0xff, 0xd8, 0xff, 0xe0]);
+    assert!(bdf::from_bytes(&rumpf).is_err(), "streng: Daten hinter der Liste");
+    assert!(bdf::from_bytes_prefix(&rumpf).is_ok());
+    assert!(sync::is_attachment(&rumpf));
+    let (art, daten) = sync::parse_attachment(&rumpf).expect("ein Anhang");
+    assert_eq!(art, "image/jpeg");
+    assert_eq!(daten, vec![0xff, 0xd8, 0xff, 0xe0]);
+}
+
+/// Ein Woerterbuch als Bytes: die Schluessel in genau dieser Folge, als
+/// Werte 0, 1, 2 ...
+fn woerterbuch(schluessel: &[&str]) -> Vec<u8> {
+    let mut roh = vec![0x70];
+    for (i, k) in schluessel.iter().enumerate() {
+        roh.push(0x41);
+        roh.push(k.len() as u8);
+        roh.extend(k.as_bytes());
+        roh.extend([0x21, i as u8]);
+    }
+    roh.push(0x80);
+    roh
+}
+
+/// Briars readDictionary verlangt die Schluessel streng aufsteigend.
+#[test]
+fn doppelter_woerterbuchschluessel_ist_ein_formfehler() {
+    assert!(bdf::from_bytes(&woerterbuch(&["a", "b"])).is_ok());
+    assert!(bdf::from_bytes(&woerterbuch(&["a", "a"])).is_err());
+}
+
+#[test]
+fn absteigende_woerterbuchschluessel_sind_ein_formfehler() {
+    assert!(bdf::from_bytes(&woerterbuch(&["b", "a"])).is_err());
+    assert!(bdf::from_bytes(&woerterbuch(&["", "a", "ab", "b"])).is_ok());
+}
+
+/// Java vergleicht Strings nach UTF-16-Einheiten: U+10000 (Surrogate
+/// D800 DC00) kommt vor U+E000, in Byte- und Codepunktordnung danach. Der
+/// Leser folgt Java, und der Schreiber auch, sonst wiese Briar unsere
+/// Woerterbuecher zurueck.
+#[test]
+fn woerterbuchschluessel_ordnen_wie_java() {
+    let bmp = "\u{e000}";
+    let astral = "\u{10000}";
+    assert!(bdf::from_bytes(&woerterbuch(&[astral, bmp])).is_ok(), "Java-Ordnung");
+    assert!(bdf::from_bytes(&woerterbuch(&[bmp, astral])).is_err(), "Byte-Ordnung");
+    let wert = bdf::Bdf::dict(vec![(bmp, bdf::Bdf::Int(1)), (astral, bdf::Bdf::Int(0))]);
+    let geschrieben = bdf::to_bytes(&wert);
+    assert_eq!(geschrieben, woerterbuch(&[astral, bmp]), "der Schreiber ordnet wie Java");
+    assert_eq!(bdf::from_bytes(&geschrieben).unwrap(), wert);
+}
+
+/// BdfReaderImpl.readInt16/32/64 mit canonical = true: passt der Wert in
+/// die naechstkleinere Form, ist es ein Formfehler.
+#[test]
+fn nicht_kanonische_ganzzahlen_sind_formfehler() {
+    let falsch: [&[u8]; 6] = [
+        &[0x22, 0x00, 0x7f],                                     // 127 als INT_16
+        &[0x22, 0xff, 0x80],                                     // -128 als INT_16
+        &[0x24, 0x00, 0x00, 0x7f, 0xff],                         // 32767 als INT_32
+        &[0x24, 0xff, 0xff, 0x80, 0x00],                         // -32768 als INT_32
+        &[0x28, 0, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff],             // 2^31-1 als INT_64
+        &[0x28, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00], // -2^31 als INT_64
+    ];
+    for roh in falsch {
+        assert!(bdf::from_bytes(roh).is_err(), "{:02x?} ist nicht kanonisch", roh);
+    }
+    let richtig: [(&[u8], i64); 6] = [
+        (&[0x22, 0x00, 0x80], 128),
+        (&[0x22, 0xff, 0x7f], -129),
+        (&[0x24, 0x00, 0x00, 0x80, 0x00], 32768),
+        (&[0x24, 0xff, 0xff, 0x7f, 0xff], -32769),
+        (&[0x28, 0, 0, 0, 0, 0x80, 0, 0, 0], 1 << 31),
+        (&[0x28, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff], -(1 << 31) - 1),
+    ];
+    for (roh, zahl) in richtig {
+        assert_eq!(bdf::from_bytes(roh).unwrap(), bdf::Bdf::Int(zahl));
+    }
+}
+
+/// Unser Schreiber waehlt immer die kleinste Form -- an allen Grenzen.
+#[test]
+fn schreiber_kodiert_ganzzahlen_kanonisch() {
+    let grenzen: [(i64, u8); 14] = [
+        (127, 0x21),
+        (128, 0x22),
+        (-128, 0x21),
+        (-129, 0x22),
+        (32767, 0x22),
+        (32768, 0x24),
+        (-32768, 0x22),
+        (-32769, 0x24),
+        ((1 << 31) - 1, 0x24),
+        (1 << 31, 0x28),
+        (-(1 << 31), 0x24),
+        (-(1 << 31) - 1, 0x28),
+        (i64::MAX, 0x28),
+        (i64::MIN, 0x28),
+    ];
+    for (zahl, art) in grenzen {
+        let roh = bdf::to_bytes(&bdf::Bdf::Int(zahl));
+        assert_eq!(roh[0], art, "{} als {:02x}", zahl, art);
+        assert_eq!(bdf::from_bytes(&roh).unwrap(), bdf::Bdf::Int(zahl), "{} liest sich zurueck", zahl);
+    }
+}
+
+/// Ein Dienst mit Geheimnis, mit Kontakt Bob und einer geheimen Nachricht.
+/// Er lauscht wie ausgeliefert auf dem Sockel neben der state.json (siehe
+/// `sockel`) und zusaetzlich, wie mit --api-port, auf einem freien TCP-Port --
+/// den brauchen die Pruefungen zu Host-Kopf und Webseiten. Liefert Port,
+/// Verzeichnis und das Geheimnis, wie die Oberflaeche es liest: aus der Datei
+/// neben der state.json.
 fn dienst(name: &str) -> (u16, std::path::PathBuf, String) {
     let mut d = std::env::temp_dir();
     d.push(format!("briar-sich-{}-{}", name, std::process::id()));
@@ -122,8 +259,11 @@ fn dienst(name: &str) -> (u16, std::path::PathBuf, String) {
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         l.local_addr().unwrap().port()
     };
+    let lauscher =
+        briarkern::api::lauscher_oeffnen(&pfad, &briarkern::api::sockel_pfad(&pfad), Some(port))
+            .unwrap();
     let geteilt = Arc::new(Mutex::new(store));
-    std::thread::spawn(move || briarkern::api::run(geteilt, port));
+    std::thread::spawn(move || briarkern::api::run(geteilt, lauscher));
     for _ in 0..50 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             break;
@@ -131,6 +271,22 @@ fn dienst(name: &str) -> (u16, std::path::PathBuf, String) {
         std::thread::sleep(Duration::from_millis(50));
     }
     (port, d, geheimnis)
+}
+
+/// Der Sockel des Dienstes aus `dienst`.
+fn sockel(d: &Path) -> std::path::PathBuf {
+    d.join(briarkern::api::SOCKEL_DATEI)
+}
+
+/// Eine Anfrage von Hand auf den Sockel -- so wie die Oberflaechen sie ueber
+/// QLocalSocket schicken.
+fn anfrage_sockel(pfad: &Path, text: &str) -> String {
+    let mut s = UnixStream::connect(pfad).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(text.as_bytes()).unwrap();
+    let mut antwort = String::new();
+    let _ = s.read_to_string(&mut antwort);
+    antwort
 }
 
 fn anfrage(port: u16, text: &str) -> String {
@@ -299,4 +455,178 @@ fn geheimnisdatei_ist_nur_fuer_den_benutzer() {
         .mode();
     let _ = std::fs::remove_dir_all(&d);
     assert_eq!(rechte & 0o777, 0o600, "{:o}", rechte);
+}
+
+/// Der Sockel ist nur fuer den Benutzer selbst: Datei 0600, und der Ordner
+/// der state.json 0700 -- auch wenn er vorher fuer alle lesbar war.
+#[test]
+fn sockel_und_ordner_sind_nur_fuer_den_benutzer() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let mut d = std::env::temp_dir();
+    d.push(format!("briar-sich-ordner-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pfad = d.join("state.json");
+    let sockel_pfad = briarkern::api::sockel_pfad(&pfad);
+    // Ein liegengebliebener Sockel eines beendeten Dienstes stoert nicht.
+    drop(std::os::unix::net::UnixListener::bind(&sockel_pfad).unwrap());
+    let lauscher = briarkern::api::lauscher_oeffnen(&pfad, &sockel_pfad, None).unwrap();
+    let datei = std::fs::symlink_metadata(&sockel_pfad).unwrap();
+    let ordner = std::fs::metadata(&d).unwrap().permissions().mode();
+    drop(lauscher);
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(datei.file_type().is_socket());
+    assert_eq!(datei.permissions().mode() & 0o777, 0o600, "{:o}", datei.permissions().mode());
+    assert_eq!(ordner & 0o777, 0o700, "{:o}", ordner);
+}
+
+/// Ueber den Sockel mit Geheimnis: alles da.
+#[test]
+fn ueber_den_sockel_mit_geheimnis_kommen_die_nachrichten() {
+    let (_, d, g) = dienst("sockel-mit");
+    let a = anfrage_sockel(
+        &sockel(&d),
+        &format!("GET /messages?contact=1 HTTP/1.0\r\nAuthorization: Bearer {}\r\n\r\n", g),
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(a.starts_with("HTTP/1.1 200") && a.contains("GEHEIME NACHRICHT"), "{}", a);
+}
+
+/// Der Sockel ersetzt nur den Transport, nicht das Geheimnis: ohne kommt 401,
+/// auf /status mit dem Nachweis und ohne Fassung.
+#[test]
+fn ueber_den_sockel_ohne_geheimnis_nur_401_mit_nachweis() {
+    let (_, d, _) = dienst("sockel-ohne");
+    let a = anfrage_sockel(&sockel(&d), "GET /messages?contact=1 HTTP/1.0\r\n\r\n");
+    let b = anfrage_sockel(&sockel(&d), "GET /status HTTP/1.0\r\n\r\n");
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(a.starts_with("HTTP/1.1 401") && !a.contains("GEHEIME NACHRICHT"), "{}", a);
+    assert!(b.starts_with("HTTP/1.1 401"), "{}", b);
+    assert!(
+        b.contains(&format!("\"nachweis\":\"{}\"", briarkern::api::nachweis())),
+        "{}",
+        b
+    );
+    assert!(!b.contains("\"version\""), "{}", b);
+}
+
+/// Kommt auf dem Sockel doch ein Host-Kopf, gelten dieselben Regeln wie auf
+/// dem Port: localhost ja, ein fremder Name nein.
+#[test]
+fn ueber_den_sockel_gilt_die_host_pruefung() {
+    let (_, d, g) = dienst("sockel-host");
+    let gut = anfrage_sockel(
+        &sockel(&d),
+        &format!("GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n", g),
+    );
+    let fremd = anfrage_sockel(
+        &sockel(&d),
+        &format!("GET /status HTTP/1.1\r\nHost: briar\r\nAuthorization: Bearer {}\r\n\r\n", g),
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(gut.starts_with("HTTP/1.1 200"), "{}", gut);
+    assert!(fremd.starts_with("HTTP/1.1 400"), "{}", fremd);
+}
+
+/// SO_PEERCRED nennt die UID des Gegenuebers -- hier die eigene, die der
+/// Dienst zulaesst. Einen fremden Benutzer kann der Test ohne root nicht
+/// stellen; die Abweisung haengt an genau diesem Wert.
+#[test]
+fn der_sockel_erkennt_den_eigenen_benutzer() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let ich = unsafe { libc::getuid() };
+    assert_eq!(briarkern::api::gegenueber_uid(&a), Some(ich));
+    assert_eq!(briarkern::api::gegenueber_uid(&b), Some(ich));
+}
+
+/// Ohne --api-port lauscht nichts auf TCP: lauscher_oeffnen gibt genau den
+/// Sockel zurueck.
+#[test]
+fn ohne_port_gibt_es_nur_den_sockel() {
+    let mut d = std::env::temp_dir();
+    d.push(format!("briar-sich-nurkel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let pfad = d.join("state.json");
+    let l = briarkern::api::lauscher_oeffnen(&pfad, &briarkern::api::sockel_pfad(&pfad), None).unwrap();
+    let nur_sockel = l.len() == 1 && matches!(l[0], briarkern::api::Lauscher::Unix(_));
+    drop(l);
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(nur_sockel);
+}
+
+/// 7b, A1: `--api-port` allein oeffnet kein TCP mehr -- erst zusammen mit
+/// BRIAR_API_TCP=1. So bleibt ein Dienst, den eine alte Oberflaeche mit
+/// `--api-port 8105` startet, beim Sockel.
+#[test]
+fn api_port_ohne_schalter_oeffnet_kein_tcp() {
+    use briarkern::api::tcp_erlaubt;
+    use std::ffi::OsStr;
+    assert_eq!(tcp_erlaubt(Some(8105), None), None);
+    assert_eq!(tcp_erlaubt(Some(8105), Some(OsStr::new("0"))), None);
+    assert_eq!(tcp_erlaubt(Some(8105), Some(OsStr::new(""))), None);
+    assert_eq!(tcp_erlaubt(Some(8105), Some(OsStr::new("ja"))), None);
+}
+
+#[test]
+fn api_port_mit_schalter_oeffnet_tcp() {
+    use briarkern::api::tcp_erlaubt;
+    use std::ffi::OsStr;
+    assert_eq!(tcp_erlaubt(Some(8105), Some(OsStr::new("1"))), Some(8105));
+    assert_eq!(tcp_erlaubt(None, Some(OsStr::new("1"))), None, "ohne Port kein TCP");
+}
+
+/// 7b, A2: antwortet am Sockel schon ein Dienst, nimmt ein zweiter ihn nicht
+/// weg -- `Lauscher::unix` meldet AddrInUse (main.rs beendet sich dann), und
+/// der Sockel des ersten bleibt, wie er ist.
+#[test]
+fn zweiter_dienst_nimmt_den_lebenden_sockel_nicht_weg() {
+    use std::os::unix::fs::MetadataExt;
+    let mut d = std::env::temp_dir();
+    d.push(format!("briar-sich-zweiter-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let pfad = d.join("state.json");
+    let sockel = briarkern::api::sockel_pfad(&pfad);
+    let erster = briarkern::api::lauscher_oeffnen(&pfad, &sockel, None).unwrap();
+    let vorher = std::fs::metadata(&sockel).unwrap().ino();
+    let zweiter = briarkern::api::lauscher_oeffnen(&pfad, &sockel, None);
+    let art = zweiter.as_ref().err().map(|e| e.kind());
+    let nachher = std::fs::metadata(&sockel).unwrap().ino();
+    // Der erste ist weiter erreichbar.
+    let erreichbar = UnixStream::connect(&sockel).is_ok();
+    drop(erster);
+    let _ = std::fs::remove_dir_all(&d);
+    assert_eq!(art, Some(std::io::ErrorKind::AddrInUse));
+    assert_eq!(vorher, nachher, "derselbe Sockel");
+    assert!(erreichbar);
+}
+
+/// Ein toter Sockel (Dienst beendet, Datei liegt noch) wird ersetzt.
+#[test]
+fn toter_sockel_wird_ersetzt() {
+    let mut d = std::env::temp_dir();
+    d.push(format!("briar-sich-tot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let pfad = d.join("state.json");
+    let sockel = briarkern::api::sockel_pfad(&pfad);
+    drop(briarkern::api::lauscher_oeffnen(&pfad, &sockel, None).unwrap());
+    assert!(sockel.exists(), "die Datei bleibt nach dem Ende liegen");
+    let neu = briarkern::api::lauscher_oeffnen(&pfad, &sockel, None);
+    let ok = neu.is_ok();
+    drop(neu);
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(ok);
+}
+
+/// 7b, H: hoechstens eine Zeile je Minute.
+#[test]
+fn drossel_laesst_eine_zeile_je_minute_durch() {
+    use briarkern::api::drossel_faellig;
+    let zuletzt = std::sync::atomic::AtomicU64::new(0);
+    assert!(drossel_faellig(&zuletzt, 1_000_000));
+    assert!(!drossel_faellig(&zuletzt, 1_000_001));
+    assert!(!drossel_faellig(&zuletzt, 1_059_999));
+    assert!(drossel_faellig(&zuletzt, 1_060_000));
 }

@@ -56,6 +56,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 horizontalAlignment: Text.AlignHCenter
@@ -90,6 +91,17 @@ Page {
                 }
             }
 
+            // Was eine Benachrichtigung zeigt. Aus ist die Vorgabe, wie bei
+            // Briar: sonst liegen Absender und Text bei lipstick im Speicher.
+            TextSwitch {
+                text: app.tr("notificationPreview")
+                description: app.tr("notificationPreviewHint")
+                checked: app.status.notificationPreview === true
+                automaticCheck: false
+                onClicked: Briar.request("POST", "/settings",
+                                         {notificationPreview: !checked}, app.refresh)
+            }
+
             TextSwitch {
                 text: app.tr("btSwitch")
                 checked: app.status.bluetooth === true
@@ -98,6 +110,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap

@@ -209,6 +209,7 @@ Page {
         spacing: Theme.paddingMedium
 
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap

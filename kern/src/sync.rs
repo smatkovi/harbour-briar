@@ -329,7 +329,9 @@ pub fn private_message_text(body: &[u8]) -> Option<String> {
 
 /// True if this body is an attachment rather than a private message.
 pub fn is_attachment(body: &[u8]) -> bool {
-    match crate::bdf::from_bytes(body) {
+    // Hinter der Beschreibung stehen die Daten -- from_bytes nimmt keine
+    // Bytes nach dem Wert an.
+    match crate::bdf::from_bytes_prefix(body) {
         Ok(list) => match list.as_list() {
             Some(items) => items.len() == 2 && items[0].as_int() == Some(ATTACHMENT),
             None => false,

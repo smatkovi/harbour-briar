@@ -290,13 +290,20 @@ pub fn confirmation(
 /// Wer zuerst spricht, haengt an der Rolle -- Alice schickt, Bob hoert zu.
 /// Genau so steht es in KeyAgreementProtocol.perform().
 ///
-/// Scheitert die Sitzung bei uns, erfaehrt die Gegenseite es: ein ABORT geht
-/// hinaus, bevor der Fehler zurueckkehrt (Briars KeyAgreementProtocol
-/// .perform: jeder Verfahrensfehler, eine AbortException, endet in sendAbort;
-/// bei einem Schreibfehler schweigt Briar, wir versuchen es trotzdem, das
-/// kostet nichts). Ohne ihn wartete sie bis
-/// zur Zeitgrenze auf einen Satz, der nie kommt -- eine Minute bei Briar,
-/// und die Anzeige stand die ganze Zeit auf "verbinde".
+/// Scheitert die Sitzung, geht ein ABORT hinaus, bevor der Fehler
+/// zurueckkehrt -- immer, auch wenn die Gegenseite selbst abgebrochen hat.
+/// So haelt es Briar: KeyAgreementProtocol.perform (Z. 119) faengt jede
+/// AbortException und ruft sendAbort, und KeyAgreementTransport.readRecord
+/// (Z. 112-122) wirft eine solche fuer alles, was beim Lesen schiefgeht --
+/// ein empfangenes ABORT (`AbortException(true)`), einen Satz ausser der
+/// Reihe, das Stromende, einen Lesefehler. Ohne ABORT wartete die
+/// Gegenseite bis zur Zeitgrenze auf einen Satz, der nie kommt -- eine
+/// Minute bei Briar, und die Anzeige stand die ganze Zeit auf "verbinde".
+///
+/// Nur bei einem Schreibfehler (sendKey/sendConfirm werfen IOException, die
+/// perform nicht faengt; KeyAgreementTaskImpl Z. 128 meldet dann nur
+/// KeyAgreementFailedEvent) schickt Briar KEIN ABORT. Wir versuchen es auch
+/// dann: scheitert es, ist nichts verloren, die Leitung war ohnehin tot.
 #[allow(clippy::too_many_arguments)]
 pub fn sitzung<S: std::io::Read + std::io::Write>(
     strom: &mut S,
@@ -316,8 +323,7 @@ pub fn sitzung<S: std::io::Read + std::io::Write>(
         their_commitment,
         alice,
     ) {
-        // Hat die Gegenseite abgebrochen, ist nichts mehr zu sagen.
-        Err(e) if e.kind() != std::io::ErrorKind::ConnectionAborted => {
+        Err(e) => {
             abbruch_senden(strom);
             Err(e)
         }
@@ -710,6 +716,55 @@ mod tests {
         .expect_err("ein CONFIRM vor dem KEY darf nicht durchgehen");
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(faden.join().unwrap(), ABORT, "die Gegenseite bekommt ein ABORT");
+    }
+
+    /// Bricht die Gegenseite ab, antworten wir trotzdem mit einem ABORT, wie
+    /// Briar (KeyAgreementProtocol.perform faengt auch die AbortException
+    /// aus einem empfangenen ABORT und ruft sendAbort).
+    #[test]
+    fn empfangenes_abort_wird_mit_abort_beantwortet() {
+        use std::io::Write;
+        let lauscher = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let adresse = lauscher.local_addr().unwrap();
+        let faden = std::thread::spawn(move || {
+            let (mut strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            crate::record::write_record(
+                &mut strom,
+                &crate::record::Record::new(PROTOCOL_VERSION, ABORT, Vec::new()),
+            )
+            .unwrap();
+            strom.flush().unwrap();
+            crate::record::read_record(&mut strom).unwrap().expect("ein Satz")
+        });
+        let privat = crate::crypto::generate_agreement_private_key();
+        let oeffentlich = crate::crypto::agreement_public_key(&privat);
+        let payload = encode(&Payload {
+            commitment: commitment(&oeffentlich),
+            descriptors: vec![],
+        });
+        let mut strom = std::net::TcpStream::connect(adresse).unwrap();
+        strom
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // Wir sind Bob und warten auf den KEY; es kommt ein ABORT.
+        let e = sitzung(
+            &mut strom,
+            &privat,
+            &oeffentlich,
+            &payload,
+            &payload,
+            &commitment(&oeffentlich),
+            false,
+        )
+        .expect_err("nach einem ABORT darf die Sitzung nicht gelingen");
+        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionAborted);
+        let antwort = faden.join().unwrap();
+        assert_eq!(antwort.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(antwort.record_type, ABORT, "die Gegenseite liest unser ABORT");
+        assert!(antwort.payload.is_empty(), "der Rumpf eines ABORT ist leer");
     }
 
     #[test]

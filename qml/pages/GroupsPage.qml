@@ -46,11 +46,13 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
 
                 Label {
+                    textFormat: Text.PlainText
                     text: modelData.name
                     width: parent.width
                     truncationMode: TruncationMode.Fade
                 }
                 Label {
+                    textFormat: Text.PlainText
                     width: parent.width
                     truncationMode: TruncationMode.Fade
                     color: Theme.secondaryColor
@@ -69,6 +71,7 @@ Page {
                 // als Zeile im Gespräch, wir haben dort keine Zeile. Sie
                 // verschwindet, sobald die Gruppe einmal offen war (/read).
                 Label {
+                    textFormat: Text.PlainText
                     width: parent.width
                     visible: !!modelData.event
                     truncationMode: TruncationMode.Fade
@@ -134,6 +137,8 @@ Page {
             id: dialog
             canAccept: groupNameField.text.trim().length > 0
 
+            // acceptText zeigt Silica immer als RichText (DialogHeader.qml:266-267,
+            // QTBUG-40161): hier nie fremden Text, nur eigene aus Strings.js.
             DialogHeader { id: header; acceptText: app.tr("create") }
 
             TextField {

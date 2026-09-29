@@ -49,6 +49,10 @@ Page {
         // ausser Bildern nur einen Fehler; zwischen MeeGo und Sailfish geht es.
         seite.hinweis = typ.indexOf("image/") === 0 ? "" : fenster.tr("attachOthersHint")
         Briar.sendFile(seite.kontakt, feld.text, fertig, typ, function(antwort) {
+            // Die verkleinerte Kopie hat der Dienst gelesen (oder nie mehr):
+            // weg damit. ImagePrep loescht nur im eigenen versand-Ordner.
+            if (fertig !== pfad)
+                ImagePrep.aufraeumen(fertig)
             if (antwort.error)
                 fenster.fehler = antwort.error
             feld.text = ""
@@ -136,6 +140,7 @@ Page {
             onClicked: pageStack.pop()
         }
         Label {
+            textFormat: Text.PlainText
             text: seite.name
             color: "white"
             font.pixelSize: 24
@@ -219,14 +224,21 @@ Page {
                                 id: einzelbild
                                 visible: Briar.isImage(modelData) && !!modelData.path
                                 source: visible ? "file://" + modelData.path : ""
-                                width: visible ? Math.min(sourceSize.width, liste.width * 0.62) : 0
-                                height: visible ? width * (sourceSize.height / Math.max(1, sourceSize.width)) : 0
+                                // Grenze fuer die entpackten Pixel (ein 32-KiB-PNG
+                                // kann Gigabyte ergeben). Gesetzt liest sich
+                                // sourceSize als diese Grenze zurueck, die wahre
+                                // Groesse steht in implicitWidth/implicitHeight.
+                                sourceSize.width: 1024
+                                sourceSize.height: 1024
+                                width: visible ? Math.min(implicitWidth, liste.width * 0.62) : 0
+                                height: visible ? width * (implicitHeight / Math.max(1, implicitWidth)) : 0
                                 fillMode: Image.PreserveAspectFit
                                 asynchronous: true
                             }
 
                             Text {
                                 id: einzeltext
+                                textFormat: Text.PlainText
                                 visible: !einzelbild.visible
                                 width: parent.width
                                 wrapMode: Text.Wrap
@@ -250,6 +262,7 @@ Page {
 
                     Text {
                         id: text
+                        textFormat: Text.PlainText
                         width: parent.width
                         visible: modelData.text.length > 0
                         height: visible ? paintedHeight : 0
@@ -262,6 +275,7 @@ Page {
             }
 
             Text {
+                textFormat: Text.PlainText
                 anchors {
                     top: blase.bottom
                     right: modelData.outgoing ? blase.right : undefined
@@ -277,6 +291,7 @@ Page {
 
     Label {
         id: hinweisZeile
+        textFormat: Text.PlainText
         anchors { left: parent.left; right: parent.right; bottom: eingabe.top; margins: 8 }
         visible: seite.hinweis.length > 0
         height: visible ? paintedHeight + 8 : 0

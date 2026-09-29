@@ -23,12 +23,14 @@ Page {
             spacing: 12
 
             Label {
+                textFormat: Text.PlainText
                 text: fenster.tr("help")
                 font.pixelSize: 32
                 color: "white"
             }
 
             Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 color: "#d0d0d0"

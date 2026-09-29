@@ -66,6 +66,10 @@ Page {
         page.hinweis = type.indexOf("image/") === 0 ? "" : app.tr("attachOthersHint")
         Briar.sendFile(page.contactId, field.text.trim(), prepared, type,
                        function(answer) {
+            // Die verkleinerte Kopie hat der Dienst gelesen (oder nie mehr):
+            // weg damit. ImagePrep loescht nur im eigenen versand-Ordner.
+            if (prepared !== path)
+                ImagePrep.aufraeumen(prepared)
             if (answer.error)
                 app.lastError = answer.error
             field.text = ""
@@ -87,6 +91,7 @@ Page {
                 PageHeader { title: app.tr("autoDelete") }
 
                 Label {
+                    textFormat: Text.PlainText
                     x: Theme.horizontalPageMargin
                     width: parent.width - 2 * Theme.horizontalPageMargin
                     wrapMode: Text.Wrap
@@ -105,6 +110,7 @@ Page {
                     ListItem {
                         width: parent.width
                         Label {
+                            textFormat: Text.PlainText
                             x: Theme.horizontalPageMargin
                             anchors.verticalCenter: parent.verticalCenter
                             text: app.tr(modelData.k)
@@ -138,6 +144,7 @@ Page {
                 PageHeader { title: app.tr("attachAction") }
                 ListItem {
                     Label {
+                        textFormat: Text.PlainText
                         x: Theme.horizontalPageMargin
                         anchors.verticalCenter: parent.verticalCenter
                         text: app.tr("fromGallery")
@@ -146,6 +153,7 @@ Page {
                 }
                 ListItem {
                     Label {
+                        textFormat: Text.PlainText
                         x: Theme.horizontalPageMargin
                         anchors.verticalCenter: parent.verticalCenter
                         text: app.tr("fromFiles")
@@ -153,6 +161,7 @@ Page {
                     onClicked: pageStack.replace(dateiAuswahl)
                 }
                 Label {
+                    textFormat: Text.PlainText
                     x: Theme.horizontalPageMargin
                     width: parent.width - 2 * Theme.horizontalPageMargin
                     wrapMode: Text.Wrap
@@ -230,6 +239,7 @@ Page {
             // Steht die Zuenddauer, soll man das sehen, ohne ins Menue zu
             // gehen -- sonst schreibt man ahnungslos etwas, das wieder geht.
             Label {
+                textFormat: Text.PlainText
                 visible: page.autoDelete > 0
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
@@ -351,17 +361,32 @@ Page {
                             width: parent.width
                             height: bild.visible ? bild.height : sonstiges.height
 
+                            // Die Quelle nur fuer Bilder: ein Image laedt auch
+                            // unsichtbar, und Qt waehlt den Leser am Inhalt,
+                            // nicht an der Endung -- sonst ginge jeder Anhang
+                            // ohne Antippen an jedes Bild-Plugin (Gegenpruefung
+                            // 7b, C1). sourceSize begrenzt die entpackten Pixel:
+                            // ein 32-KiB-PNG kann Gigabyte ergeben. Fest statt
+                            // an view.width gebunden, sonst wuerde bei jeder
+                            // Drehung neu entpackt. Gesetzt liest sich
+                            // sourceSize als diese Grenze zurueck; die wahre
+                            // Groesse steht in implicitWidth/implicitHeight.
                             Image {
                                 id: bild
                                 visible: Briar.isImage(modelData) && !!modelData.path
-                                source: modelData.path ? "file://" + modelData.path : ""
-                                width: Math.min(sourceSize.width, view.width * 0.6)
+                                source: visible ? "file://" + modelData.path : ""
+                                sourceSize.width: 1024
+                                sourceSize.height: 1024
+                                width: Math.min(implicitWidth, view.width * 0.6)
+                                height: implicitWidth > 0
+                                        ? width * implicitHeight / implicitWidth : 0
                                 fillMode: Image.PreserveAspectFit
                                 asynchronous: true
                             }
 
                             Label {
                                 id: sonstiges
+                                textFormat: Text.PlainText
                                 visible: !bild.visible
                                 width: parent.width
                                 wrapMode: Text.Wrap
@@ -388,6 +413,7 @@ Page {
 
                     Label {
                         id: body
+                        textFormat: Text.PlainText
                         width: parent.width
                         visible: modelData.text.length > 0
                         height: visible ? implicitHeight : 0
@@ -399,6 +425,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 anchors {
                     top: bubble.bottom
                     right: modelData.outgoing ? bubble.right : undefined
@@ -416,6 +443,7 @@ Page {
 
     Label {
         id: hinweisZeile
+        textFormat: Text.PlainText
         anchors {
             left: parent.left; right: parent.right; bottom: input.top
             leftMargin: Theme.horizontalPageMargin; rightMargin: Theme.horizontalPageMargin

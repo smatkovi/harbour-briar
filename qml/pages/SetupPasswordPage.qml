@@ -72,6 +72,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap
@@ -81,6 +82,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap
@@ -120,6 +122,7 @@ Page {
             }
             Label {
                 id: beschriftung
+                textFormat: Text.PlainText
                 anchors { top: balken.bottom; topMargin: Theme.paddingSmall }
                 font.pixelSize: Theme.fontSizeExtraSmall
                 color: Theme.secondaryColor
@@ -137,6 +140,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             x: Theme.horizontalPageMargin
             width: parent.width - 2 * Theme.horizontalPageMargin
             wrapMode: Text.Wrap

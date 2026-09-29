@@ -48,12 +48,17 @@ Page {
             fillMode: Image.PreserveAspectFit
             width: grundbreite * faktor
             height: grundhoehe * faktor
+            // Grenze fuer die entpackten Pixel, siehe ChatPage. Gesetzt liest
+            // sich sourceSize als diese Grenze zurueck, die wahre Groesse
+            // steht in implicitWidth/implicitHeight (QtQuick 1.1).
+            sourceSize.width: 2048
+            sourceSize.height: 2048
 
             property real faktor: 1
-            property real grundbreite: sourceSize.width > 0
-                    ? Math.min(sourceSize.width, rahmen.width) : rahmen.width
-            property real grundhoehe: sourceSize.width > 0
-                    ? grundbreite * sourceSize.height / sourceSize.width : rahmen.height
+            property real grundbreite: implicitWidth > 0
+                    ? Math.min(implicitWidth, rahmen.width) : rahmen.width
+            property real grundhoehe: implicitWidth > 0
+                    ? grundbreite * implicitHeight / implicitWidth : rahmen.height
 
             PinchArea {
                 anchors.fill: parent
@@ -78,6 +83,7 @@ Page {
 
         Text {
             id: textblock
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             color: "white"
@@ -94,6 +100,7 @@ Page {
         visible: !seite.istBild && !seite.istText
 
         Text {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
@@ -102,6 +109,7 @@ Page {
             text: ("" + seite.typ) + "  ·  " + Math.round((seite.groesse || 0) / 1024) + " KB"
         }
         Text {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter

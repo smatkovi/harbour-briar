@@ -21,6 +21,7 @@ Page {
         delegate: ListItem {
             contentHeight: Theme.itemSizeSmall
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 anchors.verticalCenter: parent.verticalCenter
                 text: modelData.name

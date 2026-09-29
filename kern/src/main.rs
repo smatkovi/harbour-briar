@@ -1,7 +1,10 @@
 //! briard -- the Briar daemon behind the Sailfish and Harmattan front ends.
 //!
-//!   briard [--state <file>] [--api-port <port>] [--lan-port <port>]
-//!          [--tor-port <port>]
+//!   briard [--state <file>] [--api-socket <file>] [--api-port <port>]
+//!          [--lan-port <port>] [--tor-port <port>] [--tor-control-port <port>]
+//!
+//! `--api-port` oeffnet TCP nur zusammen mit `BRIAR_API_TCP=1` (Tests);
+//! `--api-socket` ist ebenfalls ein Testschalter.
 
 use briarkern::net::{self, Node};
 use briarkern::store::Store;
@@ -10,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const DEFAULT_API_PORT: u16 = 8105;
 // Der Taktgeber holt nicht immer gleich oft nach. Kommt keine Verbindung
 // zustande, waechst der Abstand von 60 s mit Faktor 1,2 bis hoechstens 600 s;
 // nach einer geglueckten Verbindung faellt er zurueck auf 60 s, und der
@@ -29,7 +31,13 @@ const POLL_BACKOFF: f64 = 1.2;
 /// absichtlich nie geschlossen; O_CLOEXEC (Vorgabe von File) sorgt dafuer,
 /// dass ein gestartetes Tor die Sperre nicht erbt und ueber unser Ende
 /// hinaus haelt.
-fn instanzsperre(state_path: &std::path::Path) {
+///
+/// Mit `warten = false` geht ein zweiter Dienst stattdessen: so startet ihn
+/// nur noch eine Oberflaeche bis 0.41.0 (mit --api-port 8105). Die sieht den
+/// Sockel des laufenden Dienstes nicht, haelt ihn fuer tot und startet alle
+/// drei Sekunden einen neuen (refresh -> ensureRunning) -- die blieben sonst
+/// alle hier haengen, bis zum naechsten Neustart des Geraets.
+fn instanzsperre(state_path: &std::path::Path, warten: bool) {
     use std::os::unix::io::AsRawFd;
     let mut pfad = state_path.to_path_buf();
     pfad.set_file_name("briard.lock");
@@ -53,6 +61,18 @@ fn instanzsperre(state_path: &std::path::Path) {
     let fd = datei.as_raw_fd();
     // Sicher: fd gehoert der offenen Datei, die unten nie geschlossen wird.
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if !warten {
+            // Eine offene alte Oberflaeche startet alle drei Sekunden einen
+            // neuen Prozess -- jeder schriebe diese Zeile, und in ein paar
+            // Stunden waere das Protokoll mehrfach umgehaengt (7b, B2/H).
+            // Ein statischer Zaehler hilft nicht ueber Prozesse hinweg; die
+            // Zeit der letzten Meldung steht darum als Aenderungszeit an
+            // der Sperrdatei selbst.
+            if meldung_faellig(&datei) {
+                net::log("another briard holds this state -- not waiting with --api-port, exiting (logged once a minute)");
+            }
+            std::process::exit(0);
+        }
         net::log("another briard holds this state -- waiting until it goes");
         if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
             net::log("the instance lock failed -- running unlocked");
@@ -61,6 +81,28 @@ fn instanzsperre(state_path: &std::path::Path) {
         net::log("the other briard is gone -- taking over");
     }
     std::mem::forget(datei);
+}
+
+/// Ist die gedrosselte Zeile faellig? Ja, wenn die Aenderungszeit der
+/// Sperrdatei mindestens eine Minute zurueckliegt (oder sich nicht lesen
+/// laesst); dann wird sie auf jetzt gesetzt. Laesst sich die Zeit nicht
+/// setzen (Datei von root), wird eben jedes Mal gemeldet.
+fn meldung_faellig(datei: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let faellig = datei
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|alter| alter >= Duration::from_secs(60))
+        .unwrap_or(true);
+    if faellig {
+        // Sicher: ein offener Deskriptor, NULL heisst "jetzt".
+        unsafe {
+            libc::futimens(datei.as_raw_fd(), std::ptr::null());
+        }
+    }
+    faellig
 }
 
 fn default_state_path() -> PathBuf {
@@ -77,7 +119,11 @@ fn default_state_path() -> PathBuf {
 
 fn main() {
     let mut state_path = default_state_path();
-    let mut api_port = DEFAULT_API_PORT;
+    // Die Schnittstelle liegt auf einem Unix-Sockel neben der state.json;
+    // TCP auf 127.0.0.1 nur, wenn --api-port es verlangt UND BRIAR_API_TCP=1
+    // gesetzt ist (Tests; api::tcp_erlaubt sagt, warum beides).
+    let mut api_port: Option<u16> = None;
+    let mut api_socket: Option<PathBuf> = None;
     let mut lan_port = None;
     // The local port the hidden service points at. Only worth setting when
     // two daemons share one machine, as in the Tor tests.
@@ -91,7 +137,17 @@ fn main() {
                 i += 1;
             }
             "--api-port" if i + 1 < args.len() => {
-                api_port = args[i + 1].parse().unwrap_or(DEFAULT_API_PORT);
+                match args[i + 1].parse::<u16>() {
+                    Ok(port) => api_port = Some(port),
+                    Err(_) => {
+                        eprintln!("--api-port: not a port: {}", args[i + 1]);
+                        return;
+                    }
+                }
+                i += 1;
+            }
+            "--api-socket" if i + 1 < args.len() => {
+                api_socket = Some(PathBuf::from(&args[i + 1]));
                 i += 1;
             }
             "--lan-port" if i + 1 < args.len() => {
@@ -113,8 +169,16 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "briard [--state <file>] [--api-port <port>] [--lan-port <port>] \
-                     [--tor-port <port>] [--tor-control-port <port>]"
+                    "briard [--state <file>] [--api-socket <file>] [--api-port <port>] \
+                     [--lan-port <port>] [--tor-port <port>] [--tor-control-port <port>]\n\n\
+                     The interface listens on <state dir>/api.sock.\n\
+                     For tests only:\n\
+                     \x20 --api-socket <file>  the socket somewhere else (its directory is\n\
+                     \x20                      not made private -- keep it in a private one)\n\
+                     \x20 --api-port <port>    also 127.0.0.1:<port>, but only with\n\
+                     \x20                      BRIAR_API_TCP=1 in the environment; without it\n\
+                     \x20                      the port is ignored (an interface up to 0.41.0\n\
+                     \x20                      still passes --api-port 8105)."
                 );
                 return;
             }
@@ -128,7 +192,7 @@ fn main() {
 
     // Ist der Speicher verschluesselt, kann hier noch nichts geschehen: es
     // gibt weder Kontakte noch Schluessel. Statt abzubrechen lauscht der
-    // Dienst auf dem gewohnten Port und beantwortet nur "gesperrt" und
+    // Dienst auf dem gewohnten Sockel und beantwortet nur "gesperrt" und
     // "hier ist das Passwort", bis er eines bekommt. Danach faehrt der Rest
     // hoch wie immer.
     // Das Protokoll muss die Entsperrphase sehen: sie ist genau die, in der
@@ -144,9 +208,23 @@ fn main() {
     // stritten sich um Tor: der zweite haette (0.38.0, in der Gegenpruefung
     // gefunden) das Tor des ersten uebernommen und bei jedem abgelehnten
     // ADD_ONION mit in den Tod gerissen, minuetlich.
-    instanzsperre(&state_path);
+    //
+    // Das Nichtwarten haengt am blossen Schalter, nicht an BRIAR_API_TCP:
+    // es ist genau fuer die alte Oberflaeche da, die ihn setzt.
+    instanzsperre(&state_path, api_port.is_none());
+    let tcp_port =
+        briarkern::api::tcp_erlaubt(api_port, std::env::var_os("BRIAR_API_TCP").as_deref());
+    if api_port.is_some() && tcp_port.is_none() {
+        net::log("--api-port ignored without BRIAR_API_TCP=1");
+    }
+    // Entschluesselte Anhaenge aus einem frueheren Lauf wegraeumen -- und
+    // beim Beenden durch SIGTERM ebenso (ende.rs).
+    briarkern::store::anhang_kopien_leeren(&briarkern::store::anhang_laufzeit_ordner());
+    if let Err(e) = briarkern::ende::einrichten(briarkern::store::anhang_laufzeit_ordner()) {
+        net::log(&format!("no SIGTERM handling: {}", e));
+    }
 
-    // Das Geheimnis der Schnittstelle, bevor irgendjemand auf dem Port
+    // Das Geheimnis der Schnittstelle, bevor irgendjemand auf dem Sockel
     // lauscht -- auch der Wartedienst vor dem Entsperren bedient /unlock und
     // /account/delete. Ohne Geheimnis kein Start: eine Schnittstelle ohne
     // Geheimnis ist genau das, was hier abgeschafft wird (Sicherheitsbefund
@@ -164,8 +242,32 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Die Lauscher einmal oeffnen -- nach der Instanzsperre (sonst raeumte
+    // ein zweiter Dienst den Sockel des ersten weg) und nach dem Geheimnis.
+    // Der Wartedienst und danach api::run bedienen dieselben.
+    let sockel = api_socket.unwrap_or_else(|| briarkern::api::sockel_pfad(&state_path));
+    let lauscher = match briarkern::api::lauscher_oeffnen(&state_path, &sockel, tcp_port) {
+        Ok(l) => l,
+        // Am Sockel antwortet schon ein Dienst. Die Instanzsperre haelt einen
+        // zweiten sonst auf -- aber nicht, wenn sie selbst nicht zu haben war
+        // ("running unlocked"); dann nahm der zweite dem ersten frueher den
+        // Sockel weg (7b, A2). Kein Fehler: es laeuft ja einer.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            net::log("another briard answers on the API socket -- exiting");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            // Nicht ohne Schnittstelle weiterlaufen. Scheitert der TCP-Port
+            // (nur in Tests), hat ihn ein anderes Programm.
+            let grund = format!("cannot open the API: {} -- stopping", e);
+            net::log(&grund);
+            eprintln!("{}", grund);
+            std::process::exit(1);
+        }
+    };
+
     let mut store = if Store::ist_verschluesselt(&state_path) {
-        briarkern::entsperren::warten(&state_path, api_port, DEFAULT_PORT)
+        briarkern::entsperren::warten(&state_path, &lauscher, DEFAULT_PORT)
     } else {
         match Store::open(&state_path, DEFAULT_PORT) {
             Ok(s) => s,
@@ -184,7 +286,7 @@ fn main() {
     let shared = Arc::new(Mutex::new(store));
 
     let api_store = Arc::clone(&shared);
-    std::thread::spawn(move || briarkern::api::run(api_store, api_port));
+    std::thread::spawn(move || briarkern::api::run(api_store, lauscher));
 
     // Die Sperre nach Zeit -- sie schaut nach, ob lange nichts kam.
     briarkern::api::sperrwaechter(Arc::clone(&shared));
@@ -192,7 +294,7 @@ fn main() {
     // Replying straight from the notification: lipstick calls us on the
     // session bus, and we hand the text to our own interface.
     #[cfg(feature = "sfos")]
-    briarkern::notify::serve(api_port);
+    briarkern::notify::serve(sockel.clone());
 
     // Bluetooth is a second listener: Briar's own transport identifier, so
     // its keys and tags differ from the LAN ones, on a fixed RFCOMM channel.
@@ -318,15 +420,21 @@ fn main() {
                 // Adresse ist ein Grund, etwas zu tun.
                 return;
             }
-            briarkern::net::log(&format!(
-                "the network changed ({} / {}) -- syncing now",
-                if jetzt.0.is_empty() {
-                    "no address".to_string()
-                } else {
-                    jetzt.0.join(", ")
-                },
-                jetzt.1.clone().unwrap_or_else(|| "no Bluetooth".to_string())
-            ));
+            // Die Adressen selbst nur mit BRIAR_LOG_VOLL=1: WLAN-Adressen
+            // sind je Netz verschieden, und aus dem Protokoll ergaebe sich,
+            // wo das Geraet wann war (7b, D1).
+            briarkern::net::log_vertraulich(
+                &format!(
+                    "the network changed ({} / {}) -- syncing now",
+                    if jetzt.0.is_empty() {
+                        "no address".to_string()
+                    } else {
+                        jetzt.0.join(", ")
+                    },
+                    jetzt.1.clone().unwrap_or_else(|| "no Bluetooth".to_string())
+                ),
+                "the network changed -- syncing now",
+            );
             *gemerkt = jetzt;
             drop(gemerkt);
             // Das neue Netz sofort ins Adressgedaechtnis, damit die naechste

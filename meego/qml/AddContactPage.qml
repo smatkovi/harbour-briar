@@ -29,6 +29,7 @@ Page {
             spacing: 12
 
             Label {
+                textFormat: Text.PlainText
                 text: fenster.tr("addContact")
                 font.pixelSize: 32
                 color: "white"
@@ -39,6 +40,10 @@ Page {
                 width: parent.width
                 placeholderText: "briar://..."
                 height: 120
+                // Der Text kommt aus einem gescannten QR-Code, also von
+                // fremder Hand -- und TextEdit deutet unter Qt 4.7 ab Werk
+                // mit AutoText.
+                textFormat: TextEdit.PlainText
                 text: seite.vorgabeLink
             }
 
@@ -51,6 +56,7 @@ Page {
             // Die drei Adressfelder gehoeren zu den eigenen Fassungen: ein
             // Briar auf Android hat keine und findet den Weg ueber Tor selbst.
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 color: "#a0a0a0"
@@ -82,6 +88,7 @@ Page {
                 inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
             }
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 color: "#a0a0a0"
@@ -95,6 +102,7 @@ Page {
             // weder WLAN noch Bluetooth.
 
             Label {
+                textFormat: Text.PlainText
 
                 visible: !fenster.zustand.tor
 

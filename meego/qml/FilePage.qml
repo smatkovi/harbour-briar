@@ -32,11 +32,13 @@ Page {
         anchors { top: parent.top; left: parent.left; right: parent.right; margins: 16 }
 
         Label {
+            textFormat: Text.PlainText
             text: fenster.tr("pickFile")
             font.pixelSize: 32
             color: "white"
         }
         Label {
+            textFormat: Text.PlainText
             text: seite.ordner
             font.pixelSize: 18
             color: "#a0a0a0"
@@ -44,6 +46,7 @@ Page {
             elide: Text.ElideLeft
         }
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             font.pixelSize: 18
@@ -71,6 +74,7 @@ Page {
             height: 64
 
             Label {
+                textFormat: Text.PlainText
                 anchors { left: parent.left; leftMargin: 16; right: parent.right
                           rightMargin: 16; verticalCenter: parent.verticalCenter }
                 text: fileName

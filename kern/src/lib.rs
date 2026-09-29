@@ -16,6 +16,7 @@ pub mod bt;
 pub mod bqp;
 pub mod btprofile;
 pub mod crypto;
+pub mod ende;
 pub mod exchange;
 pub mod groups;
 pub mod introduction;

@@ -100,7 +100,12 @@ pub fn serve(store: Arc<Mutex<Store>>, uuid: String) {
         )
         .map(|_| ());
         match ergebnis {
-            Ok(()) => crate::net::log(&format!("SDP record published for {}", uuid)),
+            // Die UUID ist dauerhaft und per SDP fuer jeden in Funkreichweite
+            // zu sehen -- sie ordnete das Protokoll dem Geraet zu (7b, D3).
+            Ok(()) => crate::net::log_vertraulich(
+                &format!("SDP record published for {}", uuid),
+                "SDP record published",
+            ),
             Err(e) => {
                 // BlueZ 5 kennt ProfileManager1, BlueZ 4 nicht. Auf Harmattan
                 // ist das also kein Fehler, sondern der andere Weg.
@@ -183,10 +188,16 @@ pub fn bluez4_eintrag_mit(
     ) {
         Ok(antwort) => {
             let griff: u32 = antwort.body().deserialize().unwrap_or(0);
-            crate::net::log(&format!(
-                "SDP record published for {} on channel {} (BlueZ 4, handle {})",
-                uuid, kanal, griff
-            ));
+            crate::net::log_vertraulich(
+                &format!(
+                    "SDP record published for {} on channel {} (BlueZ 4, handle {})",
+                    uuid, kanal, griff
+                ),
+                &format!(
+                    "SDP record published on channel {} (BlueZ 4, handle {})",
+                    kanal, griff
+                ),
+            );
             Some(griff)
         }
         Err(e) => {
@@ -302,7 +313,11 @@ where
         .map(|_| ());
     match ergebnis {
         Ok(()) => {
-            crate::net::log(&format!("BQP: lauscht ueber Bluetooth unter {}", uuid));
+            // Die UUID gehoert zum gezeigten QR-Code.
+            crate::net::log_vertraulich(
+                &format!("BQP: lauscht ueber Bluetooth unter {}", uuid),
+                "BQP: lauscht ueber Bluetooth",
+            );
             Some(verbindung)
         }
         Err(e) => {

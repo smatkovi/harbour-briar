@@ -10,6 +10,25 @@ import "cover"
 ApplicationWindow {
     id: app
 
+    // Kein Rich Text, nirgends. Silicas Label liest sein textFormat aus dieser
+    // Eigenschaft (Label.qml:56), und die steht ab Werk auf Text.AutoText
+    // (ApplicationWindow.qml:108). Dann wird ein Nachrichtentext wie
+    // <img src="http://..."> als HTML gedeutet und das Bild am Tor vorbei
+    // nachgeladen -- IP und Lesezeitpunkt gingen an den Absender. Hier gilt es
+    // fuer ALLE Labels, auch die in PageHeader, ViewPlaceholder, MenuItem und
+    // Button, an deren textFormat wir sonst nicht herankommen. Die eigenen
+    // Labels setzen es zusaetzlich selbst (auf MeeGo die einzige Massnahme).
+    // Eigene Texte in Strings.js tragen keine Auszeichnung, es geht nichts
+    // verloren.
+    //
+    // Gesetzt wird es unten in Component.onCompleted und nur, wenn es die
+    // Eigenschaft gibt: sie ist privat (Unterstrich), und fehlt sie in einer
+    // anderen Silica-Fassung, waere eine Zuweisung hier ein Ladefehler -- die
+    // ganze App kaeme nicht hoch. Frueh genug ist das: Label.qml:56 bindet
+    // textFormat an die Eigenschaft, schon bestehende Labels ziehen also nach,
+    // und Fremdes (Namen, Nachrichten) kommt nur ueber die Bruecke, deren
+    // Antworten erst aus der Ereignisschleife eintreffen.
+
     // The daemon's last answer to /status, shared by every page.
     property var status: ({ contacts: [], pending: [], identity: null })
     property string lastError: ""
@@ -17,6 +36,14 @@ ApplicationWindow {
     // onCompleted -- die Seiten fragen den Dienst, bevor die Wurzel fertig
     // ist, und Bindungen stehen vorher.
     property bool geheimnisVerdrahtet: Briar.geheimnisQuelleSetzen(function() { return Daemon.token() })
+    // Die Bruecke zum Sockel des Dienstes (seit 0.42.0 kein TCP mehr) --
+    // ebenso als Bindung, aus demselben Grund. Die Antworten kommen als
+    // Signal und gehen unten an Briar.antwortErhalten.
+    property bool brueckeVerdrahtet: Briar.brueckeSetzen(Daemon)
+    Connections {
+        target: Daemon
+        onAntwort: Briar.antwortErhalten(nummer, code, rumpf)
+    }
     // Bumped when the language changes, so every binding that calls
     // Strings.t() is re-evaluated.
     property int languageRevision: 0
@@ -119,6 +146,9 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        // Klartext fuer alle Silica-Labels, siehe oben.
+        if (app._defaultLabelFormat !== undefined)
+            app._defaultLabelFormat = Text.PlainText
         // Nicht "gibt es den Dienst", sondern "haben wir dort etwas abgelegt".
         // Sonst stuende der Knopf "mit dem Telefon aufsperren" auch da, wo nie
         // etwas hinterlegt wurde, und loeste eine Pruefung aus, die ins Leere

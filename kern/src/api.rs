@@ -1,6 +1,8 @@
 //! The local HTTP interface the user interfaces talk to. Same shape as the
-//! WhatsApp and Fluesterwind backends: a small JSON API on 127.0.0.1, so the
-//! Silica and Qt 4 front ends can both use it unchanged.
+//! WhatsApp and Fluesterwind backends: a small JSON API, so the Silica and
+//! Qt 4 front ends can both use it unchanged. Seit 0.42.0 liegt sie auf einem
+//! Unix-Sockel neben der state.json (`api.sock`); TCP auf 127.0.0.1 gibt es
+//! nur noch fuer Tests und den Netztest (`tcp_erlaubt`).
 
 use crate::groups;
 use crate::net::{self, Node, Shared};
@@ -11,7 +13,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "sfos")]
@@ -35,10 +38,21 @@ fn close_notification(_key: &str) {}
 /// Sandkasten lesen kann, kann er weiterhin lesen -- dagegen hilft nur ein
 /// Sandkasten, den es hier nicht gibt; Webseiten und andere Konten sind
 /// draussen, und mit ihnen H0 (Konto loeschen ohne Pruefung) und M5 (das
-/// Schluesselbund-Passwort ueber 8105).
+/// Schluesselbund-Passwort an den, der zuerst lauscht). Seit dem Sockel
+/// (0700-Ordner, 0600, SO_PEERCRED) kommt ein anderes Konto gar nicht mehr
+/// heran; der Nachweis bleibt fuer den TCP-Weg der Tests.
 static GEHEIMNIS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// Der Dateiname neben der state.json.
 pub const GEHEIMNIS_DATEI: &str = "api-token";
+/// Der Unix-Sockel der Schnittstelle, ebenfalls neben der state.json.
+///
+/// Seit 0.42.0 der Vorgabeweg statt 127.0.0.1:8105. Den TCP-Port erreichte
+/// jede Webseite im Browser -- ohne Geheimnis bekam sie zwar nichts, konnte
+/// aber sehen, dass dort etwas lauscht (und auf Sailfish laeuft der Browser
+/// ausserhalb von firejail). Einen Sockel in einem 0700-Ordner erreicht keine
+/// Webseite und kein anderes Konto; SO_PEERCRED prueft es beim Annehmen
+/// noch einmal.
+pub const SOCKEL_DATEI: &str = "api.sock";
 /// Hoechstens so viel Rumpf nimmt eine Anfrage an (Sicherheitsbefund H2: ein
 /// erfundener Content-Length von 4 GB war eine Zuteilung, die auf einem
 /// 1-GB-Geraet den Dienst beendete).
@@ -178,7 +192,252 @@ pub fn host_passt(host: Option<&str>) -> bool {
     matches!(ohne_port, "127.0.0.1" | "localhost" | "[::1]")
 }
 
-fn antworten(mut socket: TcpStream, code: u16, wert: &Value) -> std::io::Result<()> {
+/// Wo der Sockel liegt, wenn niemand etwas anderes sagt: neben der
+/// state.json, wie das Geheimnis.
+pub fn sockel_pfad(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(SOCKEL_DATEI)
+}
+
+/// Eine angenommene Verbindung, gleich auf welchem Weg. `serve` und der
+/// Wartedienst lesen und schreiben nur ueber Read/Write und kennen den
+/// Unterschied nicht.
+pub enum Strom {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl Strom {
+    pub fn try_clone(&self) -> std::io::Result<Strom> {
+        Ok(match self {
+            Strom::Tcp(s) => Strom::Tcp(s.try_clone()?),
+            Strom::Unix(s) => Strom::Unix(s.try_clone()?),
+        })
+    }
+
+    /// Lesen und Schreiben begrenzt -- auf beiden Wegen gleich.
+    pub fn zeitgrenzen(&self, dauer: std::time::Duration) {
+        match self {
+            Strom::Tcp(s) => {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(dauer));
+                let _ = s.set_write_timeout(Some(dauer));
+            }
+            Strom::Unix(s) => {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(dauer));
+                let _ = s.set_write_timeout(Some(dauer));
+            }
+        }
+    }
+}
+
+impl Read for Strom {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Strom::Tcp(s) => s.read(buf),
+            Strom::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Strom {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Strom::Tcp(s) => s.write(buf),
+            Strom::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Strom::Tcp(s) => s.flush(),
+            Strom::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// Wer auf der anderen Seite des Sockels sitzt (SO_PEERCRED): die UID des
+/// verbindenden Prozesses, wie der Kern sie beim connect festgehalten hat.
+pub fn gegenueber_uid(strom: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut laenge = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Sicher: cred und laenge leben ueber den Aufruf, die Laenge stimmt.
+    let r = unsafe {
+        libc::getsockopt(
+            strom.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut laenge,
+        )
+    };
+    if r != 0 || laenge as usize != std::mem::size_of::<libc::ucred>() {
+        return None;
+    }
+    Some(cred.uid)
+}
+
+/// Ob der Dienst zusaetzlich auf TCP lauscht: nur mit `--api-port` UND der
+/// Umgebungsvariable `BRIAR_API_TCP=1`.
+///
+/// Eine Oberflaeche bis 0.41.0 startet den Dienst noch mit
+/// `--api-port 8105`. Laeuft gerade keiner (nach `%post`), kaeme so ein
+/// neuer Dienst mit offenem Port 8105 hoch und behielte ihn bis zum naechsten
+/// Neustart -- sichtbar fuer jede Webseite (Gegenpruefung 7b, A1). Ohne die
+/// Variable bleibt es beim Sockel; Tests und Netztest setzen sie.
+pub fn tcp_erlaubt(port: Option<u16>, schalter: Option<&std::ffi::OsStr>) -> Option<u16> {
+    port.filter(|_| schalter.is_some_and(|v| v == "1"))
+}
+
+/// Hoechstens eine Zeile je Minute fuer abgewiesene Verbindungen: gelingt
+/// das Abschliessen des Ordners nicht, koennte ein Zugriffsberechtigter sonst
+/// das Protokoll damit fluten (7b, H).
+static ABGEWIESEN_GEMELDET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Ist eine gedrosselte Zeile jetzt faellig? `zuletzt` haelt die Zeit der
+/// letzten, in Millisekunden; `jetzt` kommt von aussen, damit es pruefbar ist.
+pub fn drossel_faellig(zuletzt: &std::sync::atomic::AtomicU64, jetzt: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let alt = zuletzt.load(Ordering::Relaxed);
+    if alt != 0 && jetzt.saturating_sub(alt) < 60_000 {
+        return false;
+    }
+    // Nur einer von mehreren gleichzeitigen Faeden schreibt.
+    zuletzt
+        .compare_exchange(alt, jetzt.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Ein Lauscher der Schnittstelle: der Sockel immer, der TCP-Port nur mit
+/// --api-port und BRIAR_API_TCP=1 (Tests, Netztest; `tcp_erlaubt`).
+pub enum Lauscher {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+impl Lauscher {
+    /// Den Sockel anlegen: ein alter von einem beendeten Dienst wird vorher
+    /// entfernt, danach bekommt die Datei 0600. Der Ordner ist dann schon
+    /// 0700, also kommt in der kurzen Zeit dazwischen ohnehin kein Fremder
+    /// heran.
+    ///
+    /// Ob der alte Sockel wirklich tot ist, sagt die Instanzsperre nicht
+    /// immer: laesst sich die Sperrdatei nicht oeffnen oder sperren, laeuft
+    /// der Dienst "unlocked" weiter, und ein zweiter nahm dem ersten frueher
+    /// still den Sockel weg (7b, A2). Darum vorher anklopfen: antwortet
+    /// jemand, ist dort ein lebender Dienst, und die Antwort ist `AddrInUse`
+    /// -- main.rs beendet sich dann. Ein toter Sockel lehnt ab
+    /// (ECONNREFUSED) und wird ersetzt.
+    pub fn unix(pfad: &Path) -> std::io::Result<Lauscher> {
+        use std::os::unix::fs::PermissionsExt;
+        if UnixStream::connect(pfad).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another briard answers on the API socket",
+            ));
+        }
+        let _ = std::fs::remove_file(pfad);
+        let l = UnixListener::bind(pfad)?;
+        std::fs::set_permissions(pfad, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Lauscher::Unix(l))
+    }
+
+    pub fn tcp(port: u16) -> std::io::Result<Lauscher> {
+        Ok(Lauscher::Tcp(TcpListener::bind(("127.0.0.1", port))?))
+    }
+
+    pub fn set_nonblocking(&self, an: bool) -> std::io::Result<()> {
+        match self {
+            Lauscher::Unix(l) => l.set_nonblocking(an),
+            Lauscher::Tcp(l) => l.set_nonblocking(an),
+        }
+    }
+
+    /// Eine Verbindung annehmen. `Ok(None)`: sie kam von einem anderen
+    /// Benutzer und ist schon wieder zu.
+    pub fn annehmen(&self) -> std::io::Result<Option<Strom>> {
+        match self {
+            Lauscher::Tcp(l) => Ok(Some(Strom::Tcp(l.accept()?.0))),
+            Lauscher::Unix(l) => {
+                let (s, _) = l.accept()?;
+                // Sicher: getuid kann nicht scheitern.
+                let ich = unsafe { libc::getuid() };
+                match gegenueber_uid(&s) {
+                    Some(uid) if uid == ich => Ok(Some(Strom::Unix(s))),
+                    uid => {
+                        if drossel_faellig(&ABGEWIESEN_GEMELDET, now_ms()) {
+                            net::log(&format!(
+                                "API: refused a connection on the socket from uid {:?} (logged once a minute)",
+                                uid
+                            ));
+                        }
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    fn beschreibung(&self) -> String {
+        match self {
+            Lauscher::Unix(_) => format!("the socket {}", SOCKEL_DATEI),
+            Lauscher::Tcp(l) => match l.local_addr() {
+                Ok(a) => a.to_string(),
+                Err(_) => "TCP".to_string(),
+            },
+        }
+    }
+}
+
+/// Den Ordner der state.json abschliessen (0700) und die Lauscher oeffnen:
+/// den Sockel, und den TCP-Port nur, wenn einer genannt ist.
+///
+/// Einmal in main.rs, vor dem Wartedienst: der reicht sie danach an `run`
+/// weiter, so dass zwischen Entsperren und grossem Dienst niemand vor einer
+/// geschlossenen Tuer steht.
+pub fn lauscher_oeffnen(
+    state_path: &Path,
+    sockel: &Path,
+    port: Option<u16>,
+) -> std::io::Result<Vec<Lauscher>> {
+    use std::os::unix::fs::PermissionsExt;
+    let ordner = state_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(ordner)?;
+    // Nur wenn noetig, und nur einen eigenen Ordner ohne Sticky-Bit: liegt
+    // die state.json mit --state direkt in /tmp, soll /tmp nicht 0700 werden
+    // (als root ginge das). Scheitert chmod, ist das eine Protokollzeile
+    // wert, aber kein Grund, nicht zu starten -- SO_PEERCRED haelt Fremde
+    // trotzdem draussen.
+    if let Ok(m) = std::fs::metadata(ordner) {
+        use std::os::unix::fs::MetadataExt;
+        // Sicher: getuid kann nicht scheitern.
+        let eigener = m.uid() == unsafe { libc::getuid() };
+        let modus = m.permissions().mode();
+        if eigener && modus & 0o1000 == 0 && modus & 0o777 != 0o700 {
+            if let Err(e) = std::fs::set_permissions(ordner, std::fs::Permissions::from_mode(0o700)) {
+                net::log(&format!("cannot make the state directory private: {}", e));
+            }
+        }
+    }
+    let mut lauscher = vec![Lauscher::unix(sockel)?];
+    if let Some(port) = port {
+        lauscher.push(Lauscher::tcp(port)?);
+    }
+    Ok(lauscher)
+}
+
+fn antworten(mut socket: Strom, code: u16, wert: &Value) -> std::io::Result<()> {
     let text = serde_json::to_string(wert).unwrap_or_else(|_| "{}".to_string());
     let grund = match code {
         200 => "OK",
@@ -201,43 +460,45 @@ fn antworten(mut socket: TcpStream, code: u16, wert: &Value) -> std::io::Result<
     socket.flush()
 }
 
-pub fn run(store: Shared, port: u16) {
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(l) => l,
-        Err(e) => {
-            // Nicht ohne Schnittstelle weiterlaufen: dann redete die
-            // Oberflaeche mit dem, der den Port hat, und wir wuessten es
-            // nicht. Ein zweiter eigener Dienst kommt gar nicht bis hierher
-            // (Instanzsperre); wer den Port hat, ist ein Fremder.
-            net::log(&format!(
-                "cannot bind the API to port {}: {} -- stopping",
-                port, e
-            ));
-            std::process::exit(1);
-        }
-    };
-    net::log(&format!("API on 127.0.0.1:{}", port));
-    for socket in listener.incoming() {
-        match socket {
-            Ok(socket) => {
-                let store = Arc::clone(&store);
-                std::thread::spawn(move || {
-                    if let Err(e) = serve(store, socket) {
-                        net::log(&format!("API request failed: {}", e));
-                    }
-                });
+/// Die Schnittstelle bedienen, auf allen Lauschern, je einer im eigenen
+/// Faden. Kehrt nicht zurueck.
+pub fn run(store: Shared, lauscher: Vec<Lauscher>) {
+    let mut faeden = Vec::new();
+    for l in lauscher {
+        // Kam er vom Wartedienst, steht er noch auf nicht blockierend.
+        let _ = l.set_nonblocking(false);
+        net::log(&format!("API on {}", l.beschreibung()));
+        let store = Arc::clone(&store);
+        faeden.push(std::thread::spawn(move || loop {
+            match l.annehmen() {
+                Ok(Some(socket)) => {
+                    let store = Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        if let Err(e) = serve(store, socket) {
+                            net::log(&format!("API request failed: {}", e));
+                        }
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    net::log(&format!("API accept failed: {}", e));
+                    // Nicht im Kreis drehen, wenn etwas dauerhaft klemmt
+                    // (keine Deskriptoren mehr frei).
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
-            Err(e) => net::log(&format!("API accept failed: {}", e)),
-        }
+        }));
+    }
+    for f in faeden {
+        let _ = f.join();
     }
 }
 
-fn serve(store: Shared, socket: TcpStream) -> std::io::Result<()> {
+fn serve(store: Shared, socket: Strom) -> std::io::Result<()> {
     // Alles zusammen begrenzt, Kopf wie Rumpf: mehr liest der Dienst nicht.
     // Und nicht ewig: eine Gegenseite, die troepfelt, bindet sonst einen
     // Faden je Verbindung, beliebig viele.
-    let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let _ = socket.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+    socket.zeitgrenzen(std::time::Duration::from_secs(30));
     let mut reader = BufReader::new(socket.try_clone()?).take(MAX_KOPF + MAX_RUMPF as u64);
     let mut request_line = String::new();
     // Die Anfragezeile hoechstens 8 KiB, gelesen mit genau dieser Grenze --
@@ -399,9 +660,21 @@ pub fn sperrwaechter(store: Shared) {
         let zuletzt = LETZTE_REGUNG.load(std::sync::atomic::Ordering::Relaxed);
         if zuletzt > 0 && now_ms().saturating_sub(zuletzt) > frist * 60_000 {
             marke_verwerfen();
-            sperren();
+            sperren_und_leeren(&store);
         }
     });
+}
+
+/// Zusperren und die entschluesselten Kopien wegraeumen, unter EINEM Halten
+/// des Speicherschlosses. Eine /conversation, die schon an der Sperrschranke
+/// vorbei ist und auf das Schloss wartet, kommt erst danach dran -- und dann
+/// gibt `anhang_pfad` nichts mehr her, weil die Sperre steht. Vorher lagen
+/// Sperren und Leeren in zwei Zuegen, und eine Kopie konnte dazwischen
+/// entstehen und die Sperre ueberleben (7b, C3).
+fn sperren_und_leeren(store: &Shared) {
+    let locked = store.lock().unwrap_or_else(|e| e.into_inner());
+    sperren();
+    locked.anhang_kopien_leeren();
 }
 
 /// Alles loeschen, was zu diesem Konto gehoert, und den Dienst beenden.
@@ -410,19 +683,38 @@ pub fn sperrwaechter(store: Shared) {
 /// Passwort, ohne Kontakte. Das ist auch der Weg heraus, wenn jemand sein
 /// Passwort vergessen hat: dort gibt es sonst keinen.
 pub fn konto_loeschen(pfad: &std::path::Path) {
-    let ordner = pfad.parent().map(|p| p.to_path_buf());
-    let _ = std::fs::remove_file(pfad);
-    if let Some(ordner) = pfad.parent() {
-        let _ = std::fs::remove_file(ordner.join(GEHEIMNIS_DATEI));
-    }
-    if let Some(ordner) = ordner {
-        let _ = std::fs::remove_dir_all(ordner.join("attachments"));
-        let _ = std::fs::remove_dir_all(ordner.join("tor"));
-    }
-    crate::net::log("das Konto wurde geloescht -- der Dienst beendet sich");
+    // Die letzte Zeile vor dem Aufraeumen, und dann die Datei loslassen:
+    // danach schreibt nur noch die Standardausgabe, sonst legte die naechste
+    // Zeile eines anderen Fadens das gerade geloeschte Protokoll neu an.
+    crate::net::log("das Konto wird geloescht -- der Dienst beendet sich");
+    crate::net::log_datei_loesen();
+    konto_aufraeumen(pfad);
+    // Entsiegelte Kopien im Laufzeitordner gehoeren ebenfalls zum Konto.
+    // Nicht in konto_aufraeumen: dessen Test liefe sonst gegen den echten
+    // Laufzeitordner des Benutzers.
+    crate::store::anhang_kopien_leeren(&crate::store::anhang_laufzeit_ordner());
     // Nicht bloss den Speicher leeren: die Schluessel liegen auch im
     // Arbeitsspeicher, und der Tor-Dienst laeuft noch. Ein Ende raeumt beides.
     std::process::exit(0);
+}
+
+/// Die Dateien des Kontos entfernen: Zustand, Geheimnis und Sockel der
+/// Schnittstelle, Anhaenge, Tor-Verzeichnis und das Protokoll samt umgehaengter Fassung --
+/// auch das Protokoll nennt Kontakte (Nummern, Zeiten), und nach dem
+/// Loeschen soll nichts mehr verraten, dass es ein Konto gab.
+pub fn konto_aufraeumen(pfad: &std::path::Path) {
+    let _ = std::fs::remove_file(pfad);
+    // Ein halb geschriebener Zustand (Store::save schreibt erst dorthin).
+    let _ = std::fs::remove_file(pfad.with_extension("tmp"));
+    let (log, log_alt) = crate::net::log_pfade(pfad);
+    let _ = std::fs::remove_file(log);
+    let _ = std::fs::remove_file(log_alt);
+    if let Some(ordner) = pfad.parent() {
+        let _ = std::fs::remove_file(ordner.join(GEHEIMNIS_DATEI));
+        let _ = std::fs::remove_file(ordner.join(SOCKEL_DATEI));
+        let _ = std::fs::remove_dir_all(ordner.join("attachments"));
+        let _ = std::fs::remove_dir_all(ordner.join("tor"));
+    }
 }
 
 fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) -> Value {
@@ -449,7 +741,9 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 // Aufruf von /unlock ohne Passwort wuerde sie oeffnen.
                 return json!({"error": "set a password first"});
             }
-            sperren();
+            // Die entschluesselten Kopien der Anhaenge gehen mit: hinter der
+            // Sperre soll nichts lesbar herumliegen.
+            sperren_und_leeren(&store);
             let marke = to_hex(&crate::util::random(16));
             *MARKE.lock().unwrap() = Some(marke.clone());
             json!({"ok": true, "locked": true, "token": marke})
@@ -968,10 +1262,15 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         // unveraendert weiterlaeuft.
                         let anhaenge: Vec<Value> = m.anhaenge.iter().map(|kopf| {
                             let datei = locked.attachment(&kopf.id);
+                            // Ist der Anhang da, gilt sein gespeicherter Typ:
+                            // der im Kopf der Nachricht ist der gemeldete,
+                            // ungepruefte (Befund M7). Der Pfad ist bei
+                            // versiegelter Ablage die Kopie im Laufzeitordner.
                             json!({
                                 "id": kopf.id,
-                                "type": kopf.content_type,
-                                "path": datei.map(|a| a.path.clone()),
+                                "type": datei.map(|a| Some(a.content_type.clone()))
+                                    .unwrap_or_else(|| kopf.content_type.clone()),
+                                "path": datei.and(locked.anhang_pfad(&kopf.id)),
                                 "size": datei.map(|a| a.size),
                             })
                         }).collect();
@@ -982,8 +1281,11 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                             "outgoing": m.outgoing,
                             "acked": m.acked,
                             "attachment": m.attachment,
-                            "attachmentType": m.attachment_type,
-                            "attachmentPath": attachment.map(|a| a.path.clone()),
+                            "attachmentType": attachment
+                                .map(|a| Some(a.content_type.clone()))
+                                .unwrap_or_else(|| m.attachment_type.clone()),
+                            "attachmentPath": m.attachment.as_ref()
+                                .and_then(|id| locked.anhang_pfad(id)),
                             "attachmentSize": attachment.map(|a| a.size),
                             "attachments": anhaenge,
                             // Verschwindende Nachricht: die Dauer und, wenn
@@ -1167,6 +1469,20 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             status(&store)
         }
 
+        // Einstellungen ohne eigenen Weg. Bisher nur die Vorschau in den
+        // Benachrichtigungen; was fehlt, bleibt, wie es ist.
+        ("POST", "/settings") => {
+            let mut locked = store.lock().unwrap();
+            if let Some(vorschau) = body.get("notificationPreview") {
+                match vorschau.as_bool() {
+                    Some(v) => locked.state.notification_preview = v,
+                    None => return json!({"error": "notificationPreview must be true or false"}),
+                }
+            }
+            let _ = locked.save();
+            json!({"ok": true})
+        }
+
         ("POST", "/bluetooth") => {
             let on = body["enabled"].as_bool().unwrap_or(true);
             let mut locked = store.lock().unwrap();
@@ -1227,6 +1543,8 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 aufgeloest: false,
                 letztes_ereignis: None,
                 contacts: Vec::new(),
+                wartend: Vec::new(),
+                verworfen: Vec::new(),
             };
             // The creator's own join message starts its chain.
             let timestamp = now_ms();
@@ -1962,6 +2280,7 @@ fn status(store: &Shared) -> Value {
         "port": locked.state.listen_port,
         "bluetooth": locked.state.bluetooth,
         "language": locked.state.language.clone().unwrap_or_else(|| "en".to_string()),
+        "notificationPreview": locked.state.notification_preview,
         "bluetoothAddress": crate::bt::local_address(),
         // Our own address on this network, so the QR code can carry it.
         "unread": locked
@@ -2096,7 +2415,16 @@ fn bridge_messages(store: &Shared, query: &str) -> Value {
                 "text": m.text,
                 "fromMe": m.outgoing,
                 "timestamp": m.timestamp,
-                "mediaType": m.attachment_type.clone().unwrap_or_default(),
+                // Der gespeicherte, am Inhalt gepruefte Typ -- nicht der aus
+                // dem Nachrichtenkopf, den die Gegenseite gemeldet hat (7b,
+                // C7). Nur wenn der Anhang (noch) fehlt, der gemeldete.
+                "mediaType": m
+                    .attachment
+                    .as_deref()
+                    .and_then(|a| locked.attachment(a))
+                    .map(|a| a.content_type.clone())
+                    .or_else(|| m.attachment_type.clone())
+                    .unwrap_or_default(),
                 "fileName": "",
             })
         })
@@ -2210,6 +2538,8 @@ mod gruppenablehnung_tests {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: vec![1],
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         });
         Arc::new(Mutex::new(store))
     }
@@ -2341,6 +2671,8 @@ mod gruppenversand_tests {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: vec![1, 2],
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         });
         let shared: Shared = Arc::new(Mutex::new(store));
         let antwort = handle(
@@ -2614,6 +2946,8 @@ mod zeigen_tests {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: vec![1, 2],
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         });
         Arc::new(Mutex::new(store))
     }
@@ -2675,5 +3009,116 @@ mod zeigen_tests {
             "das JOIN muss in der Ausgangspost liegen"
         );
         assert_eq!(net::zeigbarkeit(&locked, GRUPPE, 2), Err("schon gezeigt"));
+    }
+}
+
+#[cfg(test)]
+mod einstellungs_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn speicher(wer: &str) -> (Shared, std::path::PathBuf) {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-einstellungen-{}-{}.json", wer, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        (Arc::new(Mutex::new(store)), p)
+    }
+
+    #[test]
+    fn status_zeigt_vorschau_zuerst_aus() {
+        let (store, p) = speicher("aus");
+        let antwort = handle(Arc::clone(&store), "GET", "/status", "", &Value::Null);
+        assert_eq!(antwort["notificationPreview"], json!(false));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn settings_schaltet_vorschau_ein_und_status_zeigt_es() {
+        let (store, p) = speicher("ein");
+        let antwort = handle(
+            Arc::clone(&store),
+            "POST",
+            "/settings",
+            "",
+            &json!({"notificationPreview": true}),
+        );
+        assert_eq!(antwort, json!({"ok": true}));
+        let status = handle(Arc::clone(&store), "GET", "/status", "", &Value::Null);
+        assert_eq!(status["notificationPreview"], json!(true));
+        // Und es steht auch in der Datei, nicht nur im Speicher.
+        assert!(Store::open(&p, 7327).unwrap().state.notification_preview);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn settings_schaltet_vorschau_wieder_aus() {
+        let (store, p) = speicher("wieder");
+        store.lock().unwrap().state.notification_preview = true;
+        let antwort = handle(
+            Arc::clone(&store),
+            "POST",
+            "/settings",
+            "",
+            &json!({"notificationPreview": false}),
+        );
+        assert_eq!(antwort, json!({"ok": true}));
+        assert!(!store.lock().unwrap().state.notification_preview);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Kein Wahrheitswert, keine Aenderung -- "false" als Zeichenkette waere
+    /// sonst wahr oder falsch, je nachdem, wie man es liest.
+    #[test]
+    fn settings_verwirft_keinen_wahrheitswert() {
+        let (store, p) = speicher("falsch");
+        store.lock().unwrap().state.notification_preview = true;
+        let antwort = handle(
+            Arc::clone(&store),
+            "POST",
+            "/settings",
+            "",
+            &json!({"notificationPreview": "false"}),
+        );
+        assert!(antwort.get("error").is_some(), "{}", antwort);
+        assert!(store.lock().unwrap().state.notification_preview);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Das Aufraeumen beim Kontoloeschen, ohne den Dienst zu beenden: in einem
+    /// Wegwerfordner mit allem, was dort liegt.
+    #[test]
+    fn konto_aufraeumen_entfernt_alle_dateien_des_kontos() {
+        let mut ordner = std::env::temp_dir();
+        ordner.push(format!("briar-aufraeumen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(ordner.join("attachments")).unwrap();
+        std::fs::create_dir_all(ordner.join("tor")).unwrap();
+        let zustand = ordner.join("state.json");
+        for datei in [
+            zustand.clone(),
+            zustand.with_extension("tmp"),
+            ordner.join(GEHEIMNIS_DATEI),
+            ordner.join(SOCKEL_DATEI),
+            ordner.join("briard.log"),
+            ordner.join("briard.log.1"),
+            ordner.join("attachments").join("a1"),
+            ordner.join("tor").join("torrc"),
+        ] {
+            std::fs::write(&datei, b"x").unwrap();
+        }
+        // Was nicht zum Konto gehoert, bleibt.
+        std::fs::write(ordner.join("fremd.txt"), b"x").unwrap();
+
+        konto_aufraeumen(&zustand);
+
+        let uebrig: Vec<String> = std::fs::read_dir(&ordner)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(uebrig, vec!["fremd.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&ordner);
     }
 }

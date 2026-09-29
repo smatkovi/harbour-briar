@@ -99,6 +99,7 @@ Page {
                 width: Math.min(view.width * 0.82, Theme.itemSizeHuge * 4)
 
                 Label {
+                    textFormat: Text.PlainText
                     width: parent.width
                     horizontalAlignment: mine ? Text.AlignRight : Text.AlignLeft
                     text: modelData.author
@@ -117,6 +118,7 @@ Page {
 
                     Label {
                         id: text
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         width: parent.width - 2 * Theme.paddingMedium
                         text: modelData.text
@@ -126,6 +128,7 @@ Page {
                 }
 
                 Label {
+                    textFormat: Text.PlainText
                     width: parent.width
                     horizontalAlignment: mine ? Text.AlignRight : Text.AlignLeft
                     text: Strings.shortTime(modelData.timestamp)

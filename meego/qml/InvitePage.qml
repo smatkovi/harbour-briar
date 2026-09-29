@@ -21,11 +21,13 @@ Page {
         anchors { top: parent.top; left: parent.left; right: parent.right; margins: 16 }
 
         Label {
+            textFormat: Text.PlainText
             text: fenster.tr("inviteWho")
             font.pixelSize: 32
             color: "white"
         }
         Label {
+            textFormat: Text.PlainText
             text: seite.name
             font.pixelSize: 22
             color: "#a0a0a0"
@@ -44,6 +46,7 @@ Page {
             height: 72
 
             Label {
+                textFormat: Text.PlainText
                 anchors { left: parent.left; leftMargin: 16; verticalCenter: parent.verticalCenter }
                 text: modelData.name
                 font.pixelSize: 26

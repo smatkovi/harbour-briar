@@ -3,7 +3,8 @@
 //! Ist der Speicher verschluesselt, kann der Dienst beim Hochfahren nichts
 //! tun: er kennt weder Kontakte noch Schluessel. Statt abzubrechen -- was
 //! bedeutete, dass die App nach jedem Neustart von Hand gestartet werden
-//! muesste -- lauscht er auf dem gewohnten Port und beantwortet genau zwei
+//! muesste -- lauscht er auf dem gewohnten Sockel (und, mit --api-port und
+//! BRIAR_API_TCP=1, auf dem TCP-Port) und beantwortet genau zwei
 //! Dinge: "ich bin gesperrt" und "hier ist das Passwort". Erst danach faehrt
 //! der Rest hoch.
 //!
@@ -11,21 +12,18 @@
 //! grossen: der grosse braucht einen Store, den es hier noch nicht gibt.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
+use crate::api::{Lauscher, Strom};
 use crate::store::Store;
 
 /// Lauscht, bis jemand ein gueltiges Passwort schickt, und gibt den damit
 /// geoeffneten Speicher zurueck. Kehrt nur mit Erfolg zurueck.
-pub fn warten(pfad: &Path, api_port: u16, default_port: u16) -> Store {
-    let lauscher = match TcpListener::bind(("127.0.0.1", api_port)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Entsperren: Port {} nicht zu haben: {}", api_port, e);
-            std::process::exit(1);
-        }
-    };
+///
+/// Die Lauscher gehoeren weiter dem Aufrufer: main.rs reicht sie danach an
+/// api::run. Frueher fiel der Lauscher hier weg und der grosse Dienst band
+/// den Port neu -- wer genau dazwischen fragte, stand vor verschlossener Tuer.
+pub fn warten(pfad: &Path, lauscher: &[Lauscher], lan_port: u16) -> Store {
     crate::net::log("der Speicher ist verschluesselt -- warte auf das Passwort");
 
     // Je Verbindung ein eigener Faden. Frueher lief alles nacheinander im
@@ -36,35 +34,49 @@ pub fn warten(pfad: &Path, api_port: u16, default_port: u16) -> Store {
     // nie eine Antwort. Im Protokoll stand danach "API request failed: Broken
     // pipe", und in der Oberflaeche stand fuer immer "wird geprueft".
     let (sender, empfaenger) = std::sync::mpsc::channel::<Store>();
-    let _ = lauscher.set_nonblocking(true);
+    // Mehrere Lauscher in einem Faden: nicht blockierend, reihum.
+    for l in lauscher {
+        let _ = l.set_nonblocking(true);
+    }
     loop {
-        // Hat ein Faden das Passwort angenommen, sind wir fertig -- und der
-        // Lauscher faellt mit dieser Funktion weg, damit der grosse Dienst
-        // den Port bekommt.
+        // Hat ein Faden das Passwort angenommen, sind wir fertig -- die
+        // Lauscher wieder blockierend, fuer api::run.
         if let Ok(store) = empfaenger.try_recv() {
+            for l in lauscher {
+                let _ = l.set_nonblocking(false);
+            }
             crate::net::log("entsperrt");
             return store;
         }
-        match lauscher.accept() {
-            Ok((strom, _)) => {
-                let _ = strom.set_nonblocking(false);
-                let sender = sender.clone();
-                let pfad = pfad.to_path_buf();
-                std::thread::spawn(move || {
-                    if let Some(store) = bedienen(strom, &pfad, default_port) {
-                        let _ = sender.send(store);
-                    }
-                });
+        let mut etwas = false;
+        for l in lauscher {
+            match l.annehmen() {
+                Ok(Some(strom)) => {
+                    etwas = true;
+                    let sender = sender.clone();
+                    let pfad = pfad.to_path_buf();
+                    std::thread::spawn(move || {
+                        if let Some(store) = bedienen(strom, &pfad, lan_port) {
+                            let _ = sender.send(store);
+                        }
+                    });
+                }
+                // Ein Fremder am Sockel: schon abgewiesen und protokolliert.
+                Ok(None) => etwas = true,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {}
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => continue,
+        }
+        if !etwas {
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 }
 
-fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Store> {
+fn bedienen(mut strom: Strom, pfad: &Path, lan_port: u16) -> Option<Store> {
+    // Wie api::serve: nicht ewig. Eine Gegenseite, die nie etwas schickt,
+    // haelt sonst einen Faden fest, solange der Dienst lebt.
+    strom.zeitgrenzen(std::time::Duration::from_secs(30));
     // Begrenzt wie die grosse Schnittstelle (Sicherheitsbefund H2).
     let mut leser = BufReader::new(strom.try_clone().ok()?).take(64 * 1024 + 4096);
     let mut zeile = String::new();
@@ -101,7 +113,7 @@ fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Stor
         }
         let passwort = passwort_aus(&String::from_utf8_lossy(&rumpf));
         match passwort {
-            Some(pw) => match Store::open_mit_passwort(pfad, default_port, &pw) {
+            Some(pw) => match Store::open_mit_passwort(pfad, lan_port, &pw) {
                 Ok(s) => (200, "{\"ok\":true}".to_string(), Some(s)),
                 // Nach aussen absichtlich ohne Unterscheidung, ob das
                 // Passwort falsch oder die Datei kaputt ist. Ins Protokoll
@@ -109,6 +121,10 @@ fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Stor
                 // ein Lesefehler fuer den Benutzer aus wie ein vergessenes
                 // Passwort -- und der naechste Schritt waere gewesen, das
                 // Konto zu loeschen. Genau das ist einmal passiert.
+                //
+                // Der Grund darf keine Werte aus dem entschluesselten Zustand
+                // zitieren -- Store::open kuerzt den Lesefehler dafuer auf
+                // "state does not parse" samt Zeile und Spalte (7b, D4).
                 Err(e) => {
                     crate::net::log(&format!("Entsperren gescheitert: {}", e));
                     (
@@ -198,9 +214,13 @@ mod nebenlaeufig_tests {
     /// Verbindung nennt eine Rumpflaenge und schickt den Rumpf nie.
     #[test]
     fn eine_haengende_verbindung_haelt_die_naechste_nicht_auf() {
-        let mut pfad = std::env::temp_dir();
-        pfad.push("briar-entsperren-nebenlaeufig.json");
-        let _ = std::fs::remove_file(&pfad);
+        // Ein eigener Ordner: lauscher_oeffnen schliesst den Ordner der
+        // state.json ab, und das soll nicht das gemeinsame temp_dir sein.
+        let mut ordner = std::env::temp_dir();
+        ordner.push(format!("briar-entsperren-nebenlaeufig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let pfad = ordner.join("state.json");
         {
             let mut store = Store::open(&pfad, 7399).unwrap();
             store.create_identity("ich").unwrap();
@@ -214,8 +234,11 @@ mod nebenlaeufig_tests {
         };
         crate::api::geheimnis_anlegen(&pfad).unwrap();
         let geheimnis = crate::api::geheimnis().to_string();
+        let lauscher =
+            crate::api::lauscher_oeffnen(&pfad, &crate::api::sockel_pfad(&pfad), Some(port))
+                .unwrap();
         let pfad2 = pfad.clone();
-        let dienst = std::thread::spawn(move || warten(&pfad2, port, 7399));
+        let dienst = std::thread::spawn(move || warten(&pfad2, &lauscher, 7399));
 
         // Warten, bis der Dienst lauscht.
         let mut haenger = None;
@@ -324,6 +347,80 @@ mod nebenlaeufig_tests {
         assert!(ok.contains("\"ok\":true"), "entsperren scheiterte: {:?}", ok);
         let store = dienst.join().expect("der Wartedienst kam nicht zurueck");
         assert!(store.identity().is_some());
-        let _ = std::fs::remove_file(&pfad);
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// Eine Anfrage von Hand auf den Sockel, Antwort bis zum Ende.
+    fn ueber_sockel(sockel: &Path, text: &str) -> String {
+        let mut s = std::os::unix::net::UnixStream::connect(sockel).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        s.write_all(text.as_bytes()).unwrap();
+        let mut antwort = String::new();
+        let _ = s.read_to_string(&mut antwort);
+        antwort
+    }
+
+    /// Der Wartedienst vor dem Entsperren spricht auf dem Sockel dieselbe
+    /// Sprache wie auf dem Port: ohne Geheimnis 401 mit Nachweis, mit
+    /// Geheimnis die Fassung, und das Passwort sperrt auf. Danach steht der
+    /// Sockel noch -- die Lauscher gehen an api::run weiter, statt neu
+    /// gebunden zu werden.
+    #[test]
+    fn der_wartedienst_antwortet_ueber_den_sockel() {
+        let mut ordner = std::env::temp_dir();
+        ordner.push(format!("briar-entsperren-sockel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let pfad = ordner.join("state.json");
+        {
+            let mut store = Store::open(&pfad, 7399).unwrap();
+            store.create_identity("ich").unwrap();
+            store.passwort_setzen(None, "Probewort123").unwrap();
+        }
+        crate::api::geheimnis_anlegen(&pfad).unwrap();
+        let geheimnis = crate::api::geheimnis().to_string();
+        let sockel = crate::api::sockel_pfad(&pfad);
+        let lauscher = crate::api::lauscher_oeffnen(&pfad, &sockel, None).unwrap();
+        assert_eq!(lauscher.len(), 1, "ohne --api-port kein TCP");
+        let pfad2 = pfad.clone();
+        let dienst = std::thread::spawn(move || {
+            let store = warten(&pfad2, &lauscher, 7399);
+            (store, lauscher)
+        });
+
+        let ohne = ueber_sockel(&sockel, "GET /status HTTP/1.0\r\n\r\n");
+        assert!(ohne.starts_with("HTTP/1.1 401"), "{:?}", ohne);
+        assert!(
+            ohne.contains(&format!("\"nachweis\":\"{}\"", crate::api::nachweis())),
+            "{:?}",
+            ohne
+        );
+        assert!(!ohne.contains("\"version\""), "{:?}", ohne);
+
+        let mit = ueber_sockel(
+            &sockel,
+            &format!("GET /status HTTP/1.0\r\nAuthorization: Bearer {}\r\n\r\n", geheimnis),
+        );
+        assert!(mit.starts_with("HTTP/1.1 200") && mit.contains("\"version\":\""), "{:?}", mit);
+
+        let rumpf = "{\"password\":\"Probewort123\"}";
+        let ok = ueber_sockel(
+            &sockel,
+            &format!(
+                "POST /unlock HTTP/1.0\r\nX-Briar-Geheimnis: {}\r\nContent-Length: {}\r\n\r\n{}",
+                geheimnis,
+                rumpf.len(),
+                rumpf
+            ),
+        );
+        assert!(ok.contains("\"ok\":true"), "entsperren scheiterte: {:?}", ok);
+        let (store, lauscher) = dienst.join().expect("der Wartedienst kam nicht zurueck");
+        assert!(store.identity().is_some());
+        // Der Sockel ist noch gebunden: ein connect gelingt, auch wenn
+        // gerade niemand annimmt.
+        assert!(std::os::unix::net::UnixStream::connect(&sockel).is_ok());
+        drop(lauscher);
+        let _ = std::fs::remove_dir_all(&ordner);
     }
 }

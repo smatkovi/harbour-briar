@@ -55,6 +55,7 @@ Page {
             spacing: 16
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 font.pixelSize: 26
                 font.bold: true
@@ -62,6 +63,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 font.pixelSize: 18
@@ -70,6 +72,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 font.pixelSize: 18
@@ -107,6 +110,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 horizontalAlignment: Text.AlignHCenter

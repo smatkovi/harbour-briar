@@ -30,6 +30,7 @@ Page {
                 description: page.groupName
             }
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
@@ -43,6 +44,7 @@ Page {
         delegate: ListItem {
             contentHeight: Theme.itemSizeSmall
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 anchors.verticalCenter: parent.verticalCenter
                 text: modelData.name

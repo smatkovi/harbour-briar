@@ -170,31 +170,127 @@ pub(crate) fn anforderungen_fortschreiben(
 /// Problem nicht: ContactExchangeManager entfernt den Wartenden beim ersten
 /// Erfolg, der zweite Versuch scheitert an NoSuchPendingContactException --
 /// bei uns lief der zweite aber schon, bevor der erste fertig war.
-static HANDSCHLAEGE: Mutex<std::collections::BTreeSet<String>> =
-    Mutex::new(std::collections::BTreeSet::new());
+static HANDSCHLAEGE: Mutex<BTreeMap<String, Laufend>> = Mutex::new(BTreeMap::new());
 
-/// Der Platz eines laufenden Handschlags; wird beim Fallenlassen frei.
-struct Handschlagmarke(String);
+/// Laufende Kennung der Handschlagversuche; macht jede Marke unterscheidbar,
+/// auch wenn sie denselben Wartenden meint.
+static HANDSCHLAG_NUMMER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Ein laufender Handschlag, wie ihn die Wache sieht.
+struct Laufend {
+    eingehend: bool,
+    nummer: u64,
+    abgeloest: Arc<std::sync::atomic::AtomicBool>,
+    /// Der Versuch hat den Kontaktaustausch begonnen und laesst sich nicht
+    /// mehr abloesen (siehe `Handschlagmarke::festlegen`).
+    fest: bool,
+}
+
+/// Der Platz eines laufenden Handschlags; wird beim Fallenlassen frei --
+/// aber nur, wenn er noch uns gehoert und nicht schon einem Nachfolger.
+struct Handschlagmarke {
+    schwebend: String,
+    nummer: u64,
+    abgeloest: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Handschlagmarke {
+    /// Hat ein Versuch in Gegenrichtung diesen Platz uebernommen?
+    fn abgeloest(&self) -> bool {
+        self.abgeloest.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Den Versuch unabloesbar machen, bevor der Kontaktaustausch beginnt --
+    /// oder aufgeben, wenn er schon abgeloest ist.
+    ///
+    /// Die Abloesung wirkt auf jeder Seite fuer sich. Hat eine Seite ihren
+    /// Kontakt schon gespeichert und die andere gibt dieselbe Verbindung erst
+    /// danach auf, steht der Kontakt nur einseitig da: der Wartende ist bei
+    /// der ersten weg, der Nachfolger findet keine erkennbare Marke mehr, und
+    /// beide Seiten kommen nie zusammen. Darum ist der Beginn des Austauschs
+    /// die Grenze: eine Seite speichert nur, was die andere geschickt hat, und
+    /// die schickt ihren Teil erst nach dieser Stelle. Wer hier abgeloest ist,
+    /// hat nichts geschickt, also speichert auch die Gegenseite nichts aus
+    /// dieser Verbindung; wer hier fest ist, wird nicht mehr abgeloest.
+    fn festlegen(&self) -> std::io::Result<()> {
+        let mut laufend = HANDSCHLAEGE.lock().unwrap_or_else(|e| e.into_inner());
+        if self.abgeloest() {
+            return Err(bad("superseded by the peer's handshake"));
+        }
+        if let Some(l) = laufend.get_mut(&self.schwebend) {
+            if l.nummer == self.nummer {
+                l.fest = true;
+            }
+        }
+        Ok(())
+    }
+}
 
 impl Drop for Handschlagmarke {
     fn drop(&mut self) {
-        HANDSCHLAEGE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+        let mut laufend = HANDSCHLAEGE.lock().unwrap_or_else(|e| e.into_inner());
+        if laufend.get(&self.schwebend).map(|l| l.nummer) == Some(self.nummer) {
+            laufend.remove(&self.schwebend);
+        }
     }
 }
 
 /// Einen Handschlag mit diesem Wartenden beginnen -- oder ablehnen, wenn
-/// schon einer laeuft. Treffen beide Seiten gleichzeitig aufeinander,
-/// scheitern in dieser Runde beide Versuche; der Taktgeber probiert es in der
-/// naechsten wieder.
-fn handschlag_beginnen(schwebend: &str) -> std::io::Result<Handschlagmarke> {
+/// schon einer laeuft.
+///
+/// Waehlen beide Seiten gleichzeitig, haelt jede ihren ausgehenden Versuch,
+/// wenn der eingehende des anderen ankommt. Wuerde jede den zweiten einfach
+/// ablehnen, scheiterten beide, und der Treffpunkt probierte es erst eine
+/// Minute spaeter wieder -- mit derselben Aussicht. Darum entscheidet die
+/// Rolle, die beide Seiten gleich kennen: die Verbindung Alice -> Bob gewinnt.
+/// Bei Alice hat der ausgehende Versuch Vorrang, bei Bob der eingehende; so
+/// behalten beide Seiten dieselbe Verbindung und damit denselben
+/// Hauptschluessel. Zwei Versuche in derselben Richtung bleiben abgelehnt,
+/// ebenso die Uebernahme eines Versuchs, der schon fest ist.
+fn handschlag_beginnen(
+    schwebend: &str,
+    eingehend: bool,
+    alice: bool,
+) -> std::io::Result<Handschlagmarke> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let mut laufend = HANDSCHLAEGE.lock().unwrap_or_else(|e| e.into_inner());
-    if !laufend.insert(schwebend.to_string()) {
-        return Err(bad("a handshake with this contact is already running"));
+    if let Some(alt) = laufend.get(schwebend) {
+        if alt.eingehend == eingehend {
+            return Err(bad("a handshake with this contact is already running"));
+        }
+        // Gegenrichtung: gewinnen darf nur die Richtung Alice -> Bob, also bei
+        // Bob der eingehende, bei Alice der ausgehende Versuch.
+        let gewinnt = eingehend != alice;
+        let richtung = |e: bool| if e { "incoming" } else { "outgoing" };
+        if !gewinnt || alt.fest {
+            log(&format!(
+                "handshake collision: keeping the {} attempt",
+                richtung(alt.eingehend)
+            ));
+            return Err(bad("a handshake with this contact is already running"));
+        }
+        alt.abgeloest.store(true, Ordering::SeqCst);
+        log(&format!(
+            "handshake collision: keeping the {} attempt",
+            richtung(eingehend)
+        ));
     }
-    Ok(Handschlagmarke(schwebend.to_string()))
+    let nummer = HANDSCHLAG_NUMMER.fetch_add(1, Ordering::SeqCst);
+    let abgeloest = Arc::new(AtomicBool::new(false));
+    laufend.insert(
+        schwebend.to_string(),
+        Laufend {
+            eingehend,
+            nummer,
+            abgeloest: Arc::clone(&abgeloest),
+            fest: false,
+        },
+    );
+    Ok(Handschlagmarke {
+        schwebend: schwebend.to_string(),
+        nummer,
+        abgeloest,
+    })
 }
 
 /// Die WLAN-Beschreiber fuer den eigenen Code, in der Reihenfolge, in der sie
@@ -258,6 +354,173 @@ fn mitglied_eintragen(store: &mut Store, group_hex: &str, contact_id: u32) {
     }
 }
 
+/// Ist der Kontakt fuer diese Gruppe draussen -- gegangen, Sitzung
+/// abgebrochen? Dann nehmen wir von ihm dort nichts mehr an.
+///
+/// Eine aufgeloeste Gruppe zaehlt hier NICHT mit: Briar setzt bei der
+/// Aufloesung nur die Sitzung des Erstellers auf INVISIBLE
+/// (InviteeProtocolEngine.onRemoteLeaveWhenSubscribed, Z. 309-315); Beitraege
+/// anderer Mitglieder werden weiter zugestellt. Die Sitzung des Erstellers
+/// steht bei uns nach seinem LEAVE ohnehin auf Gegangen
+/// (receive_einladung_leave).
+fn abgemeldet(g: &crate::store::PrivateGroup, contact_id: u32) -> bool {
+    use crate::store::Sitzungszustand;
+    matches!(
+        g.einladungen.get(&contact_id).map(|s| s.zustand),
+        Some(Sitzungszustand::Gegangen) | Some(Sitzungszustand::Fehler)
+    )
+}
+
+/// Was aus einem empfangenen Gruppenbeitrag geworden ist -- und damit, ob er
+/// quittiert wird.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Gruppeneingang {
+    /// Gespeichert, angezeigt, weitergereicht.
+    Angenommen,
+    /// Auf der Warteliste; quittiert wie bei Briar, das ihn als PENDING
+    /// behaelt.
+    Wartend,
+    /// Nicht (neu) gespeichert: ungueltig, doppelt, von einem Gegangenen.
+    /// Quittiert -- ein erneutes Senden aendert daran nichts.
+    Verworfen,
+    /// Die Warteliste hat fuer ihn keinen Platz. NICHT quittiert: Briar
+    /// schickt ihn dann spaeter wieder (getUnackedMessagesToSend, solange
+    /// seen = FALSE), und bis dahin ist vielleicht Platz.
+    Zurueckgestellt,
+}
+
+/// Was aus einer empfangenen Nachricht gleich welcher Art geworden ist.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Eingang {
+    /// Etwas Neues fuer den Benutzer; quittieren.
+    Neu,
+    /// Nichts Neues (doppelt, ungueltig, Haushalt); quittieren.
+    Bekannt,
+    /// Nicht quittieren (siehe Gruppeneingang::Zurueckgestellt).
+    Zurueckgestellt,
+}
+
+/// Was einem wartenden Beitrag fehlt -- fuer eine Protokollzeile, die stimmt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fehlt {
+    Vorige,
+    Elternbeitrag,
+}
+
+/// Der Ersteller aus dem, was wir von der Gruppe wissen. Die Autorenkennung
+/// folgt aus Name und Schluessel (`Author::id`), `creator_author_id` braucht es
+/// dafuer nicht.
+fn gruppen_ersteller(g: &crate::store::PrivateGroup) -> Option<Author> {
+    Some(Author {
+        name: g.creator_name.clone(),
+        public_key: from_hex(&g.creator_public)?,
+    })
+}
+
+/// Was mit einem gueltig unterschriebenen Gruppenbeitrag geschieht.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kettenlage {
+    Annehmen,
+    /// Etwas, worauf er aufbaut, fehlt noch.
+    Warten(Fehlt),
+    /// Er baut auf etwas auf, das es gibt, aber nicht passt, oder auf etwas
+    /// Verworfenes: fuer immer ungueltig.
+    Verwerfen,
+}
+
+fn kettenlage(g: &crate::store::PrivateGroup, parsed: &GroupMessage, timestamp: u64) -> Kettenlage {
+    match parsed {
+        // validateJoin gibt keine Abhaengigkeiten zurueck: ein JOIN geht immer.
+        GroupMessage::Join { .. } => Kettenlage::Annehmen,
+        GroupMessage::Post {
+            member,
+            parent,
+            previous,
+            ..
+        } => postlage(
+            g,
+            &to_hex(&member.id()),
+            timestamp,
+            parent.as_ref().map(|p| to_hex(p)).as_deref(),
+            &to_hex(previous),
+        ),
+    }
+}
+
+/// Die Kette eines POST, wie Briar sie prueft: Elternbeitrag und vorige
+/// Nachricht sind Abhaengigkeiten (GroupMessageValidator.validatePost, Zeile
+/// 175-179), und beim Zustellen verlangt PrivateGroupManagerImpl.
+/// handleGroupMessage (Zeile 567-597), dass der Beitrag echt nach beiden
+/// liegt, die vorige Nachricht vom selben Autor stammt und der Elternbeitrag
+/// ein POST ist. Ist eine Abhaengigkeit verworfen, ist er es auch
+/// (ValidationManagerImpl.invalidateMessage).
+///
+/// Bis 0.42.0 stand hier noch "der Autor hat hier ein JOIN, sonst warten".
+/// Briar kennt das nicht: bei sauberer Kette folgt das JOIN aus previous, und
+/// bei Altbestand ohne JOIN wartete jeder neue Beitrag des Autors fuer immer
+/// (7a, G3.1).
+fn postlage(
+    g: &crate::store::PrivateGroup,
+    member_id: &str,
+    timestamp: u64,
+    parent: Option<&str>,
+    previous: &str,
+) -> Kettenlage {
+    let verworfen = |id: &str| g.verworfen.iter().any(|v| v == id);
+    if verworfen(previous) || parent.is_some_and(verworfen) {
+        return Kettenlage::Verwerfen;
+    }
+    let finden = |id: &str| g.messages.iter().find(|m| m.id == id);
+    let vorige = match finden(previous) {
+        Some(m) => m,
+        None => return Kettenlage::Warten(Fehlt::Vorige),
+    };
+    if vorige.author_id != member_id || timestamp <= vorige.timestamp {
+        return Kettenlage::Verwerfen;
+    }
+    if let Some(parent) = parent {
+        match finden(parent) {
+            None => return Kettenlage::Warten(Fehlt::Elternbeitrag),
+            Some(m) if m.join || timestamp <= m.timestamp => return Kettenlage::Verwerfen,
+            Some(_) => {}
+        }
+    }
+    Kettenlage::Annehmen
+}
+
+/// Verwerfen samt Kaskade -- vorher die Verweise alter Wartender
+/// nachtragen, sonst fielen sie mit leerem `previous` nicht mit.
+fn verwerfen_samt_wartenden(g: &mut crate::store::PrivateGroup, id: &str) -> usize {
+    verweise_nachtragen(g);
+    g.verwerfen_mit_abhaengigen(id)
+}
+
+/// Wartende aus 0.42.0 tragen ihre Verweise noch nicht: einmal aus dem Rumpf
+/// nachtragen. Wer sich nicht lesen laesst (nur bei einer veraenderten Datei
+/// moeglich), faellt mit einer Protokollzeile.
+fn verweise_nachtragen(g: &mut crate::store::PrivateGroup) {
+    if g.wartend.iter().all(|w| !w.previous.is_empty()) {
+        return;
+    }
+    g.wartend.retain_mut(|w| {
+        if !w.previous.is_empty() {
+            return true;
+        }
+        match from_hex(&w.body).and_then(|b| groups::post_verweise(&b)) {
+            Some((autor, parent, previous)) => {
+                w.author_id = to_hex(&autor);
+                w.parent = parent.map(|p| to_hex(&p));
+                w.previous = to_hex(&previous);
+                true
+            }
+            None => {
+                log("a waiting group post from an older state could not be read and was dropped");
+                false
+            }
+        }
+    });
+}
+
 pub type Shared = Arc<Mutex<Store>>;
 
 /// Wohin das Protokoll ausser auf die Standardausgabe noch geht.
@@ -274,11 +537,50 @@ static LOGDATEI: std::sync::Mutex<Option<std::path::PathBuf>> =
 /// Wurzelverzeichnis, gross genug fuer einen ganzen Abend.
 const LOG_MAX: u64 = 256 * 1024;
 
-/// Sagt dem Protokoll, wohin es schreiben soll. Einmal beim Hochfahren.
-pub fn log_datei_setzen(neben: &std::path::Path) {
+/// Die Protokolldatei neben dem Zustand und ihre umgehaengte Vorgaengerin.
+/// An einer Stelle, damit das Kontoloeschen dieselben Namen findet.
+pub fn log_pfade(neben: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let mut pfad = neben.to_path_buf();
     pfad.set_file_name("briard.log");
-    *LOGDATEI.lock().unwrap() = Some(pfad);
+    let mut alt = pfad.clone();
+    alt.set_extension("log.1");
+    (pfad, alt)
+}
+
+/// Sagt dem Protokoll, wohin es schreiben soll. Einmal beim Hochfahren.
+pub fn log_datei_setzen(neben: &std::path::Path) {
+    *LOGDATEI.lock().unwrap() = Some(log_pfade(neben).0);
+}
+
+/// Ab jetzt nur noch auf die Standardausgabe. Beim Kontoloeschen: sonst legt
+/// die naechste Zeile eines anderen Fadens die gerade entfernte Datei neu an.
+pub fn log_datei_loesen() {
+    *LOGDATEI.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Ob das Protokoll Kennungen nennen darf: nur mit `BRIAR_LOG_VOLL=1`.
+pub(crate) fn log_voll() -> bool {
+    std::env::var_os("BRIAR_LOG_VOLL").is_some_and(|v| v == "1")
+}
+
+/// Welche der beiden Fassungen einer Zeile ins Protokoll geht.
+fn vertrauliche_zeile<'a>(voll: &'a str, knapp: &'a str, erlaubt: bool) -> &'a str {
+    if erlaubt {
+        voll
+    } else {
+        knapp
+    }
+}
+
+/// Eine Zeile, die jemanden kennzeichnet -- eine Onion, eine Bluetooth- oder
+/// IP-Adresse, einen Namen. Das Protokoll liegt unverschluesselt neben dem
+/// (verschluesselten) Zustand und ueberlebt die Sperre; wer es liest, soll
+/// daraus nicht erfahren, mit wem man spricht. Briar selbst schreibt solche
+/// Angaben nur gekuerzt oder gar nicht ins Log (scrubOnion, scrubMacAddress,
+/// scrubInetAddress in bramble-api/.../util/PrivacyUtils.java:20-63). Die volle Fassung
+/// gibt es nur, wenn `BRIAR_LOG_VOLL=1` gesetzt ist -- zur Fehlersuche.
+pub fn log_vertraulich(voll: &str, knapp: &str) {
+    log(vertrauliche_zeile(voll, knapp, log_voll()));
 }
 
 pub fn log(message: &str) {
@@ -292,8 +594,7 @@ pub fn log(message: &str) {
     // Umhaengen statt anwachsen lassen: eine Datei, die niemand begrenzt,
     // fuellt am N9 irgendwann die Wurzel.
     if std::fs::metadata(&pfad).map(|m| m.len()).unwrap_or(0) > LOG_MAX {
-        let mut alt = pfad.clone();
-        alt.set_extension("log.1");
+        let alt = log_pfade(&pfad).1;
         let _ = std::fs::rename(&pfad, &alt);
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -385,7 +686,10 @@ impl Write for Conn {
 
 enum Recognised {
     Pending {
-        index: usize,
+        /// Der Handschlagschluessel des Wartenden -- nicht sein Platz in der
+        /// Liste: die kann sich verschieben, waehrend ein anderer Handschlag
+        /// fertig wird (7a, B2).
+        public_key: String,
         header_key: SecretKey,
         stream_number: u64,
         /// Der Abschnitt, zu dem die erkannte Marke gehoert -- nicht
@@ -398,6 +702,7 @@ enum Recognised {
         id: u32,
         header_key: SecretKey,
         stream_number: u64,
+        /// Nur fuer das Vermerken in `marke_erkennen`.
         period: u64,
     },
 }
@@ -433,7 +738,7 @@ fn pending_keys(store: &Store, their_public_hex: &str) -> Option<(SecretKey, boo
 fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recognised> {
     let period = current_time_period();
     let periods = [period.saturating_sub(1), period, period + 1];
-    for (index, pending) in store.state.pending.iter().enumerate() {
+    for pending in &store.state.pending {
         let (root, alice) = match pending_keys(store, &pending.public_key) {
             Some(v) => v,
             None => continue,
@@ -453,7 +758,7 @@ fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recogn
             for stream_number in first..first + WINDOW {
                 if encode_tag(&keys.tag_key, PROTOCOL_VERSION, stream_number) == tag[..] {
                     return Some(Recognised::Pending {
-                        index,
+                        public_key: pending.public_key.clone(),
                         header_key: keys.header_key,
                         stream_number,
                         period: p,
@@ -465,9 +770,9 @@ fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recogn
     }
     for contact in &store.state.contacts {
         let root = contact.master_key_bytes();
-        let base = contact
+        let (base, gesehen) = contact
             .transport(transport_id)
-            .map(|t| t.in_stream.clone())
+            .map(|t| (t.in_stream.clone(), t.in_gesehen.clone()))
             .unwrap_or_default();
         for p in periods {
             let keys = derive_rotation_keys(
@@ -478,7 +783,16 @@ fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recogn
                 !contact.alice,
             );
             let first = *base.get(&p.to_string()).unwrap_or(&0);
-            for stream_number in first..first + WINDOW {
+            let seen = *gesehen.get(&p.to_string()).unwrap_or(&0);
+            for offset in 0..WINDOW {
+                // Schon gesehene Nummern sind aus dem Vorrat genommen, wie
+                // bei Briar (TransportKeyManagerImpl.markTagAsRecognised
+                // streicht die Marke aus inContexts). Eine Wiederholung
+                // desselben Stroms faellt damit als unbekannte Marke durch.
+                if seen >> offset & 1 == 1 {
+                    continue;
+                }
+                let stream_number = first + offset;
                 if encode_tag(&keys.tag_key, PROTOCOL_VERSION, stream_number) == tag[..] {
                     return Some(Recognised::Contact {
                         id: contact.id,
@@ -491,6 +805,70 @@ fn recognise_tag(store: &Store, transport_id: &str, tag: &[u8]) -> Option<Recogn
         }
     }
     None
+}
+
+/// Marke erkennen und -- bei einem Kontakt -- sofort als gesehen vermerken.
+///
+/// Beides muss unter DERSELBEN Sperre geschehen, die der Aufrufer haelt:
+/// erkennen, loslassen, wieder sperren, vermerken hiesse, dass zwei
+/// gleichzeitig ankommende Kopien desselben Stroms beide durch die Erkennung
+/// kommen. Briar tut es ebenso in einem Zug unter seinem Schloss
+/// (TransportKeyManagerImpl.getStreamContext: streamContextFromTag, dann
+/// markTagAsRecognised). Vermerkt wird bei jeder Erkennung, nicht erst am
+/// Rundenende: sonst schoebe ein spaeter endender Strom 7 den Fusspunkt
+/// unter einen schon beendeten Strom 8 zurueck, und 8 waere wieder
+/// einspielbar.
+///
+/// Wartende laufen hier unveraendert durch; ihr Fenster zieht
+/// `fenster_vermerken` nach (siehe `fenster_nachziehen`, warum anders).
+fn marke_erkennen(store: &mut Store, transport_id: &str, tag: &[u8]) -> Option<Recognised> {
+    let erkannt = recognise_tag(store, transport_id, tag)?;
+    erkennung_vermerken(store, transport_id, erkannt)
+}
+
+/// Die zweite Haelfte von `marke_erkennen`: eine erkannte Kontaktmarke im
+/// Fenster vermerken. Eigene Funktion, damit sich der Fall "laesst sich nicht
+/// vermerken" pruefen laesst -- ueber eine echte Marke kommt er nicht vor.
+fn erkennung_vermerken(
+    store: &mut Store,
+    transport_id: &str,
+    erkannt: Recognised,
+) -> Option<Recognised> {
+    if let Recognised::Contact {
+        id,
+        stream_number,
+        period,
+        ..
+    } = erkannt
+    {
+        let vermerkt = match store.contact_mut(id) {
+            Some(contact) => fenster_setzen(
+                contact.transport_mut(transport_id),
+                period,
+                stream_number,
+                current_time_period(),
+            ),
+            None => false,
+        };
+        // Laesst sich die Nummer nicht vermerken, darf die Marke auch nicht
+        // als erkannt gelten -- sonst liefe ein Strom durch, dessen Nummer
+        // nicht verbraucht ist, und er waere wieder einspielbar (7a, B1).
+        // Vorkommen sollte es nicht: die Erkennung sucht nur Ungesehenes im
+        // Fenster.
+        if !vermerkt {
+            log("a recognised tag could not be marked as seen -- treated as unrecognised");
+            return None;
+        }
+        // Ein missglueckter Schreibversuch bricht die Runde nicht ab; im
+        // Speicher ist die Nummer verbraucht, und das Rundenende schreibt
+        // ohnehin noch einmal. Stuerzt der Dienst vorher ab, ist die Nummer
+        // nach dem Neustart allerdings wieder frei -- darum wenigstens eine
+        // Zeile.
+        if let Err(e) = store.save() {
+            log(&format!("the stream number could not be saved: {}", e));
+        }
+    }
+    Some(erkannt)
 }
 
 /// Briars eigene Pruefung (`LanTcpPlugin.isAcceptableAddress`): brauchbar ist
@@ -704,10 +1082,50 @@ fn local_properties(
     props
 }
 
+/// Was eine Meldung zeigen darf: ob Absender und Text hinein duerfen, und in
+/// welcher Sprache der Ersatztext steht.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Meldungsart {
+    vorschau: bool,
+    deutsch: bool,
+}
+
+impl Meldungsart {
+    fn aus(store: &Store) -> Meldungsart {
+        Meldungsart {
+            vorschau: store.state.notification_preview,
+            deutsch: store.state.language.as_deref() == Some("de"),
+        }
+    }
+}
+
+/// Ueberschrift und Text der Meldung. Ohne Vorschau weder Name noch Text:
+/// lipstick legt beides im Benachrichtigungsspeicher ab, und Briar auf
+/// Android sagt ebenfalls nur, dass etwas kam (briar-android
+/// AndroidNotificationManagerImpl.java:326-337, updateContactNotification: Titel
+/// ist der App-Name, Text "N neue Nachrichten", kein Absender, kein Inhalt).
+fn meldungstext(art: Meldungsart, gruppe: bool, summary: String, body: String) -> (String, String) {
+    if art.vorschau {
+        return (summary, body);
+    }
+    let text = match (gruppe, art.deutsch) {
+        (false, true) => "Neue Nachricht",
+        (false, false) => "New message",
+        (true, true) => "Neuer Gruppenbeitrag",
+        (true, false) => "New group post",
+    };
+    ("Briar".to_string(), text.to_string())
+}
+
 /// Raises a notification for an incoming message -- on Sailfish; everywhere
 /// else this does nothing, and the interface shows the message as before.
+fn notify_chat(key: String, summary: String, body: String, group: bool, art: Meldungsart) {
+    let (summary, body) = meldungstext(art, group, summary, body);
+    melden(key, summary, body, group, art);
+}
+
 #[cfg(feature = "sfos")]
-fn notify_chat(key: String, summary: String, body: String, group: bool) {
+fn melden(key: String, summary: String, body: String, group: bool, art: Meldungsart) {
     // Zugesperrt heisst zugesperrt: dann steht in der Meldung, DASS etwas kam,
     // aber nicht was und von wem -- und die Antwortzeile in der Meldung faellt
     // weg, sonst schriebe man an der Sperre vorbei. Briar auf Android haelt es
@@ -715,15 +1133,19 @@ fn notify_chat(key: String, summary: String, body: String, group: bool) {
     let gesperrt = crate::api::ist_gesperrt();
     std::thread::spawn(move || {
         if gesperrt {
-            crate::notify::message("briar-gesperrt", "Briar", "Neue Nachricht", "", group, "");
+            let knapp = Meldungsart { vorschau: false, ..art };
+            let (summary, body) = meldungstext(knapp, false, String::new(), String::new());
+            crate::notify::message("briar-gesperrt", &summary, &body, "", group, "");
         } else {
-            crate::notify::message(&key, &summary, &body, &key, group, "Antworten");
+            // Die Antwortzeile bleibt auch ohne Vorschau: sie zeigt nichts an.
+            let antworten = if art.deutsch { "Antworten" } else { "Reply" };
+            crate::notify::message(&key, &summary, &body, &key, group, antworten);
         }
     });
 }
 
 #[cfg(not(feature = "sfos"))]
-fn notify_chat(_key: String, _summary: String, _body: String, _group: bool) {}
+fn melden(_key: String, _summary: String, _body: String, _group: bool, _art: Meldungsart) {}
 
 /// A short stand-in for the whole address set, to notice when it changes.
 fn properties_fingerprint(
@@ -1159,10 +1581,13 @@ impl Node {
                                 // Mit Adresse: ohne sie laesst sich nicht
                                 // nachsehen, ob beide Seiten dieselben beiden
                                 // Treffpunkte meinen.
-                                log(&format!(
-                                    "rendezvous: own meeting point published ({}.onion)",
-                                    dienst.onion
-                                ));
+                                log_vertraulich(
+                                    &format!(
+                                        "rendezvous: own meeting point published ({}.onion)",
+                                        dienst.onion
+                                    ),
+                                    "rendezvous: own meeting point published",
+                                );
                                 // Die Kennung kommt von Tor, nicht aus unserer
                                 // eigenen Rechnung: nur sie darf spaeter in
                                 // DEL_ONION stehen.
@@ -1188,8 +1613,14 @@ impl Node {
                     };
                     if let Some(index) = index {
                         match self.connect_pending_at(index, TOR_TRANSPORT_ID, &ziel) {
-                            Ok(()) => log(&format!("rendezvous: met at {}", ziel)),
-                            Err(e) => log(&format!("rendezvous: not yet at {} ({})", ziel, e)),
+                            Ok(()) => log_vertraulich(
+                                &format!("rendezvous: met at {}", ziel),
+                                "rendezvous: met",
+                            ),
+                            Err(e) => log_vertraulich(
+                                &format!("rendezvous: not yet at {} ({})", ziel, e),
+                                &format!("rendezvous: not yet ({})", e),
+                            ),
                         }
                     }
                 }
@@ -1244,7 +1675,10 @@ impl Node {
             store.state.tor_onion = Some(service.onion.clone());
             let _ = store.save();
         }
-        log(&format!("hidden service {}.onion", service.onion));
+        log_vertraulich(
+            &format!("hidden service {}.onion", service.onion),
+            "hidden service ready",
+        );
         let listener = match TcpListener::bind(("127.0.0.1", tor_port)) {
             Ok(l) => l,
             Err(e) => {
@@ -1321,11 +1755,14 @@ impl Node {
                 }
             };
             complained = false;
-            log(&format!(
-                "listening on Bluetooth channel {} ({})",
-                bt::CHANNEL,
-                bt::local_address().unwrap_or_else(|| "no adapter address".to_string())
-            ));
+            log_vertraulich(
+                &format!(
+                    "listening on Bluetooth channel {} ({})",
+                    bt::CHANNEL,
+                    bt::local_address().unwrap_or_else(|| "no adapter address".to_string())
+                ),
+                &format!("listening on Bluetooth channel {}", bt::CHANNEL),
+            );
             // A failing accept means the adapter went away; after a few of
             // them the socket is dropped and bound again, which is what
             // brings Bluetooth back after it was switched off and on.
@@ -1334,7 +1771,10 @@ impl Node {
                 match listener.accept() {
                     Ok((socket, address)) => {
                         failures = 0;
-                        log(&format!("Bluetooth connection from {}", address));
+                        log_vertraulich(
+                            &format!("Bluetooth connection from {}", address),
+                            "Bluetooth connection accepted",
+                        );
                         // Die MAC der Gegenseite wandert mit: wir melden sie ihr
                         // als `u:address` zurueck, weil ein Android ab 8.0 seine
                         // eigene nicht lesen darf.
@@ -1444,30 +1884,26 @@ impl Node {
         let mut tag = [0u8; TAG_LEN];
         reader.read_exact(&mut tag)?;
         let recognised = {
-            let store = self.store.lock().unwrap();
-            recognise_tag(&store, transport_id, &tag)
+            let mut store = self.store.lock().unwrap();
+            marke_erkennen(&mut store, transport_id, &tag)
         };
         match recognised {
             Some(Recognised::Pending {
-                index,
+                public_key: schwebend,
                 header_key,
                 stream_number,
                 period: gesehen_in,
                 alice,
             }) => {
                 log(&format!("incoming handshake connection ({})", transport_id));
-                let (root, schwebend) = {
+                let root = {
                     let store = self.store.lock().unwrap();
-                    let pending = store
-                        .state
-                        .pending
-                        .get(index)
-                        .ok_or_else(|| bad("pending contact vanished"))?;
-                    let schwebend = pending.public_key.clone();
-                    let root = pending_keys(&store, &schwebend)
+                    if !store.state.pending.iter().any(|p| p.public_key == schwebend) {
+                        return Err(bad("pending contact vanished"));
+                    }
+                    pending_keys(&store, &schwebend)
                         .ok_or_else(|| bad("no identity yet"))?
-                        .0;
-                    (root, schwebend)
+                        .0
                 };
                 // Die erkannte Nummer sagt, wie weit die Gegenseite gezaehlt
                 // hat. Das Fenster zieht nach, damit ihr naechster Versuch im
@@ -1481,7 +1917,7 @@ impl Node {
                 );
                 let period = current_time_period();
                 let keys = derive_handshake_keys(transport_id, &root, period, alice);
-                let _marke = handschlag_beginnen(&schwebend)?;
+                let marke = handschlag_beginnen(&schwebend, true, alice)?;
                 let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
                 let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
                 // Unseren Stromkopf hinaus, bevor wir zu lesen anfangen.
@@ -1498,11 +1934,12 @@ impl Node {
                 let neu = self.finish_handshake(
                     conn,
                     transport_id,
-                    index,
+                    &schwebend,
                     writer,
                     Some((header_key, stream_number)),
                     alice,
                     peer_ip.clone(),
+                    &marke,
                 )?;
                 if let Some(id) = neu {
                     self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip, false);
@@ -1513,7 +1950,7 @@ impl Node {
                 id,
                 header_key,
                 stream_number,
-                period,
+                ..
             }) => {
                 log(&format!(
                     "incoming sync connection from contact {} ({})",
@@ -1523,7 +1960,7 @@ impl Node {
                     conn,
                     transport_id,
                     id,
-                    Some((header_key, stream_number, period)),
+                    Some((header_key, stream_number)),
                     peer_ip,
                     false,
                 )
@@ -1569,7 +2006,7 @@ impl Node {
         // zu zwei Tage lang angewaehlt und meist ist niemand dran -- sonst
         // waere das Fenster der Gegenseite binnen einer halben Stunde
         // ueberholt.
-        let _marke = handschlag_beginnen(&schwebend)?;
+        let marke = handschlag_beginnen(&schwebend, false, alice)?;
         let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
         let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
@@ -1577,11 +2014,12 @@ impl Node {
         let neu = self.finish_handshake(
             conn,
             transport_id,
-            index,
+            &schwebend,
             writer,
             None,
             alice,
             peer_ip.clone(),
+            &marke,
         )?;
         if let Some(id) = neu {
             // In einem eigenen Faden: connect_pending laeuft im Taktgeber,
@@ -1627,7 +2065,7 @@ impl Node {
         };
         // Auch hier erst nach dem Waehlen: ein fehlgeschlagener Anwahlversuch
         // hat keine Marke gesendet.
-        let _marke = handschlag_beginnen(&schwebend)?;
+        let marke = handschlag_beginnen(&schwebend, false, alice)?;
         let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
         let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
@@ -1635,11 +2073,12 @@ impl Node {
         let neu = self.finish_handshake(
             conn,
             transport_id,
-            index,
+            &schwebend,
             writer,
             None,
             alice,
             peer_ip.clone(),
+            &marke,
         )?;
         if let Some(id) = neu {
             // In einem eigenen Faden: connect_pending laeuft im Taktgeber,
@@ -1662,18 +2101,20 @@ impl Node {
         &self,
         conn: Conn,
         transport_id: &str,
-        index: usize,
+        schwebend: &str,
         mut writer: StreamWriter<Conn>,
         incoming: Option<(SecretKey, u64)>,
         alice: bool,
         peer_ip: Option<String>,
+        marke: &Handschlagmarke,
     ) -> std::io::Result<Option<u32>> {
         let (their_public_hex, alias, pending_bluetooth) = {
             let store = self.store.lock().unwrap();
             let pending = store
                 .state
                 .pending
-                .get(index)
+                .iter()
+                .find(|p| p.public_key == schwebend)
                 .ok_or_else(|| bad("pending contact vanished"))?;
             (
                 pending.public_key.clone(),
@@ -1743,6 +2184,9 @@ impl Node {
         // fuellen (Gegenpruefung 6, B4).
         let _ = std::io::copy(&mut (&mut reader).take(64 * 1024), &mut std::io::sink());
         log("handshake succeeded");
+        // Ab hier nicht mehr abloesbar -- oder aufgeben, bevor wir der
+        // Gegenseite etwas geben, woraus sie einen Kontakt machen koennte.
+        marke.festlegen()?;
 
         // Contact exchange, on the same connection but with its own streams
         let master_key = result.master_key;
@@ -1817,6 +2261,12 @@ impl Node {
         let author_id_hex = to_hex(&author_id);
         {
             let mut store = self.store.lock().unwrap();
+            // Unter dem Speicherschloss, direkt vor dem Schreiben: ein
+            // abgeloester Versuch schreibt nichts (nach `festlegen` kann das
+            // nicht mehr eintreten, die Frage kostet aber nichts).
+            if marke.abgeloest() {
+                return Err(bad("superseded by the peer's handshake"));
+            }
             let known = store
                 .state
                 .contacts
@@ -1852,16 +2302,21 @@ impl Node {
                     .pending
                     .retain(|p| p.public_key != their_public_hex);
                 store.save()?;
-                log(&format!(
-                    "handshake with {} again -- staying contact {}",
-                    remote.name, id
-                ));
+                // tools/tor-e2e.sh zaehlt "handshake with .* again" -- die
+                // knappe Fassung passt ebenso auf das Muster.
+                log_vertraulich(
+                    &format!("handshake with {} again -- staying contact {}", remote.name, id),
+                    &format!("handshake with a known contact again -- staying contact {}", id),
+                );
                 return Ok(Some(id));
             }
         }
 
         let contact_id = {
             let mut store = self.store.lock().unwrap();
+            if marke.abgeloest() {
+                return Err(bad("superseded by the peer's handshake"));
+            }
             // Steht der Wartende ueberhaupt noch da? Der Benutzer kann ihn
             // gestrichen haben, waehrend der Handschlag lief -- ohne diese
             // Frage kaeme er gleich darauf als Kontakt zurueck, und das
@@ -1949,10 +2404,10 @@ impl Node {
             store.save()?;
             id
         };
-        log(&format!(
-            "contact exchange succeeded: {} is contact {}",
-            remote.name, contact_id
-        ));
+        log_vertraulich(
+            &format!("contact exchange succeeded: {} is contact {}", remote.name, contact_id),
+            &format!("contact exchange succeeded: contact {}", contact_id),
+        );
         Ok(Some(contact_id))
     }
 
@@ -2148,7 +2603,7 @@ impl Node {
         conn: Conn,
         transport_id: &str,
         contact_id: u32,
-        incoming: Option<(SecretKey, u64, u64)>,
+        incoming: Option<(SecretKey, u64)>,
         peer_ip: Option<String>,
         gewaehlt: bool,
     ) -> std::io::Result<()> {
@@ -2357,19 +2812,23 @@ impl Node {
 
         // The peer's stream: if we dialled, its tag is still to come
         let mut raw_reader = conn.try_clone()?;
-        let (in_header_key, in_stream_number, in_period) = match incoming {
+        let (in_header_key, in_stream_number) = match incoming {
             Some(v) => v,
             None => {
                 let mut tag = [0u8; TAG_LEN];
                 raw_reader.read_exact(&mut tag)?;
-                let store = self.store.lock().unwrap();
-                match recognise_tag(&store, transport_id, &tag) {
+                // Erkennen und vermerken in einem Zug (marke_erkennen). Eine
+                // Marke, die sich als ein ANDERER Kontakt entpuppt, bleibt
+                // dabei verbraucht -- wie bei Briar, das bei jeder Erkennung
+                // vermerkt; jene Nummer wurde ja wirklich gesendet.
+                let mut store = self.store.lock().unwrap();
+                match marke_erkennen(&mut store, transport_id, &tag) {
                     Some(Recognised::Contact {
                         id,
                         header_key,
                         stream_number,
-                        period,
-                    }) if id == contact_id => (header_key, stream_number, period),
+                        ..
+                    }) if id == contact_id => (header_key, stream_number),
                     _ => return Err(bad("the contact's tag was not recognised")),
                 }
             }
@@ -2492,6 +2951,10 @@ impl Node {
         let acked_now: std::collections::BTreeSet<String> =
             to_ack.iter().map(|id| to_hex(id)).collect();
         let mut new_messages = 0;
+        // Was in dieser Runde kam, aber nicht quittiert werden darf
+        // (Eingang::Zurueckgestellt).
+        let mut zurueckgestellt: std::collections::BTreeSet<SecretKey> =
+            std::collections::BTreeSet::new();
         let nachgefordert: Vec<OutMessage>;
         {
             let mut store = self.store.lock().unwrap();
@@ -2525,10 +2988,9 @@ impl Node {
                     }
                 }
                 contact.last_seen = now_ms();
-                contact
-                    .transport_mut(transport_id)
-                    .in_stream
-                    .insert(in_period.to_string(), in_stream_number + 1);
+                // Das Empfangsfenster ist hier nicht mehr zu ruehren: die
+                // Nummer wurde schon bei der Erkennung verbraucht
+                // (marke_erkennen).
                 if transport_id == BLUETOOTH_TRANSPORT_ID {
                     // Ihre MAC, wie wir sie gesehen haben. Sie geht mit der
                     // naechsten Adressmeldung als `u:address` an sie zurueck.
@@ -2589,8 +3051,16 @@ impl Node {
                 }
             }
             for (id, group, timestamp, body) in &received {
-                if self.receive_message(&mut store, contact_id, id, group, *timestamp, body) {
+                let eingang =
+                    self.receive_message(&mut store, contact_id, id, group, *timestamp, body);
+                if eingang == Eingang::Neu {
                     new_messages += 1;
+                }
+                // Was zurueckgestellt ist, wird nicht quittiert -- sonst
+                // schickte die Gegenseite es nie wieder.
+                if eingang == Eingang::Zurueckgestellt {
+                    zurueckgestellt.insert(*id);
+                    continue;
                 }
                 if let Some(contact) = store.contact_mut(contact_id) {
                     let hex = to_hex(id);
@@ -2604,8 +3074,11 @@ impl Node {
             // schickt die Gegenseite es erneut -- eine doppelte Nachricht faengt
             // die Entdoppelung ab.
             if !received.is_empty() {
-                let jetzt_quittiert: std::collections::BTreeSet<String> =
-                    received.iter().map(|(id, ..)| to_hex(id)).collect();
+                let jetzt_quittiert: std::collections::BTreeSet<String> = received
+                    .iter()
+                    .filter(|(id, ..)| !zurueckgestellt.contains(id))
+                    .map(|(id, ..)| to_hex(id))
+                    .collect();
                 if let Some(contact) = store.contact_mut(contact_id) {
                     contact.to_ack.retain(|id| !jetzt_quittiert.contains(id));
                 }
@@ -2629,8 +3102,12 @@ impl Node {
         // Jetzt erst die Antwort in derselben Runde: die Quittungen fuer das,
         // was gerade angekommen ist, und die angeforderten Nachrichten. Danach
         // das Stromende -- damit beendet die Gegenseite ihre Sitzung.
-        if !received.is_empty() {
-            let kennungen: Vec<SecretKey> = received.iter().map(|(id, ..)| *id).collect();
+        let kennungen: Vec<SecretKey> = received
+            .iter()
+            .map(|(id, ..)| *id)
+            .filter(|id| !zurueckgestellt.contains(id))
+            .collect();
+        if !kennungen.is_empty() {
             sync::write_ack(&mut writer, &kennungen)?;
         }
         for message in &nachgefordert {
@@ -2695,10 +3172,16 @@ impl Node {
                         spaete_quittungen.iter().map(|id| to_hex(id)).collect();
                     quittungen_verbuchen(contact, &peer_acked);
                 }
-                // Was spaet kam, wird in der naechsten Runde quittiert.
+                // Was spaet kam, wird in der naechsten Runde quittiert --
+                // ausser es ist zurueckgestellt.
                 for (id, group, timestamp, body) in &spaete_nachrichten {
-                    if self.receive_message(&mut store, contact_id, id, group, *timestamp, body) {
+                    let eingang =
+                        self.receive_message(&mut store, contact_id, id, group, *timestamp, body);
+                    if eingang == Eingang::Neu {
                         new_messages += 1;
+                    }
+                    if eingang == Eingang::Zurueckgestellt {
+                        continue;
                     }
                     if let Some(contact) = store.contact_mut(contact_id) {
                         let hex = to_hex(id);
@@ -2736,8 +3219,37 @@ impl Node {
     }
 
     /// Sorts an incoming message by the group it belongs to: a private
-    /// message, an invitation, or a message in a private group.
+    /// message, an invitation, or a message in a private group -- and says
+    /// whether it may be acknowledged.
+    ///
+    /// Die private Gruppe zuerst: ihre Kennung ist ein Hash mit eigenem
+    /// Etikett und faellt nie mit einer der Kontaktgruppen zusammen.
     fn receive_message(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        id: &SecretKey,
+        group: &SecretKey,
+        timestamp: u64,
+        body: &[u8],
+    ) -> Eingang {
+        if store.group(&to_hex(group)).is_some() {
+            return match self.receive_group_message(store, contact_id, id, group, timestamp, body) {
+                Gruppeneingang::Angenommen => Eingang::Neu,
+                Gruppeneingang::Wartend | Gruppeneingang::Verworfen => Eingang::Bekannt,
+                Gruppeneingang::Zurueckgestellt => Eingang::Zurueckgestellt,
+            };
+        }
+        if self.receive_contact_message(store, contact_id, id, group, timestamp, body) {
+            Eingang::Neu
+        } else {
+            Eingang::Bekannt
+        }
+    }
+
+    /// Eine Nachricht in einer der Gruppen, die wir mit diesem Kontakt allein
+    /// teilen: Adressen, Fassungen, Privatnachrichten, Einladungen.
+    fn receive_contact_message(
         &self,
         store: &mut Store,
         contact_id: u32,
@@ -2809,10 +3321,16 @@ impl Node {
                     if let Some(address) = address {
                         if entry.address.as_deref() != Some(address.as_str()) {
                             entry.address = Some(address.clone());
-                            log(&format!(
-                                "contact {} announced {} for {}",
-                                contact_id, address, transport
-                            ));
+                            log_vertraulich(
+                                &format!(
+                                    "contact {} announced {} for {}",
+                                    contact_id, address, transport
+                                ),
+                                &format!(
+                                    "contact {} announced a new address for {}",
+                                    contact_id, transport
+                                ),
+                            );
                         }
                     }
                 }
@@ -2850,9 +3368,11 @@ impl Node {
             if sync::is_attachment(body) {
                 if let Some((content_type, data)) = sync::parse_attachment(body) {
                     let hex = to_hex(id);
-                    match store.store_attachment(&hex, &content_type, &data) {
-                        Ok(_) => {
-                            let kind = content_type.clone();
+                    // Der gemeldete Typ wird am Inhalt geprueft; in die
+                    // Nachricht kommt der gespeicherte (Befund M7).
+                    match store.anhang_empfangen(&hex, &content_type, &data) {
+                        Ok(kind) => {
+                            let content_type = kind.clone();
                             if let Some(contact) = store.contact_mut(contact_id) {
                                 for message in contact.messages.iter_mut() {
                                     if message.attachment.as_deref() == Some(hex.as_str()) {
@@ -2865,8 +3385,10 @@ impl Node {
                                     }
                                 }
                             }
+                            // Nur die Familie: der Typ ist Text der
+                            // Gegenseite (7b, C7).
                             log(&format!("attachment received ({}, {} bytes)",
-                                         content_type, data.len()));
+                                         crate::store::typ_familie(&content_type), data.len()));
                             return true;
                         }
                         Err(e) => {
@@ -2882,16 +3404,26 @@ impl Node {
                 // Alle, nicht nur den ersten. Briar haengt bis zu zehn Bilder
                 // an eine Nachricht; die weiteren kamen an, wurden quittiert
                 // und lagen danach unerreichbar herum.
+                // Der Typ je Anhang: ist der Anhang schon da, der dort
+                // gespeicherte, am Inhalt gepruefte; sonst der gemeldete, auf
+                // das Muster gebracht. Kommt der Anhang spaeter, schreibt
+                // anhang_empfangen den geprueften nach (7b, C7).
+                let typ_von = |id: &SecretKey, gemeldet: &str| {
+                    store
+                        .attachment(&to_hex(id))
+                        .map(|a| a.content_type.clone())
+                        .unwrap_or_else(|| crate::store::typ_normalisieren(gemeldet))
+                };
                 let anhaenge: Vec<crate::store::Anhangskopf> = attachments
                     .iter()
                     .map(|(id, content_type)| crate::store::Anhangskopf {
                         id: to_hex(id),
-                        content_type: Some(content_type.clone()),
+                        content_type: Some(typ_von(id, content_type)),
                     })
                     .collect();
                 let (attachment, attachment_type) = match attachments.first() {
                     Some((id, content_type)) => {
-                        (Some(to_hex(id)), Some(content_type.clone()))
+                        (Some(to_hex(id)), Some(typ_von(id, content_type)))
                     }
                     None => (None, None),
                 };
@@ -2948,7 +3480,8 @@ impl Node {
                         .contact(contact_id)
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
-                    notify_chat(contact_id.to_string(), name, preview, false);
+                    let art = Meldungsart::aus(store);
+                    notify_chat(contact_id.to_string(), name, preview, false, art);
                 }
                 return stored;
             }
@@ -2957,11 +3490,6 @@ impl Node {
 
         if *group == groups::invite_group_id(&our_author, &their_author) {
             return self.receive_einladung(store, contact_id, id, timestamp, body);
-        }
-
-        let group_hex = to_hex(group);
-        if store.group(&group_hex).is_some() {
-            return self.receive_group_message(store, contact_id, id, group, timestamp, body);
         }
         false
     }
@@ -3086,10 +3614,13 @@ impl Node {
             .get(&contact_id)
             .and_then(|s| s.letzte_eigene.clone());
         if frueher.is_some() {
-            log(&format!(
-                "die Einladung zur Gruppe {} kommt erneut -- die alte Kette wird fortgesetzt",
-                group_hex
-            ));
+            log_vertraulich(
+                &format!(
+                    "die Einladung zur Gruppe {} kommt erneut -- die alte Kette wird fortgesetzt",
+                    group_hex
+                ),
+                "die Einladung zu einer Gruppe kommt erneut -- die alte Kette wird fortgesetzt",
+            );
         }
         einladungen.insert(
             contact_id,
@@ -3123,11 +3654,16 @@ impl Node {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: vec![contact_id],
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         });
-        log(&format!(
-            "invited to the group \"{}\" by contact {}",
-            invite.group_name, contact_id
-        ));
+        log_vertraulich(
+            &format!(
+                "invited to the group \"{}\" by contact {}",
+                invite.group_name, contact_id
+            ),
+            &format!("invited to a group by contact {}", contact_id),
+        );
         true
     }
 
@@ -3179,10 +3715,16 @@ impl Node {
     /// Das eine ist aus der anderen Sicht dasselbe.
     fn kette_melden(&self, contact_id: u32, art: &str, genannt: &Option<String>, erwartet: &Option<String>) {
         if genannt != erwartet {
-            log(&format!(
-                "{} von Kontakt {}: Kette zeigt auf {:?}, erwartet war {:?} -- wird trotzdem angenommen",
-                art, contact_id, genannt, erwartet
-            ));
+            log_vertraulich(
+                &format!(
+                    "{} von Kontakt {}: Kette zeigt auf {:?}, erwartet war {:?} -- wird trotzdem angenommen",
+                    art, contact_id, genannt, erwartet
+                ),
+                &format!(
+                    "{} von Kontakt {}: Kette zeigt nicht auf die erwartete Nachricht -- wird trotzdem angenommen",
+                    art, contact_id
+                ),
+            );
         }
     }
 
@@ -3299,10 +3841,16 @@ impl Node {
         // dazwischen wuerden verworfen und nicht quittiert. Erst sein JOIN
         // zurueck (Beigetreten-Zweig) traegt ihn ein, so wie Briars
         // PeerProtocolEngine erst in BOTH_JOINED teilt.
-        log(&format!(
-            "Kontakt {} ist auch in Gruppe {} -- JOIN als Mitglied geschickt",
-            contact_id, group_hex
-        ));
+        log_vertraulich(
+            &format!(
+                "Kontakt {} ist auch in Gruppe {} -- JOIN als Mitglied geschickt",
+                contact_id, group_hex
+            ),
+            &format!(
+                "Kontakt {} ist auch in einer unserer Gruppen -- JOIN als Mitglied geschickt",
+                contact_id
+            ),
+        );
     }
 
     /// Die Eingeladene hat zugesagt. Sind wir die Erstellerin, schickt Briar
@@ -3422,10 +3970,10 @@ impl Node {
             s.letzte_fremde = Some(to_hex(id));
             s.zustand = Sitzungszustand::Beigetreten;
         }
-        log(&format!(
-            "contact {} accepted the invitation to group {}",
-            contact_id, group_hex
-        ));
+        log_vertraulich(
+            &format!("contact {} accepted the invitation to group {}", contact_id, group_hex),
+            &format!("contact {} accepted a group invitation", contact_id),
+        );
         // Jetzt, und nicht beim Einladen, geht der Verlauf der Gruppe an sie
         // hinaus: vor der Zusage ist die Gruppe bei einem echten Briar
         // unsichtbar, und was dort ankommt, wird verworfen und nicht quittiert.
@@ -3511,10 +4059,13 @@ impl Node {
                         .map(|m| m.id.clone())
                 });
                 if let Some(kennung) = gefunden {
-                    log(&format!(
-                        "Kette zur Gruppe {} aus dem Ausgangskorb nachgeholt: {}",
-                        group_hex, kennung
-                    ));
+                    log_vertraulich(
+                        &format!(
+                            "Kette zur Gruppe {} aus dem Ausgangskorb nachgeholt: {}",
+                            group_hex, kennung
+                        ),
+                        "Kette zu einer Gruppe aus dem Ausgangskorb nachgeholt",
+                    );
                     if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
                         s.letzte_eigene = Some(kennung.clone());
                     }
@@ -3525,10 +4076,13 @@ impl Node {
             }
         };
         if anker.is_none() {
-            log(&format!(
-                "die Gruppe {} stammt aus einer Fassung vor 0.27.0 und ihre Einladung ist quittiert -- kein eigenes JOIN, die Kette hat keinen Kopf",
-                group_hex
-            ));
+            log_vertraulich(
+                &format!(
+                    "die Gruppe {} stammt aus einer Fassung vor 0.27.0 und ihre Einladung ist quittiert -- kein eigenes JOIN, die Kette hat keinen Kopf",
+                    group_hex
+                ),
+                "eine Gruppe stammt aus einer Fassung vor 0.27.0 und ihre Einladung ist quittiert -- kein eigenes JOIN, die Kette hat keinen Kopf",
+            );
             return true;
         }
         let zeitstempel = store
@@ -3617,10 +4171,10 @@ impl Node {
             // unsichtbaren Gruppe wird dort verworfen UND nicht quittiert --
             // unser Korb schickte sie also fuer immer wieder hinaus.
             store.verwerfe_gruppenpost(contact_id, &group_hex);
-            log(&format!(
-                "contact {} dissolved the group {}",
-                contact_id, group_hex
-            ));
+            log_vertraulich(
+                &format!("contact {} dissolved the group {}", contact_id, group_hex),
+                &format!("contact {} dissolved a group", contact_id),
+            );
         } else {
             // Nur er geht. Briar macht die Gruppe fuer ihn unsichtbar; bei uns
             // heisst das: aus der Verteilliste und die Warteschlange leer. Ohne
@@ -3639,12 +4193,11 @@ impl Node {
                 });
             }
             store.verwerfe_gruppenpost(contact_id, &group_hex);
-            log(&format!(
-                "contact {} is out of the group {} ({})",
-                contact_id,
-                group_hex,
-                if war_mitglied { "left" } else { "declined" }
-            ));
+            let wie = if war_mitglied { "left" } else { "declined" };
+            log_vertraulich(
+                &format!("contact {} is out of the group {} ({})", contact_id, group_hex, wie),
+                &format!("contact {} is out of a group ({})", contact_id, wie),
+            );
         }
         if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
             s.letzte_fremde = Some(to_hex(id));
@@ -3729,10 +4282,16 @@ impl Node {
             s.eigener_zeitstempel = zeitstempel;
             s.zustand = Sitzungszustand::Fehler;
         }
-        log(&format!(
-            "contact {} aborted the invitation session for {}; ABORT sent back",
-            contact_id, group_hex
-        ));
+        log_vertraulich(
+            &format!(
+                "contact {} aborted the invitation session for {}; ABORT sent back",
+                contact_id, group_hex
+            ),
+            &format!(
+                "contact {} aborted a group invitation session; ABORT sent back",
+                contact_id
+            ),
+        );
         true
     }
 
@@ -3744,42 +4303,151 @@ impl Node {
         group: &SecretKey,
         timestamp: u64,
         body: &[u8],
-    ) -> bool {
-        // Und hier: der Beitrag eines anderen wird zur Untergrenze, sobald er
-        // als vorige Nachricht in der Gruppe steht.
+    ) -> Gruppeneingang {
         if self.zu_weit_in_der_zukunft(contact_id, "ein Gruppenbeitrag", timestamp) {
-            return false;
+            return Gruppeneingang::Verworfen;
         }
-        let parsed = match groups::parse_body(group, timestamp, body) {
+        let group_hex = to_hex(group);
+        let message_id = to_hex(id);
+        let creator = {
+            let g = match store.group(&group_hex) {
+                Some(g) => g,
+                None => return Gruppeneingang::Verworfen,
+            };
+            if g.messages.iter().any(|m| m.id == message_id)
+                || g.verworfen.iter().any(|v| *v == message_id)
+            {
+                return Gruppeneingang::Verworfen;
+            }
+            if g.wartend.iter().any(|w| w.id == message_id) {
+                return Gruppeneingang::Wartend;
+            }
+            // Wer gegangen ist, kommt nicht durch einen Nachlaeufer zurueck.
+            // Das muss VOR dem Speichern stehen: bisher landete der Beitrag
+            // erst in der Gruppe und wurde weitergereicht, und erst danach
+            // fiel auf, dass der Kontakt draussen ist.
+            if abgemeldet(g, contact_id) {
+                log(&format!(
+                    "a group message from contact {} was dropped: left or aborted",
+                    contact_id
+                ));
+                return Gruppeneingang::Verworfen;
+            }
+            match gruppen_ersteller(g) {
+                Some(c) => c,
+                None => return Gruppeneingang::Verworfen,
+            }
+        };
+        let parsed = match groups::parse_body(group, &creator, timestamp, body) {
             Some(p) => p,
             None => {
                 log("a group message did not verify, or its text was out of bounds");
-                return false;
+                // Ungueltig bleibt ungueltig -- die Kennung haengt am Inhalt.
+                // Wer darauf aufbaut, faellt mit (Briar: INVALID und
+                // invalidateMessage fuer die Abhaengigen).
+                if let Some(g) = store.group_mut(&group_hex) {
+                    verwerfen_samt_wartenden(g, &message_id);
+                }
+                return Gruppeneingang::Verworfen;
             }
         };
-        let group_hex = to_hex(group);
-        let message_id = to_hex(id);
+        let lage = match store.group(&group_hex) {
+            Some(g) => kettenlage(g, &parsed, timestamp),
+            None => return Gruppeneingang::Verworfen,
+        };
+        match lage {
+            Kettenlage::Verwerfen => {
+                let mit = store
+                    .group_mut(&group_hex)
+                    .map(|g| verwerfen_samt_wartenden(g, &message_id))
+                    .unwrap_or(0);
+                log(&format!(
+                    "a group post broke its member's chain and was dropped ({} waiting post(s) with it)",
+                    mit
+                ));
+                Gruppeneingang::Verworfen
+            }
+            Kettenlage::Warten(fehlt) => {
+                let (author_id, parent, previous) = match &parsed {
+                    GroupMessage::Post {
+                        member,
+                        parent,
+                        previous,
+                        ..
+                    } => (
+                        to_hex(&member.id()),
+                        parent.as_ref().map(|p| to_hex(p)),
+                        to_hex(previous),
+                    ),
+                    // Ein JOIN wartet nie (kettenlage).
+                    GroupMessage::Join { .. } => return Gruppeneingang::Verworfen,
+                };
+                let aufgenommen = match store.group_mut(&group_hex) {
+                    Some(g) => g.warten_lassen(crate::store::WartenderBeitrag {
+                        id: message_id,
+                        contact_id,
+                        timestamp,
+                        body: to_hex(body),
+                        author_id,
+                        parent,
+                        previous,
+                    }),
+                    None => return Gruppeneingang::Verworfen,
+                };
+                if !aufgenommen {
+                    log(&format!(
+                        "a group post from contact {} was deferred: the waiting list is full -- not acknowledged",
+                        contact_id
+                    ));
+                    return Gruppeneingang::Zurueckgestellt;
+                }
+                log(match fehlt {
+                    Fehlt::Vorige => "a group post waits for its member's earlier message",
+                    Fehlt::Elternbeitrag => "a group post waits for the post it replies to",
+                });
+                Gruppeneingang::Wartend
+            }
+            Kettenlage::Annehmen => {
+                self.gruppenbeitrag_annehmen(
+                    store, contact_id, &group_hex, &message_id, timestamp, body, &parsed,
+                );
+                self.warteliste_nachlesen(store, group, &creator, &message_id);
+                Gruppeneingang::Angenommen
+            }
+        }
+    }
+
+    /// Ein Beitrag, dessen Kette steht: in die Gruppe, anzeigen, weiterreichen.
+    #[allow(clippy::too_many_arguments)]
+    fn gruppenbeitrag_annehmen(
+        &self,
+        store: &mut Store,
+        contact_id: u32,
+        group_hex: &str,
+        message_id: &str,
+        timestamp: u64,
+        body: &[u8],
+        parsed: &GroupMessage,
+    ) {
         let member = parsed.member().clone();
         let member_id = to_hex(&member.id());
-        let (text, join) = match &parsed {
+        let (text, join) = match parsed {
             GroupMessage::Join { .. } => (String::new(), true),
             GroupMessage::Post { text, .. } => (text.clone(), false),
         };
         let others: Vec<u32>;
         let neu_dabei: bool;
+        let art = Meldungsart::aus(store);
         {
-            let group_entry = match store.group_mut(&group_hex) {
+            let group_entry = match store.group_mut(group_hex) {
                 Some(g) => g,
-                None => return false,
+                None => return,
             };
-            if group_entry.messages.iter().any(|m| m.id == message_id) {
-                return false;
-            }
             group_entry
                 .member_names
                 .insert(member_id.clone(), member.name.clone());
             group_entry.messages.push(GroupPost {
-                id: message_id.clone(),
+                id: message_id.to_string(),
                 author_id: member_id,
                 author_name: member.name.clone(),
                 timestamp,
@@ -3790,7 +4458,7 @@ impl Node {
             group_entry.messages.sort_by_key(|m| m.timestamp);
             if !join {
                 notify_chat(
-                    group_hex.clone(),
+                    group_hex.to_string(),
                     format!("{} - {}", group_entry.name, member.name),
                     group_entry
                         .messages
@@ -3798,18 +4466,15 @@ impl Node {
                         .map(|m| m.text.clone())
                         .unwrap_or_default(),
                     true,
+                    art,
                 );
             }
-            // Wer gegangen ist, kommt nicht durch einen Nachlaeufer zurueck.
-            // Ohne diese Bedingung hebt der naechste Beitrag, der noch
-            // unterwegs war, das gerade gelesene LEAVE wieder auf -- und wir
-            // schicken weiter an jemanden, der abgesagt hat.
-            let abgemeldet = matches!(
-                group_entry.einladungen.get(&contact_id).map(|s| s.zustand),
-                Some(crate::store::Sitzungszustand::Gegangen)
-                    | Some(crate::store::Sitzungszustand::Fehler)
-            ) || group_entry.aufgeloest;
-            neu_dabei = !abgemeldet && !group_entry.contacts.contains(&contact_id);
+            // In einer aufgeloesten Gruppe kommt niemand mehr dazu -- wir
+            // schicken dort nichts, auch kein eigenes JOIN (mitglied_eintragen
+            // haelt es genauso).
+            neu_dabei = !group_entry.aufgeloest
+                && !abgemeldet(group_entry, contact_id)
+                && !group_entry.contacts.contains(&contact_id);
             if neu_dabei {
                 group_entry.contacts.push(contact_id);
             }
@@ -3823,7 +4488,7 @@ impl Node {
         // sind wir fuereinander bloss Mitglieder, und ein echtes Briar teilt die
         // Gruppe erst, wenn beide dort ein JOIN geschickt haben.
         if neu_dabei {
-            self.peer_join_schicken(store, contact_id, &group_hex);
+            self.peer_join_schicken(store, contact_id, group_hex);
         }
         // Pass it on to the other members, unchanged: that is what makes a
         // group work when not everyone can reach everyone.
@@ -3831,8 +4496,8 @@ impl Node {
             store.queue(
                 other,
                 OutMessage {
-                    id: message_id.clone(),
-                    group: group_hex.clone(),
+                    id: message_id.to_string(),
+                    group: group_hex.to_string(),
                     timestamp,
                     body: to_hex(body),
                     acked: false,
@@ -3841,7 +4506,99 @@ impl Node {
                 },
             );
         }
-        true
+    }
+
+    /// Briars Abhaengigkeitsmechanik (ValidationManagerImpl, deliverNext
+    /// PendingMessage): ist ein Beitrag angenommen, werden die Wartenden
+    /// geprueft, die genau auf ihn warten -- als vorige Nachricht oder als
+    /// Elternbeitrag. Was aufgeht, wird angenommen und weitergereicht wie ein
+    /// frisch angekommener Beitrag und kommt selbst auf die Liste der
+    /// Angenommenen; was nicht mehr aufgehen kann, wird mit allem, was darauf
+    /// aufbaut, verworfen.
+    ///
+    /// Nicht mehr die ganze Liste je Durchgang und nicht jeden Rumpf erneut
+    /// parsen (7a, G2): die Verweise stehen am Wartenden. Nur wer aufgeht,
+    /// wird einmal dekodiert und seine Unterschrift geprueft.
+    ///
+    /// Der Ueberbringer spielt hier keine Rolle mehr: Briar prueft
+    /// Sichtbarkeit nur beim Empfang (DatabaseComponentImpl.receiveMessage)
+    /// und stellt eine gespeicherte PENDING-Nachricht spaeter zu, gleich was
+    /// aus dem Kontakt wurde, der sie brachte (7a, G3.2).
+    fn warteliste_nachlesen(
+        &self,
+        store: &mut Store,
+        group: &SecretKey,
+        creator: &Author,
+        angenommen: &str,
+    ) {
+        let group_hex = to_hex(group);
+        match store.group_mut(&group_hex) {
+            Some(g) if !g.wartend.is_empty() => verweise_nachtragen(g),
+            _ => return,
+        }
+        let mut offen = vec![angenommen.to_string()];
+        while let Some(id) = offen.pop() {
+            let kandidaten: Vec<crate::store::WartenderBeitrag> = match store.group_mut(&group_hex)
+            {
+                Some(g) => {
+                    let (k, rest) = std::mem::take(&mut g.wartend).into_iter().partition(
+                        |w: &crate::store::WartenderBeitrag| {
+                            w.previous == id || w.parent.as_deref() == Some(id.as_str())
+                        },
+                    );
+                    g.wartend = rest;
+                    k
+                }
+                None => return,
+            };
+            for w in kandidaten {
+                let lage = match store.group(&group_hex) {
+                    Some(g) => postlage(g, &w.author_id, w.timestamp, w.parent.as_deref(), &w.previous),
+                    None => return,
+                };
+                match lage {
+                    Kettenlage::Warten(_) => {
+                        if let Some(g) = store.group_mut(&group_hex) {
+                            g.wartend.push(w);
+                        }
+                    }
+                    Kettenlage::Verwerfen => {
+                        let mit = store
+                            .group_mut(&group_hex)
+                            .map(|g| g.verwerfen_mit_abhaengigen(&w.id))
+                            .unwrap_or(0);
+                        log(&format!(
+                            "a waiting group post broke its member's chain and was dropped ({} with it)",
+                            mit
+                        ));
+                    }
+                    Kettenlage::Annehmen => {
+                        let parsed = from_hex(&w.body).and_then(|body| {
+                            groups::parse_body(group, creator, w.timestamp, &body).map(|p| (body, p))
+                        });
+                        let Some((body, parsed)) = parsed else {
+                            // Beim Eintreffen war er gueltig; hier kann nur eine
+                            // veraenderte Datei stehen.
+                            log("a waiting group post no longer verifies and was dropped");
+                            if let Some(g) = store.group_mut(&group_hex) {
+                                g.verwerfen_mit_abhaengigen(&w.id);
+                            }
+                            continue;
+                        };
+                        self.gruppenbeitrag_annehmen(
+                            store,
+                            w.contact_id,
+                            &group_hex,
+                            &w.id,
+                            w.timestamp,
+                            &body,
+                            &parsed,
+                        );
+                        offen.push(w.id);
+                    }
+                }
+            }
+        }
     }
 
     /// Tries every pending contact and every contact with an address.
@@ -3959,6 +4716,12 @@ pub fn stromnummer_vormerken(
 /// ausschliesslich **gescheiterte** Versuche -- und eine Gegenseite mit der
 /// Fassung bis 0.26.0 schickt jeden davon wieder mit der Nummer 0. Wer die
 /// Marke verbraucht, sperrt genau die Wiederholung aus, auf die es ankommt.
+///
+/// Kontakte haben seither das volle Fenster mit Bitfeld (`fenster_setzen`,
+/// Regel 1 und 2): dort ist eine Wiederholung derselben Nummer kein
+/// Wiederholungsversuch, sondern ein eingespielter Mitschnitt. Wartende
+/// bleiben bei Regel 1 allein, aus dem Grund oben; ihr `in_gesehen` bleibt
+/// leer.
 pub fn fenster_nachziehen(
     zustand: &mut crate::store::TransportState,
     period: u64,
@@ -3977,11 +4740,64 @@ pub fn fenster_nachziehen(
     // Eine Marke aus dem naechsten Abschnitt (die Uhr der Gegenseite geht vor)
     // wuerde sonst den vorigen wegraeumen, obwohl der noch gilt. Darum kommt
     // der Bezugsabschnitt von aussen und nicht aus der Uhr: so ist er pruefbar.
-    zustand.in_stream.retain(|a, _| {
+    abschnitte_raeumen(zustand, jetzt);
+}
+
+/// Nur voriger, jetziger und naechster Abschnitt bleiben -- gerechnet vom
+/// jetzigen (siehe `fenster_nachziehen`). Fusspunkt und Bitfeld gehen
+/// zusammen, damit keins ohne das andere uebrig bleibt.
+fn abschnitte_raeumen(zustand: &mut crate::store::TransportState, jetzt: u64) {
+    let gilt = |a: &String| {
         a.parse::<u64>()
             .map(|p| p.max(jetzt) - p.min(jetzt) <= 1)
             .unwrap_or(false)
-    });
+    };
+    zustand.in_stream.retain(|a, _| gilt(a));
+    zustand.in_gesehen.retain(|a, _| gilt(a));
+}
+
+/// Eine Nummer im Empfangsfenster eines Kontakts als gesehen vermerken.
+///
+/// Nach Briars `ReorderingWindow.setSeen` (ReorderingWindow.java:54-86):
+/// Bit setzen, dann Regel 1 -- so weit schieben, dass alles oberhalb der
+/// Fenstermitte ungesehen ist -- und Regel 2 -- weiter schieben, bis der
+/// Fusspunkt selbst ungesehen ist. Das Bitfeld rueckt mit.
+///
+/// Briar wirft bei einer Nummer ausserhalb des Fensters oder einer schon
+/// gesehenen; hier waere das ein Absturz des ganzen Dienstes. Stattdessen
+/// bleibt alles, wie es ist, und die Antwort ist `false`. Vorkommen darf es
+/// nicht: die Erkennung sucht nur im Fenster und ueberspringt Gesehenes.
+pub fn fenster_setzen(
+    zustand: &mut crate::store::TransportState,
+    period: u64,
+    nummer: u64,
+    jetzt: u64,
+) -> bool {
+    let abschnitt = period.to_string();
+    let base = *zustand.in_stream.get(&abschnitt).unwrap_or(&0);
+    let alt = *zustand.in_gesehen.get(&abschnitt).unwrap_or(&0);
+    if nummer < base || nummer - base >= WINDOW {
+        return false;
+    }
+    let offset = nummer - base;
+    let bit = 1u32 << offset;
+    if alt & bit != 0 {
+        return false;
+    }
+    let gesehen = alt | bit;
+    // Regel 1: alles oberhalb der Mitte ungesehen.
+    let mut slide = (offset + 1).saturating_sub(WINDOW / 2);
+    // Regel 2: der Fusspunkt ungesehen. Die Grenze WINDOW schuetzt vor einem
+    // geladenen Bitfeld, das die Regeln verletzt -- ein Schieben um 32 Bit
+    // waere im Pruefbau ein Absturz.
+    while slide < WINDOW && gesehen >> slide & 1 == 1 {
+        slide += 1;
+    }
+    let neu = gesehen.checked_shr(slide as u32).unwrap_or(0);
+    zustand.in_stream.insert(abschnitt.clone(), base + slide);
+    zustand.in_gesehen.insert(abschnitt, neu);
+    abschnitte_raeumen(zustand, jetzt);
+    true
 }
 
 /// Dasselbe fuer einen Wartenden im Speicher, samt Wegschreiben. Gebraucht an
@@ -4756,6 +5572,8 @@ mod einladungsantwort_tests {
             aufgeloest: false,
             letztes_ereignis: None,
             contacts: vec![1],
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
         });
     }
 
@@ -5058,6 +5876,567 @@ mod einladungsantwort_tests {
 }
 
 #[cfg(test)]
+mod gruppenkette_tests {
+    use super::*;
+    use crate::store::{Einladungssitzung, PrivateGroup, Sitzungszustand};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    const SALZ: [u8; groups::SALT_LEN] = [9u8; groups::SALT_LEN];
+
+    fn wer(name: &str, n: u8) -> (Author, SecretKey) {
+        let seed = [n; 32];
+        (
+            Author {
+                name: name.to_string(),
+                public_key: crate::crypto::signature_public_key(&seed).to_vec(),
+            },
+            seed,
+        )
+    }
+
+    fn kontakt(id: u32, n: u8) -> Contact {
+        let (autor, _) = wer("Kontakt", n);
+        Contact {
+            id,
+            name: format!("Kontakt {}", id),
+            author_id: to_hex(&autor.id()),
+            signature_public: to_hex(&autor.public_key),
+            handshake_public: None,
+            master_key: to_hex(&[n; 32]),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
+        }
+    }
+
+    /// Eine Gruppe der Erstellerin (Schluessel 1), die mit den Kontakten 1 und
+    /// 2 geteilt ist; beide Sitzungen stehen auf Beigetreten.
+    struct Welt {
+        store: Store,
+        knoten: Node,
+        gruppe: SecretKey,
+        ersteller: Author,
+        ersteller_seed: SecretKey,
+        mitglied: Author,
+        mitglied_seed: SecretKey,
+    }
+
+    fn welt(name: &str) -> Welt {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-gruppenkette-test-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        let (ich, ich_seed) = wer("ich", 3);
+        store.state.identity = Some(crate::store::Identity {
+            name: ich.name.clone(),
+            signature_seed: to_hex(&ich_seed),
+            signature_public: to_hex(&ich.public_key),
+            author_id: to_hex(&ich.id()),
+            handshake_private: to_hex(&ich_seed),
+            handshake_public: to_hex(&ich_seed),
+        });
+        store.state.contacts.push(kontakt(1, 11));
+        store.state.contacts.push(kontakt(2, 12));
+        let (ersteller, ersteller_seed) = wer("Erstellerin", 1);
+        let (mitglied, mitglied_seed) = wer("Mitglied", 2);
+        let gruppe = groups::group_id(&ersteller, "Kette", &SALZ);
+        let mut einladungen = BTreeMap::new();
+        for c in [1u32, 2] {
+            let mut s = Einladungssitzung::default();
+            s.zustand = Sitzungszustand::Beigetreten;
+            einladungen.insert(c, s);
+        }
+        store.state.groups.push(PrivateGroup {
+            id: to_hex(&gruppe),
+            name: "Kette".to_string(),
+            salt: to_hex(&SALZ),
+            creator_name: ersteller.name.clone(),
+            creator_public: to_hex(&ersteller.public_key),
+            creator_author_id: to_hex(&ersteller.id()),
+            joined: true,
+            invited_by: Some(1),
+            invite_timestamp: None,
+            invite_signature: None,
+            member_names: BTreeMap::new(),
+            last_read: 0,
+            messages: Vec::new(),
+            our_previous: None,
+            einladungen,
+            einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
+            contacts: vec![1, 2],
+            wartend: Vec::new(),
+            verworfen: Vec::new(),
+        });
+        let mut kp = std::env::temp_dir();
+        kp.push(format!("briar-gruppenkette-test-{}-knoten.json", name));
+        let _ = std::fs::remove_file(&kp);
+        let knoten = Node::new(Arc::new(Mutex::new(Store::open(&kp, 7327).unwrap())));
+        Welt {
+            store,
+            knoten,
+            gruppe,
+            ersteller,
+            ersteller_seed,
+            mitglied,
+            mitglied_seed,
+        }
+    }
+
+    impl Welt {
+        fn empfangen(&mut self, von: u32, zeit: u64, rumpf: &[u8]) -> (bool, String) {
+            let (lage, id) = self.eingang(von, zeit, rumpf);
+            (lage == Gruppeneingang::Angenommen, id)
+        }
+
+        fn eingang(&mut self, von: u32, zeit: u64, rumpf: &[u8]) -> (Gruppeneingang, String) {
+            let id = ids::message_id(&self.gruppe, zeit, rumpf);
+            let lage = self.knoten.receive_group_message(
+                &mut self.store,
+                von,
+                &id,
+                &self.gruppe,
+                zeit,
+                rumpf,
+            );
+            (lage, to_hex(&id))
+        }
+
+        fn g_mut(&mut self) -> &mut PrivateGroup {
+            let hex = to_hex(&self.gruppe);
+            self.store.group_mut(&hex).unwrap()
+        }
+
+        /// Ein POST eines beliebigen Autors (Samen `n`) mit Elternbeitrag.
+        fn post_von(
+            &self,
+            n: u8,
+            zeit: u64,
+            eltern: Option<&str>,
+            vorige: &str,
+            text: &str,
+        ) -> Vec<u8> {
+            let (autor, seed) = wer("Wegwerf", n);
+            groups::post_body(
+                &self.gruppe,
+                zeit,
+                &autor,
+                &seed,
+                eltern.map(key_from_hex),
+                &key_from_hex(vorige),
+                text,
+            )
+        }
+
+        fn mitglied_join(&self, zeit: u64) -> Vec<u8> {
+            let sig = groups::invite_signature(
+                &self.ersteller_seed,
+                &self.ersteller.id(),
+                &self.mitglied.id(),
+                &self.gruppe,
+                zeit - 1,
+            );
+            groups::join_body(
+                &self.gruppe,
+                zeit,
+                &self.mitglied,
+                &self.mitglied_seed,
+                Some((zeit - 1, sig)),
+            )
+        }
+
+        fn mitglied_post(&self, zeit: u64, vorige: &str, text: &str) -> Vec<u8> {
+            groups::post_body(
+                &self.gruppe,
+                zeit,
+                &self.mitglied,
+                &self.mitglied_seed,
+                None,
+                &key_from_hex(vorige),
+                text,
+            )
+        }
+
+        fn g(&self) -> &PrivateGroup {
+            self.store.group(&to_hex(&self.gruppe)).unwrap()
+        }
+
+        fn gespeichert(&self, id: &str) -> bool {
+            self.g().messages.iter().any(|m| m.id == id)
+        }
+
+        fn im_korb(&self, kontakt: u32, id: &str) -> bool {
+            self.store
+                .contact(kontakt)
+                .unwrap()
+                .outbox
+                .iter()
+                .any(|m| m.id == id)
+        }
+    }
+
+    #[test]
+    fn join_ohne_einladung_wird_nicht_gespeichert() {
+        let mut w = welt("join-ohne");
+        let rumpf = groups::join_body(&w.gruppe, 500, &w.mitglied, &w.mitglied_seed, None);
+        let (angenommen, id) = w.empfangen(1, 500, &rumpf);
+        assert!(!angenommen);
+        assert!(!w.gespeichert(&id));
+        assert!(!w.im_korb(2, &id), "und nicht weitergereicht");
+        assert!(w.g().member_names.is_empty(), "und kein Name vermerkt");
+    }
+
+    #[test]
+    fn gueltiges_join_wird_gespeichert_und_weitergereicht() {
+        let mut w = welt("join-gut");
+        let rumpf = w.mitglied_join(500);
+        let (angenommen, id) = w.empfangen(1, 500, &rumpf);
+        assert!(angenommen);
+        assert!(w.gespeichert(&id));
+        assert!(w.im_korb(2, &id));
+        assert!(!w.im_korb(1, &id), "nicht zurueck an den Absender");
+    }
+
+    #[test]
+    fn ersteller_join_wird_ohne_einladung_angenommen() {
+        let mut w = welt("ersteller-join");
+        let rumpf = groups::join_body(&w.gruppe, 500, &w.ersteller, &w.ersteller_seed, None);
+        let (angenommen, id) = w.empfangen(1, 500, &rumpf);
+        assert!(angenommen);
+        assert!(w.gespeichert(&id));
+    }
+
+    #[test]
+    fn beitrag_eines_gegangenen_wird_weder_gespeichert_noch_weitergereicht() {
+        let mut w = welt("gegangen");
+        let join = w.mitglied_join(500);
+        let (_, join_id) = w.empfangen(1, 500, &join);
+        w.store
+            .group_mut(&to_hex(&w.gruppe))
+            .unwrap()
+            .einladungen
+            .get_mut(&1)
+            .unwrap()
+            .zustand = Sitzungszustand::Gegangen;
+        let post = w.mitglied_post(600, &join_id, "spaet");
+        let (angenommen, id) = w.empfangen(1, 600, &post);
+        assert!(!angenommen);
+        assert!(!w.gespeichert(&id));
+        assert!(w.g().wartend.is_empty(), "auch nicht auf die Warteliste");
+        assert!(!w.im_korb(2, &id));
+    }
+
+    /// Bis 0.42.0 fiel hier jeder Beitrag (Test hiess
+    /// `beitrag_in_aufgeloester_gruppe_wird_nicht_gespeichert`). Briar setzt
+    /// bei der Aufloesung nur die Sitzung des Erstellers auf INVISIBLE
+    /// (InviteeProtocolEngine.onRemoteLeaveWhenSubscribed, Z. 309-315) und
+    /// stellt Beitraege anderer Mitglieder weiter zu (7a, G3.3).
+    #[test]
+    fn beitrag_in_aufgeloester_gruppe_wird_gespeichert_und_weitergereicht() {
+        let mut w = welt("aufgeloest");
+        let join = w.mitglied_join(500);
+        let (_, join_id) = w.empfangen(1, 500, &join);
+        w.g_mut().aufgeloest = true;
+        let post = w.mitglied_post(600, &join_id, "spaet");
+        let (angenommen, id) = w.empfangen(2, 600, &post);
+        assert!(angenommen);
+        assert!(w.gespeichert(&id));
+        assert!(w.im_korb(1, &id), "an die uebrigen Mitglieder wie ueberall");
+        assert!(!w.im_korb(2, &id));
+    }
+
+    /// Die Sitzung des Erstellers steht nach seinem LEAVE auf Gegangen: von
+    /// ihm kommt auch in der aufgeloesten Gruppe nichts mehr herein.
+    #[test]
+    fn in_aufgeloester_gruppe_bleibt_der_gegangene_draussen() {
+        let mut w = welt("aufgeloest-gegangen");
+        let (_, join_id) = w.empfangen(1, 500, &w.mitglied_join(500));
+        w.g_mut().aufgeloest = true;
+        w.g_mut().einladungen.get_mut(&2).unwrap().zustand = Sitzungszustand::Gegangen;
+        let post = w.mitglied_post(600, &join_id, "spaet");
+        let (lage, id) = w.eingang(2, 600, &post);
+        assert_eq!(lage, Gruppeneingang::Verworfen);
+        assert!(!w.gespeichert(&id));
+    }
+
+    #[test]
+    fn beitrag_vor_dem_join_wartet_und_geht_danach_auf() {
+        let mut w = welt("vor-join");
+        let join = w.mitglied_join(500);
+        let join_id = to_hex(&ids::message_id(&w.gruppe, 500, &join));
+        let erster = w.mitglied_post(600, &join_id, "eins");
+        let (angenommen, erster_id) = w.empfangen(1, 600, &erster);
+        assert!(!angenommen);
+        assert!(!w.gespeichert(&erster_id), "nicht angezeigt");
+        assert!(!w.im_korb(2, &erster_id), "nicht weitergereicht");
+        assert_eq!(w.g().wartend.len(), 1);
+        assert!(w.g().member_names.is_empty());
+        // Der zweite Beitrag haengt am ersten: auch er wartet.
+        let zweiter = w.mitglied_post(700, &erster_id, "zwei");
+        let (_, zweiter_id) = w.empfangen(1, 700, &zweiter);
+        assert_eq!(w.g().wartend.len(), 2);
+        // Das JOIN kommt von Kontakt 2 -- die Kette geht ganz auf.
+        let (angenommen, _) = w.empfangen(2, 500, &join);
+        assert!(angenommen);
+        assert!(w.gespeichert(&erster_id));
+        assert!(w.gespeichert(&zweiter_id));
+        assert!(w.g().wartend.is_empty());
+        // Weitergereicht an den, von dem der Beitrag NICHT kam.
+        assert!(w.im_korb(2, &erster_id));
+        assert!(w.im_korb(2, &zweiter_id));
+        assert!(!w.im_korb(1, &erster_id));
+        assert!(!w.im_korb(1, &zweiter_id));
+    }
+
+    #[test]
+    fn wartender_beitrag_wird_nicht_doppelt_vorgemerkt() {
+        let mut w = welt("doppelt");
+        let post = w.mitglied_post(600, &to_hex(&[5u8; 32]), "eins");
+        let _ = w.empfangen(1, 600, &post);
+        let (angenommen, _) = w.empfangen(2, 600, &post);
+        assert!(!angenommen);
+        assert_eq!(w.g().wartend.len(), 1);
+    }
+
+    #[test]
+    fn beitrag_mit_fremder_voriger_nachricht_wird_verworfen() {
+        let mut w = welt("fremde-vorige");
+        let ersteller_join =
+            groups::join_body(&w.gruppe, 400, &w.ersteller, &w.ersteller_seed, None);
+        let (_, ersteller_join_id) = w.empfangen(1, 400, &ersteller_join);
+        let _ = w.empfangen(1, 500, &w.mitglied_join(500));
+        // Das Mitglied nennt das JOIN der Erstellerin als seine vorige Nachricht.
+        let post = w.mitglied_post(600, &ersteller_join_id, "geklaut");
+        let (angenommen, id) = w.empfangen(1, 600, &post);
+        assert!(!angenommen);
+        assert!(!w.gespeichert(&id));
+        assert!(w.g().wartend.is_empty());
+    }
+
+    #[test]
+    fn beitrag_nicht_nach_der_vorigen_nachricht_wird_verworfen() {
+        let mut w = welt("zeit");
+        let (_, join_id) = w.empfangen(1, 500, &w.mitglied_join(500));
+        let post = w.mitglied_post(500, &join_id, "gleichzeitig");
+        let (angenommen, id) = w.empfangen(1, 500, &post);
+        assert!(!angenommen);
+        assert!(!w.gespeichert(&id));
+    }
+
+    /// Bis 0.42.0 fiel der Wartende (Test hiess
+    /// `wartender_eines_inzwischen_gegangenen_faellt`). Briar prueft die
+    /// Sichtbarkeit nur beim Empfang (DatabaseComponentImpl.receiveMessage,
+    /// Z. 967) und stellt PENDING spaeter zu, gleich was aus dem Ueberbringer
+    /// wurde -- der Autor ist ja ein Dritter (7a, G3.2).
+    #[test]
+    fn wartender_eines_inzwischen_gegangenen_geht_trotzdem_auf() {
+        let mut w = welt("inzwischen-gegangen");
+        let join = w.mitglied_join(500);
+        let join_id = to_hex(&ids::message_id(&w.gruppe, 500, &join));
+        let post = w.mitglied_post(600, &join_id, "eins");
+        let (_, post_id) = w.empfangen(1, 600, &post);
+        w.g_mut().einladungen.get_mut(&1).unwrap().zustand = Sitzungszustand::Gegangen;
+        let _ = w.empfangen(2, 500, &join);
+        assert!(w.gespeichert(&post_id));
+        assert!(w.g().wartend.is_empty());
+        assert!(!w.im_korb(1, &post_id), "nicht zurueck an den Ueberbringer");
+        assert!(w.im_korb(2, &post_id), "weitergereicht wie jeder aufgehende");
+    }
+
+    /// Bis 0.42.0 wartete ein Beitrag, dessen Autor hier kein JOIN hat, auch
+    /// bei gespeicherter voriger Nachricht (7a, G3.1). Briar kennt die
+    /// Bedingung nicht; Altbestand aus 0.41.0 kann Beitraege ohne JOIN haben.
+    #[test]
+    fn beitrag_auf_altbestand_ohne_join_wird_angenommen() {
+        let mut w = welt("ohne-join");
+        let mitglied_id = to_hex(&w.mitglied.id());
+        w.g_mut().messages.push(GroupPost {
+            id: to_hex(&[7u8; 32]),
+            author_id: mitglied_id,
+            author_name: "Mitglied".to_string(),
+            timestamp: 550,
+            text: "alt".to_string(),
+            body: String::new(),
+            join: false,
+        });
+        let post = w.mitglied_post(600, &to_hex(&[7u8; 32]), "neu");
+        let (lage, id) = w.eingang(1, 600, &post);
+        assert_eq!(lage, Gruppeneingang::Angenommen);
+        assert!(w.gespeichert(&id));
+    }
+
+    #[test]
+    fn beitrag_mit_fehlendem_elternbeitrag_wartet_und_geht_danach_auf() {
+        let mut w = welt("eltern");
+        let (_, join_id) = w.empfangen(1, 500, &w.mitglied_join(500));
+        let erster = w.mitglied_post(600, &join_id, "eins");
+        let erster_id = to_hex(&ids::message_id(&w.gruppe, 600, &erster));
+        // Die Antwort kennt ihren Elternbeitrag noch nicht.
+        let antwort = groups::post_body(
+            &w.gruppe,
+            700,
+            &w.mitglied,
+            &w.mitglied_seed,
+            Some(key_from_hex(&erster_id)),
+            &key_from_hex(&erster_id),
+            "zwei",
+        );
+        let (lage, antwort_id) = w.eingang(2, 700, &antwort);
+        assert_eq!(lage, Gruppeneingang::Wartend);
+        let (lage, _) = w.eingang(1, 600, &erster);
+        assert_eq!(lage, Gruppeneingang::Angenommen);
+        assert!(w.gespeichert(&antwort_id));
+    }
+
+    #[test]
+    fn kette_in_umgekehrter_folge_geht_ganz_auf() {
+        let mut w = welt("umgekehrt");
+        let join = w.mitglied_join(500);
+        let mut vorige = to_hex(&ids::message_id(&w.gruppe, 500, &join));
+        let mut rumpfe = Vec::new();
+        for n in 1..=5u64 {
+            let r = w.mitglied_post(500 + n * 100, &vorige, "x");
+            vorige = to_hex(&ids::message_id(&w.gruppe, 500 + n * 100, &r));
+            rumpfe.push((500 + n * 100, r, vorige.clone()));
+        }
+        for (zeit, r, _) in rumpfe.iter().rev() {
+            assert_eq!(w.eingang(1, *zeit, r).0, Gruppeneingang::Wartend);
+        }
+        assert_eq!(w.eingang(2, 500, &join).0, Gruppeneingang::Angenommen);
+        for (_, _, id) in &rumpfe {
+            assert!(w.gespeichert(id), "{} fehlt", id);
+        }
+        assert!(w.g().wartend.is_empty());
+    }
+
+    /// Die Grenze je Ueberbringer: sein 51. Wartender wird zurueckgestellt
+    /// (nicht quittiert), die eines anderen Kontakts nicht.
+    #[test]
+    fn volle_warteliste_stellt_den_neuen_zurueck() {
+        let mut w = welt("zurueck");
+        for n in 0..crate::store::MAX_WARTEND_JE_KONTAKT {
+            let r = w.post_von(40, 600 + n as u64, None, &to_hex(&[n as u8; 32]), "w");
+            assert_eq!(w.eingang(1, 600 + n as u64, &r).0, Gruppeneingang::Wartend);
+        }
+        let r = w.post_von(40, 900, None, &to_hex(&[0xEE; 32]), "zuviel");
+        let (lage, id) = w.eingang(1, 900, &r);
+        assert_eq!(lage, Gruppeneingang::Zurueckgestellt);
+        assert!(!w.g().wartend.iter().any(|x| x.id == id), "nicht gespeichert");
+        assert!(!w.g().verworfen.contains(&id), "und nicht verworfen");
+        assert_eq!(w.eingang(2, 900, &r).0, Gruppeneingang::Wartend, "Kontakt 2 hat Platz");
+    }
+
+    #[test]
+    fn wartender_speichert_seine_verweise() {
+        let mut w = welt("verweise");
+        let eltern = to_hex(&[1u8; 32]);
+        let vorige = to_hex(&[2u8; 32]);
+        let r = w.post_von(41, 600, Some(&eltern), &vorige, "v");
+        let _ = w.eingang(1, 600, &r);
+        let x = &w.g().wartend[0];
+        assert_eq!(x.previous, vorige);
+        assert_eq!(x.parent.as_deref(), Some(eltern.as_str()));
+        assert_eq!(x.author_id, to_hex(&wer("Wegwerf", 41).0.id()));
+    }
+
+    /// G3.4: Wartende auf einen verworfenen Vorgaenger fallen mit, und was
+    /// spaeter auf ihn aufbaut, faellt gleich -- quittiert, nicht wartend.
+    #[test]
+    fn verworfener_vorgaenger_nimmt_die_kette_mit() {
+        let mut w = welt("kaskade");
+        let (_, join_id) = w.empfangen(1, 500, &w.mitglied_join(500));
+        // Zeitlich VOR dem JOIN: bricht die Kette.
+        let schlecht = w.mitglied_post(400, &join_id, "zu frueh");
+        let schlecht_id = to_hex(&ids::message_id(&w.gruppe, 400, &schlecht));
+        // Zwei Beitraege darauf warten schon (kamen vorher an).
+        let a = w.mitglied_post(700, &schlecht_id, "a");
+        let (lage, a_id) = w.eingang(1, 700, &a);
+        assert_eq!(lage, Gruppeneingang::Wartend);
+        let b = groups::post_body(
+            &w.gruppe,
+            800,
+            &w.mitglied,
+            &w.mitglied_seed,
+            Some(key_from_hex(&a_id)),
+            &key_from_hex(&a_id),
+            "b",
+        );
+        let (_, b_id) = w.eingang(1, 800, &b);
+        assert_eq!(w.g().wartend.len(), 2);
+        assert_eq!(w.eingang(1, 400, &schlecht).0, Gruppeneingang::Verworfen);
+        assert!(w.g().wartend.is_empty(), "die Abhaengigen fallen mit");
+        for id in [&schlecht_id, &a_id, &b_id] {
+            assert!(w.g().verworfen.contains(id));
+        }
+        // Ein spaeterer Beitrag auf den verworfenen: gleich verworfen.
+        let c = w.mitglied_post(900, &b_id, "c");
+        assert_eq!(w.eingang(2, 900, &c).0, Gruppeneingang::Verworfen);
+        // Und der Verworfene selbst noch einmal: verworfen, nicht neu geprueft.
+        assert_eq!(w.eingang(2, 400, &schlecht).0, Gruppeneingang::Verworfen);
+    }
+
+    /// Ein Wartender aus 0.42.0 ohne Verweise faellt auch mit, wenn sein
+    /// Vorgaenger verworfen wird.
+    #[test]
+    fn wartender_aus_0_42_faellt_mit_dem_verworfenen() {
+        let mut w = welt("alt-042-kaskade");
+        let (_, join_id) = w.empfangen(1, 500, &w.mitglied_join(500));
+        let schlecht = w.mitglied_post(400, &join_id, "zu frueh");
+        let schlecht_id = to_hex(&ids::message_id(&w.gruppe, 400, &schlecht));
+        let post = w.mitglied_post(700, &schlecht_id, "danach");
+        let post_id = to_hex(&ids::message_id(&w.gruppe, 700, &post));
+        w.g_mut().wartend.push(crate::store::WartenderBeitrag {
+            id: post_id.clone(),
+            contact_id: 1,
+            timestamp: 700,
+            body: to_hex(&post),
+            ..Default::default()
+        });
+        assert_eq!(w.eingang(1, 400, &schlecht).0, Gruppeneingang::Verworfen);
+        assert!(w.g().wartend.is_empty());
+        assert!(w.g().verworfen.contains(&post_id));
+    }
+
+    /// Ein Wartender aus 0.42.0 ohne gespeicherte Verweise geht trotzdem auf.
+    #[test]
+    fn wartender_aus_0_42_ohne_verweise_geht_auf() {
+        let mut w = welt("alt-042");
+        let join = w.mitglied_join(500);
+        let join_id = to_hex(&ids::message_id(&w.gruppe, 500, &join));
+        let post = w.mitglied_post(600, &join_id, "eins");
+        let post_id = to_hex(&ids::message_id(&w.gruppe, 600, &post));
+        w.g_mut().wartend.push(crate::store::WartenderBeitrag {
+            id: post_id.clone(),
+            contact_id: 1,
+            timestamp: 600,
+            body: to_hex(&post),
+            ..Default::default()
+        });
+        let _ = w.empfangen(2, 500, &join);
+        assert!(w.gespeichert(&post_id));
+        assert!(w.g().wartend.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod stromnummer_tests {
     use super::*;
     use crate::store::TransportState;
@@ -5164,6 +6543,257 @@ mod stromnummer_tests {
             let n = naechste_stromnummer(&sender, 100);
             stromnummer_vormerken(&mut sender, 100, n);
             assert_eq!(n, runde, "Runde {}: jede Runde eine neue Marke", runde);
+        }
+    }
+
+    // --- Das volle Fenster der Kontakte, nach ReorderingWindowTest.java ---
+
+    fn fenster(z: &TransportState) -> (u64, u32) {
+        (
+            *z.in_stream.get("100").unwrap_or(&0),
+            *z.in_gesehen.get("100").unwrap_or(&0),
+        )
+    }
+
+    #[test]
+    fn fenster_rueckt_wenn_der_fusspunkt_gesehen_wird() {
+        // testWindowSlidesWhenFirstElementIsSeen
+        let mut z = TransportState::default();
+        assert!(fenster_setzen(&mut z, 100, 0, 100));
+        assert_eq!(fenster(&z), (1, 0));
+    }
+
+    #[test]
+    fn fenster_bleibt_unterhalb_der_mitte_stehen() {
+        // testWindowDoesNotSlideWhenElementBelowMidpointIsSeen
+        let mut z = TransportState::default();
+        assert!(fenster_setzen(&mut z, 100, 1, 100));
+        assert_eq!(fenster(&z), (0, 0b10));
+    }
+
+    #[test]
+    fn fenster_rueckt_oberhalb_der_mitte_regel_eins() {
+        // testWindowSlidesWhenElementAboveMidpointIsSeen: 16 gesehen -> um
+        // eins geschoben, das hoechste Element unter der Mitte (15) gesehen.
+        let mut z = TransportState::default();
+        assert!(fenster_setzen(&mut z, 100, WINDOW / 2, 100));
+        assert_eq!(fenster(&z), (1, 1 << 15));
+    }
+
+    #[test]
+    fn fenster_rueckt_bis_der_fusspunkt_ungesehen_ist_regel_zwei() {
+        // testWindowSlidesUntilLowestElementIsUnseenWhenFirstElementIsSeen
+        let mut z = TransportState::default();
+        fenster_setzen(&mut z, 100, 1, 100);
+        assert!(fenster_setzen(&mut z, 100, 0, 100));
+        assert_eq!(fenster(&z), (2, 0));
+    }
+
+    #[test]
+    fn fenster_regel_eins_und_zwei_zusammen() {
+        // testWindowSlidesUntilLowestElementIsUnseenWhenElementAboveMidpointIsSeen
+        let mut z = TransportState::default();
+        fenster_setzen(&mut z, 100, 1, 100);
+        assert!(fenster_setzen(&mut z, 100, WINDOW / 2, 100));
+        assert_eq!(fenster(&z), (2, 1 << 14));
+    }
+
+    #[test]
+    fn fenster_hoechstes_element_schiebt_um_die_halbe_breite() {
+        let mut z = TransportState::default();
+        assert!(fenster_setzen(&mut z, 100, WINDOW - 1, 100));
+        assert_eq!(fenster(&z), (16, 1 << 15), "31 landet auf der Mitte");
+    }
+
+    #[test]
+    fn fenster_weist_nummern_ausserhalb_ab() {
+        let mut z = TransportState::default();
+        fenster_setzen(&mut z, 100, 0, 100);
+        let vorher = fenster(&z);
+        assert!(!fenster_setzen(&mut z, 100, 0, 100), "unter dem Fusspunkt");
+        assert!(!fenster_setzen(&mut z, 100, 1 + WINDOW, 100), "ueber dem Fenster");
+        assert_eq!(fenster(&z), vorher, "nichts veraendert");
+        assert!(fenster_setzen(&mut z, 100, WINDOW, 100), "base+31 geht noch");
+    }
+
+    #[test]
+    fn fenster_weist_eine_gesehene_nummer_ab() {
+        let mut z = TransportState::default();
+        fenster_setzen(&mut z, 100, 3, 100);
+        let vorher = fenster(&z);
+        assert!(!fenster_setzen(&mut z, 100, 3, 100));
+        assert_eq!(fenster(&z), vorher);
+    }
+
+    #[test]
+    fn fenster_uebersteht_ein_verdorbenes_bitfeld() {
+        // Alle Bits gesetzt verletzt die Regeln; es darf trotzdem nichts
+        // abstuerzen (Schieben um 32 Bit), und das Fenster muss danach frei
+        // sein.
+        let mut z = TransportState::default();
+        z.in_gesehen.insert("100".to_string(), !(1u32 << 31));
+        assert!(fenster_setzen(&mut z, 100, 31, 100));
+        assert_eq!(fenster(&z), (32, 0));
+    }
+
+    #[test]
+    fn fenster_raeumt_fremde_abschnitte_samt_bitfeld() {
+        let mut z = TransportState::default();
+        fenster_setzen(&mut z, 98, 1, 98);
+        fenster_setzen(&mut z, 100, 1, 100);
+        assert!(!z.in_gesehen.contains_key("98"));
+        assert!(!z.in_stream.contains_key("98"));
+        assert!(z.in_gesehen.contains_key("100"));
+    }
+
+    #[test]
+    fn alte_zustandsdatei_ohne_bitfeld_laedt() {
+        let alt = r#"{"address":null,"in_stream":{"100":7}}"#;
+        let z: TransportState = serde_json::from_str(alt).unwrap();
+        assert_eq!(z.in_stream["100"], 7);
+        assert!(z.in_gesehen.is_empty(), "alles gilt als ungesehen");
+    }
+
+    // --- Erkennung mit echten Marken ---
+
+    fn speicher_mit_kontakt(name: &str) -> Store {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-fenster-test-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.state.contacts.push(crate::store::Contact {
+            id: 1,
+            name: "Probe".to_string(),
+            author_id: to_hex(&[7u8; 32]),
+            signature_public: to_hex(&[8u8; 32]),
+            handshake_public: None,
+            master_key: to_hex(&[9u8; 32]),
+            alice: true,
+            // Ein frischer Kontakt: derive_rotation_keys dreht den Schluessel
+            // von hier bis zum Abschnitt weiter. Mit 0 waeren das je Ableitung
+            // ~20 000 Drehungen, und der Taktlauf (400 Erkennungen) brauchte im
+            // Debug-Bau zehn Minuten.
+            creation_period: current_time_period().saturating_sub(2),
+            transports: Default::default(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
+        });
+        store
+    }
+
+    /// Die Marke, die der Kontakt fuer seinen Strom `nummer` schickt -- mit
+    /// seiner Rolle, also `!alice`, wie in recognise_tag.
+    fn marke(store: &Store, period: u64, nummer: u64) -> [u8; TAG_LEN] {
+        let c = &store.state.contacts[0];
+        let keys = derive_rotation_keys(
+            LAN_TRANSPORT_ID,
+            &c.master_key_bytes(),
+            c.creation_period,
+            period,
+            !c.alice,
+        );
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&encode_tag(&keys.tag_key, PROTOCOL_VERSION, nummer));
+        tag
+    }
+
+    fn erkannt(store: &mut Store, tag: &[u8]) -> Option<u64> {
+        match marke_erkennen(store, LAN_TRANSPORT_ID, tag) {
+            Some(Recognised::Contact { stream_number, .. }) => Some(stream_number),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn nicht_vermerkbare_erkennung_gilt_als_unerkannt() {
+        let mut store = speicher_mit_kontakt("nicht-vermerkbar");
+        let p = current_time_period();
+        let id = store.state.contacts[0].id;
+        let tag = marke(&store, p, 3);
+        assert_eq!(erkannt(&mut store, &tag), Some(3));
+        // Dieselbe Nummer noch einmal zum Vermerken: fenster_setzen sagt
+        // false, also darf nichts als erkannt durchgehen.
+        let erneut = Recognised::Contact {
+            id,
+            header_key: [0u8; 32],
+            stream_number: 3,
+            period: p,
+        };
+        assert!(erkennung_vermerken(&mut store, LAN_TRANSPORT_ID, erneut).is_none());
+        // Ausserhalb des Fensters ebenso.
+        let weit = Recognised::Contact {
+            id,
+            header_key: [0u8; 32],
+            stream_number: 1000,
+            period: p,
+        };
+        assert!(erkennung_vermerken(&mut store, LAN_TRANSPORT_ID, weit).is_none());
+    }
+
+    #[test]
+    fn dieselbe_marke_wird_nur_einmal_erkannt() {
+        let mut store = speicher_mit_kontakt("einmal");
+        let p = current_time_period();
+        let tag = marke(&store, p, 0);
+        assert_eq!(erkannt(&mut store, &tag), Some(0));
+        assert_eq!(erkannt(&mut store, &tag), None, "Wiederholung faellt durch");
+    }
+
+    #[test]
+    fn nebenlaeufige_stroeme_acht_dann_sieben_und_keine_wiederholung() {
+        // Der Befund: 8 endet vor 7. Frueher schob 7 den Fusspunkt auf 8
+        // zurueck, und 8 war wieder einspielbar.
+        let mut store = speicher_mit_kontakt("acht-sieben");
+        let p = current_time_period();
+        let acht = marke(&store, p, 8);
+        let sieben = marke(&store, p, 7);
+        assert_eq!(erkannt(&mut store, &acht), Some(8));
+        assert_eq!(erkannt(&mut store, &sieben), Some(7));
+        assert_eq!(erkannt(&mut store, &acht), None);
+        assert_eq!(erkannt(&mut store, &sieben), None);
+        // Die uebrigen Nummern unter 8 bleiben erkennbar.
+        let null = marke(&store, p, 0);
+        assert_eq!(erkannt(&mut store, &null), Some(0));
+    }
+
+    #[test]
+    fn erkennung_von_base_plus_31_rueckt_das_fenster() {
+        let mut store = speicher_mit_kontakt("hoechste");
+        let p = current_time_period();
+        let hoechste = marke(&store, p, 31);
+        assert_eq!(erkannt(&mut store, &hoechste), Some(31));
+        let z = store.state.contacts[0].transport(LAN_TRANSPORT_ID).unwrap();
+        assert_eq!(z.in_stream[&p.to_string()], 16);
+        // Jetzt ist 47 im Fenster, 15 darunter.
+        let (oben, unten) = (marke(&store, p, 47), marke(&store, p, 15));
+        assert_eq!(erkannt(&mut store, &oben), Some(47));
+        assert_eq!(erkannt(&mut store, &unten), None);
+    }
+
+    #[test]
+    fn kontaktfenster_laeuft_mit_dem_zaehler_im_takt() {
+        // Wie zaehler_und_fenster_laufen_im_takt, nur mit Verbrauch: jede
+        // Nummer wird genau einmal erkannt, die Wiederholung nie.
+        let mut store = speicher_mit_kontakt("takt");
+        let p = current_time_period();
+        for n in 0..200u64 {
+            let tag = marke(&store, p, n);
+            assert_eq!(erkannt(&mut store, &tag), Some(n), "Nummer {}", n);
+            assert_eq!(erkannt(&mut store, &tag), None, "Wiederholung {}", n);
         }
     }
 
@@ -5292,15 +6922,18 @@ impl Node {
             .collect();
         let genannte: Vec<String> = adressen.iter().map(|ip| ip.to_string()).collect();
         let mut beschreiber = lan_beschreiber(&adressen, port);
-        log(&format!(
-            "BQP: im Code stehen {} ({})",
-            if genannte.is_empty() {
-                "keine WLAN-Adresse".to_string()
-            } else {
-                genannte.join(", ")
-            },
-            port
-        ));
+        log_vertraulich(
+            &format!(
+                "BQP: im Code stehen {} ({})",
+                if genannte.is_empty() {
+                    "keine WLAN-Adresse".to_string()
+                } else {
+                    genannte.join(", ")
+                },
+                port
+            ),
+            &format!("BQP: im Code stehen {} WLAN-Adresse(n) ({})", genannte.len(), port),
+        );
         let verpflichtung = crate::bqp::commitment(&oeffentlich);
         let fertig = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kontakt = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -5921,7 +7554,10 @@ impl Node {
             anforderungs_runden: Default::default(),
         });
         store.save()?;
-        log(&format!("BQP: neuer Kontakt {} ({})", id, remote.name));
+        log_vertraulich(
+            &format!("BQP: neuer Kontakt {} ({})", id, remote.name),
+            &format!("BQP: neuer Kontakt {}", id),
+        );
         Ok(id)
     }
 
@@ -6712,6 +8348,99 @@ mod angebots_tests {
         );
     }
 
+    /// Ein Gruppenbeitrag, fuer den die Warteliste keinen Platz hat, wird
+    /// zurueckgestellt: er geht NICHT in die Quittung dieser Runde und nicht
+    /// in die Liste fuer die naechste -- Briar schickt ihn dann spaeter wieder.
+    /// Eine gewoehnliche Nachricht derselben Runde wird quittiert wie immer.
+    #[test]
+    fn zurueckgestellter_gruppenbeitrag_wird_nicht_quittiert() {
+        let period = current_time_period();
+        let node = knoten("zurueckgestellt", period);
+        let master = key_from_hex(IHR);
+        let gruppe: SecretKey = [0x61; 32];
+        let ersteller_seed = [0x62u8; 32];
+        {
+            let mut s = node.store.lock().unwrap();
+            let mut g = crate::store::PrivateGroup {
+                id: to_hex(&gruppe),
+                name: "voll".to_string(),
+                creator_name: "Erstellerin".to_string(),
+                creator_public: to_hex(&crate::crypto::signature_public_key(&ersteller_seed)),
+                joined: true,
+                contacts: vec![1],
+                ..Default::default()
+            };
+            for n in 0..crate::store::MAX_WARTEND_JE_KONTAKT {
+                assert!(g.warten_lassen(crate::store::WartenderBeitrag {
+                    id: format!("{:064x}", n),
+                    contact_id: 1,
+                    timestamp: 1,
+                    previous: "fehlt".to_string(),
+                    ..Default::default()
+                }));
+            }
+            s.state.groups.push(g);
+        }
+        let autor_seed = [0x63u8; 32];
+        let autor = Author {
+            name: "Wegwerf".to_string(),
+            public_key: crate::crypto::signature_public_key(&autor_seed).to_vec(),
+        };
+        let zeit = now_ms();
+        let beitrag =
+            groups::post_body(&gruppe, zeit, &autor, &autor_seed, None, &[0x64; 32], "zuviel");
+        let beitrag_id = ids::message_id(&gruppe, zeit, &beitrag);
+        let fremd: SecretKey = [9u8; 32];
+        let sonst = b"irgendwas".to_vec();
+        let sonst_id = ids::message_id(&fremd, zeit, &sonst);
+
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let gegenseite = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut roh = strom.try_clone().unwrap();
+            let mut marke = [0u8; TAG_LEN];
+            roh.read_exact(&mut marke).unwrap();
+            let ihre = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, false);
+            let unsere = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, true);
+            let mut schreiber = StreamWriter::new(strom.try_clone().unwrap(), &ihre, 0);
+            sync::write_versions(&mut schreiber).unwrap();
+            sync::write_message(&mut schreiber, &gruppe, zeit, &beitrag).unwrap();
+            sync::write_message(&mut schreiber, &fremd, zeit, &sonst).unwrap();
+            schreiber.send_end_of_stream().unwrap();
+            let mut leser = StreamReader::new(roh, unsere.header_key, 0);
+            let mut quittiert: Vec<SecretKey> = Vec::new();
+            loop {
+                match read_record(&mut leser) {
+                    Ok(Some(r)) if r.record_type == sync::ACK => {
+                        quittiert.extend(sync::parse_ids(&r.payload))
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => panic!("Lesen der Quittung: {}", e),
+                }
+            }
+            quittiert
+        });
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        node.run_sync(Conn::Tcp(strom), LAN_TRANSPORT_ID, 1, None, None, true)
+            .expect("die Runde geht durch");
+        let quittiert = gegenseite.join().unwrap();
+        assert!(quittiert.contains(&sonst_id), "die andere Nachricht wird quittiert");
+        assert!(!quittiert.contains(&beitrag_id), "der zurueckgestellte nicht");
+        let s = node.store.lock().unwrap();
+        assert!(
+            !s.contact(1).unwrap().to_ack.contains(&to_hex(&beitrag_id)),
+            "auch nicht fuer die naechste Runde vorgemerkt"
+        );
+        let g = s.group(&to_hex(&gruppe)).unwrap();
+        assert_eq!(g.wartend.len(), crate::store::MAX_WARTEND_JE_KONTAKT);
+        assert!(!g.wartend.iter().any(|w| w.id == to_hex(&beitrag_id)));
+    }
+
     /// Ein Angebot, auf das nichts folgt: die Kennung bleibt fuer die naechste
     /// Runde vorgemerkt, mit Zaehler null.
     #[test]
@@ -6856,13 +8585,246 @@ mod abgleich_tests {
 
     #[test]
     fn zweiter_handschlag_mit_demselben_wartenden_wird_abgelehnt() {
-        let erste = handschlag_beginnen("abgleich-test-abc").expect("frei");
-        assert!(handschlag_beginnen("abgleich-test-abc").is_err());
+        let erste = handschlag_beginnen("abgleich-test-abc", false, true).expect("frei");
+        assert!(handschlag_beginnen("abgleich-test-abc", false, true).is_err());
         assert!(
-            handschlag_beginnen("abgleich-test-xyz").is_ok(),
+            handschlag_beginnen("abgleich-test-xyz", false, true).is_ok(),
             "ein anderer Wartender stoert nicht"
         );
         drop(erste);
-        assert!(handschlag_beginnen("abgleich-test-abc").is_ok(), "nach dem Ende wieder frei");
+        assert!(
+            handschlag_beginnen("abgleich-test-abc", false, true).is_ok(),
+            "nach dem Ende wieder frei"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wache_tests {
+    use super::*;
+
+    /// Die Wache ist prozessweit: jeder Test nimmt seinen eigenen Schluessel.
+    fn laeuft(schluessel: &str) -> bool {
+        HANDSCHLAEGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(schluessel)
+    }
+
+    /// Ergebnis des zweiten Versuchs, wenn der erste noch laeuft:
+    /// true = uebernommen, false = abgelehnt.
+    fn zweiter(schluessel: &str, alice: bool, erst_ein: bool, dann_ein: bool) -> bool {
+        let erste = handschlag_beginnen(schluessel, erst_ein, alice).expect("frei");
+        let ergebnis = handschlag_beginnen(schluessel, dann_ein, alice);
+        match ergebnis {
+            Ok(zweite) => {
+                assert!(erste.abgeloest(), "wer uebernimmt, loest den ersten ab");
+                assert!(!zweite.abgeloest());
+                true
+            }
+            Err(_) => {
+                assert!(!erste.abgeloest(), "ein abgelehnter zweiter loest nichts ab");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn alice_ausgehend_loest_laufenden_eingehenden_ab() {
+        assert!(zweiter("wache-1", true, true, false));
+    }
+
+    #[test]
+    fn alice_lehnt_eingehenden_neben_ausgehendem_ab() {
+        assert!(!zweiter("wache-2", true, false, true));
+    }
+
+    #[test]
+    fn alice_lehnt_zweiten_eingehenden_ab() {
+        assert!(!zweiter("wache-3", true, true, true));
+    }
+
+    #[test]
+    fn alice_lehnt_zweiten_ausgehenden_ab() {
+        assert!(!zweiter("wache-4", true, false, false));
+    }
+
+    #[test]
+    fn bob_eingehend_loest_laufenden_ausgehenden_ab() {
+        assert!(zweiter("wache-5", false, false, true));
+    }
+
+    #[test]
+    fn bob_lehnt_waehlen_neben_eingehendem_ab() {
+        assert!(!zweiter("wache-6", false, true, false));
+    }
+
+    #[test]
+    fn bob_lehnt_zweiten_eingehenden_ab() {
+        assert!(!zweiter("wache-7", false, true, true));
+    }
+
+    #[test]
+    fn bob_lehnt_zweiten_ausgehenden_ab() {
+        assert!(!zweiter("wache-8", false, false, false));
+    }
+
+    /// Der abgeloeste Versuch endet meist nach seinem Nachfolger nicht --
+    /// sein Fallenlassen darf dessen Platz nicht freigeben, sonst liefe
+    /// daneben gleich wieder ein dritter.
+    #[test]
+    fn fallenlassen_des_abgeloesten_laesst_den_nachfolger_stehen() {
+        let alt = handschlag_beginnen("wache-9", false, false).expect("frei");
+        let neu = handschlag_beginnen("wache-9", true, false).expect("uebernommen");
+        drop(alt);
+        assert!(laeuft("wache-9"), "der Nachfolger haelt den Platz");
+        assert!(
+            handschlag_beginnen("wache-9", true, false).is_err(),
+            "und wehrt einen weiteren eingehenden ab"
+        );
+        drop(neu);
+        assert!(!laeuft("wache-9"), "erst der Nachfolger gibt frei");
+    }
+
+    #[test]
+    fn abgeloester_kann_nicht_mehr_festlegen() {
+        let alt = handschlag_beginnen("wache-10", true, true).expect("frei");
+        let _neu = handschlag_beginnen("wache-10", false, true).expect("uebernommen");
+        assert!(alt.festlegen().is_err());
+    }
+
+    /// Nach Beginn des Kontaktaustauschs wird nicht mehr abgeloest -- sonst
+    /// koennte die Gegenseite aus dieser Verbindung schon gespeichert haben.
+    #[test]
+    fn fester_versuch_wird_nicht_abgeloest() {
+        let alt = handschlag_beginnen("wache-11", false, false).expect("frei");
+        alt.festlegen().expect("noch nicht abgeloest");
+        assert!(handschlag_beginnen("wache-11", true, false).is_err());
+        assert!(!alt.abgeloest());
+    }
+
+    #[test]
+    fn nach_dem_ende_des_nachfolgers_wieder_frei() {
+        let alt = handschlag_beginnen("wache-12", true, true).expect("frei");
+        let neu = handschlag_beginnen("wache-12", false, true).expect("uebernommen");
+        drop(neu);
+        drop(alt);
+        assert!(handschlag_beginnen("wache-12", true, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod metadaten_tests {
+    use super::*;
+
+    fn art(vorschau: bool, deutsch: bool) -> Meldungsart {
+        Meldungsart { vorschau, deutsch }
+    }
+
+    fn text(a: Meldungsart, gruppe: bool) -> (String, String) {
+        meldungstext(a, gruppe, "Bert".to_string(), "geheimer Text".to_string())
+    }
+
+    #[test]
+    fn ohne_vorschau_weder_name_noch_text_deutsch() {
+        assert_eq!(
+            text(art(false, true), false),
+            ("Briar".to_string(), "Neue Nachricht".to_string())
+        );
+    }
+
+    #[test]
+    fn ohne_vorschau_weder_name_noch_text_englisch() {
+        assert_eq!(
+            text(art(false, false), false),
+            ("Briar".to_string(), "New message".to_string())
+        );
+    }
+
+    #[test]
+    fn ohne_vorschau_gruppenbeitrag_deutsch() {
+        assert_eq!(
+            text(art(false, true), true),
+            ("Briar".to_string(), "Neuer Gruppenbeitrag".to_string())
+        );
+    }
+
+    #[test]
+    fn ohne_vorschau_gruppenbeitrag_englisch() {
+        assert_eq!(
+            text(art(false, false), true),
+            ("Briar".to_string(), "New group post".to_string())
+        );
+    }
+
+    #[test]
+    fn mit_vorschau_absender_und_text_wie_bisher() {
+        for gruppe in [false, true] {
+            for deutsch in [false, true] {
+                assert_eq!(
+                    text(art(true, deutsch), gruppe),
+                    ("Bert".to_string(), "geheimer Text".to_string())
+                );
+            }
+        }
+    }
+
+    /// Die Sprache kommt aus dem Zustand; ohne Angabe englisch, wie die
+    /// Oberflaeche es auch haelt. Die Vorschau ist von sich aus aus.
+    #[test]
+    fn meldungsart_liest_sprache_und_vorschau_aus_dem_zustand() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-meldungsart-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        assert_eq!(Meldungsart::aus(&store), art(false, false));
+        store.state.language = Some("de".to_string());
+        store.state.notification_preview = true;
+        assert_eq!(Meldungsart::aus(&store), art(true, true));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn vertrauliche_zeile_ohne_erlaubnis_ist_die_knappe() {
+        assert_eq!(vertrauliche_zeile("voll abc.onion", "knapp", false), "knapp");
+    }
+
+    #[test]
+    fn vertrauliche_zeile_mit_erlaubnis_ist_die_volle() {
+        assert_eq!(vertrauliche_zeile("voll abc.onion", "knapp", true), "voll abc.onion");
+    }
+
+    #[test]
+    fn log_pfade_liegen_neben_dem_zustand() {
+        let (log, alt) = log_pfade(std::path::Path::new("/a/b/state.json"));
+        assert_eq!(log, std::path::PathBuf::from("/a/b/briard.log"));
+        assert_eq!(alt, std::path::PathBuf::from("/a/b/briard.log.1"));
+    }
+
+    /// Ueber die echte Protokolldatei: ohne BRIAR_LOG_VOLL steht die Kennung
+    /// nicht darin, die knappe Zeile schon. Andere Tests koennen waehrenddessen
+    /// ebenfalls hineinschreiben -- darum nur nach den eigenen Zeichenketten
+    /// suchen.
+    #[test]
+    fn log_vertraulich_schreibt_ohne_variable_keine_kennung() {
+        if log_voll() {
+            // Wer die Tests mit BRIAR_LOG_VOLL=1 laufen laesst, will die
+            // Kennungen sehen; dann gibt es hier nichts zu pruefen.
+            return;
+        }
+        let mut ordner = std::env::temp_dir();
+        ordner.push(format!("briar-logtest-{}", std::process::id()));
+        std::fs::create_dir_all(&ordner).unwrap();
+        let zustand = ordner.join("state.json");
+        log_datei_setzen(&zustand);
+        log_vertraulich(
+            "hidden service kennungxyz4711.onion",
+            "hidden service ready (logtest-4711)",
+        );
+        log_datei_loesen();
+        let inhalt = std::fs::read_to_string(log_pfade(&zustand).0).unwrap();
+        assert!(inhalt.contains("hidden service ready (logtest-4711)"), "{}", inhalt);
+        assert!(!inhalt.contains("kennungxyz4711"), "{}", inhalt);
+        let _ = std::fs::remove_dir_all(&ordner);
     }
 }

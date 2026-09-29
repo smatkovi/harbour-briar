@@ -9,14 +9,16 @@ is **not a port of Briar's code**. It is a fresh implementation of Briar's
 Sailfish OS, `com.nokia.meego` on Harmattan.
 
 Both interfaces talk to the same daemon (`briard`) over a small HTTP interface
-on `127.0.0.1:8105`, the same shape the WhatsApp and Signal ports on these
-devices use.
+on a Unix socket, `api.sock` beside its `state.json` (see "The interface"
+below). Until 0.41.0 it listened on `127.0.0.1:8105`; a socket is out of reach
+of web pages and, with the directory at 0700, of other accounts on the device.
 
 **It interoperates because every layer is checked against Briar's own bytes**,
 not because it looks similar. `vectors/java/` loads the real classes out of
 Briar's fat jar (briar-headless 1.5.20) and prints their output as
-`key=hex`; `cargo test` in `kern/` compares the Rust side against that, layer
-by layer. Without those vectors a reimplementation is guesswork.
+`key=hex`; `cargo test --locked` in `kern/` compares the Rust side against
+that, layer by layer (`--locked`: exactly the crates in the checked-in
+`Cargo.lock`). Without those vectors a reimplementation is guesswork.
 
 ## Status
 
@@ -199,6 +201,23 @@ src/imageprep.h                                    scaling images (Qt 4 and 5)
 vectors/    reference bytes from bramble-core
 tools/      building, packaging, installing
 ```
+
+## The interface
+
+The daemon answers HTTP/1.0 on `~/.local/share/harbour-briar/api.sock` (next
+to `state.json`; `--state` moves both, `--api-socket` only the socket). Every
+request needs the secret the daemon writes to `api-token` in the same
+directory at each start:
+
+```sh
+D=~/.local/share/harbour-briar
+curl --unix-socket $D/api.sock -H "Authorization: Bearer $(cat $D/api-token)" \
+     http://localhost/status
+```
+
+TCP on `127.0.0.1` is for tests only: it needs both `--api-port <port>` and
+`BRIAR_API_TCP=1` in the environment. Without the variable `--api-port` opens
+no port — an interface up to 0.41.0 still passes it when it starts the daemon.
 
 ## Building
 

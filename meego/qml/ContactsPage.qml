@@ -151,6 +151,7 @@ Page {
         spacing: 12
 
         Label {
+            textFormat: Text.PlainText
             text: fenster.zustand.identity
                   ? fenster.tr("briar") + " – " + fenster.zustand.identity.name
                   : fenster.tr("briar")
@@ -159,6 +160,7 @@ Page {
         }
 
         Label {
+            textFormat: Text.PlainText
             visible: fenster.fehler.length > 0
             text: fenster.fehler
             width: parent.width
@@ -171,6 +173,7 @@ Page {
         // Pufferbatterie setzt die Uhr auf 1970. Dann kommt nichts mehr an,
         // ohne dass es jemand merkt -- die Gegenseite quittiert und verwirft.
         Label {
+            textFormat: Text.PlainText
             visible: !!fenster.zustand.clockWrong
             text: fenster.tr("clockWrong")
             width: parent.width
@@ -222,6 +225,7 @@ Page {
                 width: parent.width - 32
 
                 Label {
+                    textFormat: Text.PlainText
                     // Ungelesenes gehoert an den Namen: der Dienst rechnet es
                     // je Kontakt, angezeigt hat es bisher keine der beiden
                     // Oberflaechen.
@@ -232,6 +236,7 @@ Page {
                     color: modelData.unread > 0 ? "#95d220" : "white"
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: modelData.lastText
                           ? modelData.lastText
                           : (modelData.address ? modelData.address
@@ -271,6 +276,7 @@ Page {
                     width: liste.width
                     height: 56
                     Label {
+                        textFormat: Text.PlainText
                         width: liste.width - 32
                         x: 16
                         anchors.verticalCenter: parent.verticalCenter
@@ -293,6 +299,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 visible: fenster.zustand.contacts.length === 0
                          && fenster.zustand.pending.length === 0
                          && !!fenster.zustand.identity

@@ -23,9 +23,12 @@ for target in aarch64-unknown-linux-musl armv7-unknown-linux-musleabi i686-unkno
     rustup target list --installed | grep -qx "$target" || rustup target add "$target"
     # Only Sailfish gets the notification side: it needs D-Bus, and
     # Harmattan has no org.freedesktop.Notifications at all.
+    # --locked: genau die Fassungen aus dem eingecheckten Cargo.lock. Ohne
+    # das loest cargo bei einer Luecke neu auf und baut still eine andere
+    # Kiste ein, als geprueft wurde; so bricht es stattdessen ab.
     case $target in
-        aarch64-*|i686-*) cargo build --release --target "$target" --features sfos ;;
-        *)                cargo build --release --target "$target" ;;
+        aarch64-*|i686-*) cargo build --locked --release --target "$target" --features sfos ;;
+        *)                cargo build --locked --release --target "$target" ;;
     esac
 done
 cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/briard" "$OUT/briard-aarch64"

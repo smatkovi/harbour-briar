@@ -3,6 +3,15 @@
 //! Type bytes and the canonical ordering of dictionary keys are taken from
 //! BdfWriterImpl/BdfReaderImpl -- they are part of the wire format, because
 //! message identifiers are hashes over these bytes.
+//!
+//! Der Leser ist so streng wie Briars kanonischer (BdfReaderImpl mit
+//! canonical = true, so erzeugt ihn BdfReaderFactoryImpl): Ganzzahlen und
+//! Laengen in der kleinsten Form, Woerterbuchschluessel streng aufsteigend,
+//! hoechstens fuenf Ebenen, hoechstens 64 KiB je Zeichenkette oder Rohfolge,
+//! UTF-8 streng, und `from_bytes` nimmt keine Bytes hinter dem Wert an. Was
+//! Briar verwirft, verwerfen wir auch -- sonst naehmen wir Nachrichten an,
+//! die Briar-Geraete nicht weitergeben, und zeigten sie womoeglich anders.
+//! Gleitkommazahlen prueft Briar nicht (readDouble), wir auch nicht.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -45,7 +54,8 @@ pub enum Bdf {
     Str(String),
     Raw(Vec<u8>),
     List(Vec<Bdf>),
-    /// A BTreeMap, because the writer demands keys in sorted order.
+    /// Eine BTreeMap, weil der Schreiber die Schluessel geordnet ausgeben
+    /// muss -- in UTF-16-Ordnung, siehe `write`.
     Dict(BTreeMap<String, Bdf>),
 }
 
@@ -123,13 +133,27 @@ pub fn write(out: &mut impl Write, value: &Bdf) -> std::io::Result<()> {
         }
         Bdf::Dict(entries) => {
             out.write_all(&[DICTIONARY])?;
-            for (k, v) in entries {
+            // Die BTreeMap ordnet nach Bytes, also nach Codepunkten; Briar
+            // ordnet nach Java-Strings, also nach UTF-16-Einheiten
+            // (BdfWriterImpl.writeDictionary ueber eine TreeMap). Die beiden
+            // weichen nur ab, wenn ein Zeichen ausserhalb der BMP (Surrogat
+            // 0xD800..) auf eines zwischen U+E000 und U+FFFF trifft -- dann
+            // wuerde Briars kanonischer Leser unser Woerterbuch verwerfen.
+            let mut sortiert: Vec<(&String, &Bdf)> = entries.iter().collect();
+            sortiert.sort_by(|a, b| utf16_ordnung(a.0, b.0));
+            for (k, v) in sortiert {
                 write(out, &Bdf::Str(k.clone()))?;
                 write(out, v)?;
             }
             out.write_all(&[END])
         }
     }
+}
+
+/// Die Reihenfolge von Java's `String.compareTo`: lexikographisch ueber die
+/// UTF-16-Einheiten.
+fn utf16_ordnung(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
 }
 
 fn write_int(out: &mut impl Write, i: i64) -> std::io::Result<()> {
@@ -248,9 +272,17 @@ impl<R: Read> Reader<R> {
             FALSE => Ok(Bdf::Bool(false)),
             TRUE => Ok(Bdf::Bool(true)),
             INT_8 => Ok(Bdf::Int(self.read_byte()? as i8 as i64)),
+            // Briar liest kanonisch (BdfReaderImpl.readInt16/32/64 mit
+            // canonical = true): ein Wert, der in die naechstkleinere Form
+            // gepasst haette, ist ein Formfehler. Sonst haette dieselbe Zahl
+            // mehrere Kodierungen und dieselbe Nachricht mehrere Kennungen.
             INT_16 => {
                 let b = self.read_exact_vec(2)?;
-                Ok(Bdf::Int(crate::util::read_u16(&b) as i16 as i64))
+                let v = crate::util::read_u16(&b) as i16 as i64;
+                if (i8::MIN as i64..=i8::MAX as i64).contains(&v) {
+                    return Err(bad("BDF INT_16 is not canonical"));
+                }
+                Ok(Bdf::Int(v))
             }
             INT_32 => {
                 let b = self.read_exact_vec(4)?;
@@ -258,11 +290,19 @@ impl<R: Read> Reader<R> {
                     | ((b[1] as u32) << 16)
                     | ((b[2] as u32) << 8)
                     | b[3] as u32;
-                Ok(Bdf::Int(v as i32 as i64))
+                let v = v as i32 as i64;
+                if (i16::MIN as i64..=i16::MAX as i64).contains(&v) {
+                    return Err(bad("BDF INT_32 is not canonical"));
+                }
+                Ok(Bdf::Int(v))
             }
             INT_64 => {
                 let b = self.read_exact_vec(8)?;
-                Ok(Bdf::Int(crate::util::read_u64(&b) as i64))
+                let v = crate::util::read_u64(&b) as i64;
+                if (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                    return Err(bad("BDF INT_64 is not canonical"));
+                }
+                Ok(Bdf::Int(v))
             }
             FLOAT_64 => {
                 let b = self.read_exact_vec(8)?;
@@ -294,6 +334,11 @@ impl<R: Read> Reader<R> {
             DICTIONARY => {
                 self.hinein()?;
                 let mut m = std::collections::BTreeMap::new();
+                // Briars readDictionary: Schluessel streng aufsteigend nach
+                // String.compareTo, also auch keine doppelten. Frueher
+                // ueberschrieb ein zweiter gleicher Schluessel still den
+                // ersten -- Briar verwirft so etwas.
+                let mut voriger: Option<String> = None;
                 loop {
                     let t = self.read_byte()?;
                     if t == END {
@@ -304,7 +349,13 @@ impl<R: Read> Reader<R> {
                         Bdf::Str(s) => s,
                         _ => return Err(bad("dictionary key is not a string")),
                     };
+                    if let Some(v) = &voriger {
+                        if utf16_ordnung(&key, v) != std::cmp::Ordering::Greater {
+                            return Err(bad("BDF dictionary keys not sorted and unique"));
+                        }
+                    }
                     let value = self.read()?;
+                    voriger = Some(key.clone());
                     m.insert(key, value);
                 }
             }
@@ -370,8 +421,22 @@ fn bad(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
 }
 
+/// Genau ein Wert und nichts dahinter. Briar prueft das ueberall, wo ein
+/// Rumpf gelesen wird (ClientHelperImpl.toList: `if (!reader.eof()) throw
+/// new FormatException()`, ebenso PayloadParserImpl.parse fuer den QR-Code):
+/// angehaengte Bytes gingen sonst nicht in die Pruefung ein, lagen aber in
+/// der Nachrichtenkennung.
 pub fn from_bytes(b: &[u8]) -> std::io::Result<Bdf> {
     let mut r = Reader::new(b);
     let v = r.read()?;
+    if !r.at_eof() {
+        return Err(bad("bytes after the BDF value"));
+    }
     Ok(v)
+}
+
+/// Ein Wert am Anfang, der Rest bleibt ungelesen -- nur fuer Anhaenge, deren
+/// Daten hinter der Beschreibung stehen (sync::attachment_body).
+pub fn from_bytes_prefix(b: &[u8]) -> std::io::Result<Bdf> {
+    Reader::new(b).read()
 }

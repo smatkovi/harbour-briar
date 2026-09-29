@@ -54,6 +54,7 @@ Page {
             spacing: 14
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 font.pixelSize: 26
                 font.bold: true
@@ -61,6 +62,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 font.pixelSize: 18
@@ -69,6 +71,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 font.pixelSize: 18
@@ -106,6 +109,7 @@ Page {
                     }
                 }
                 Label {
+                    textFormat: Text.PlainText
                     anchors { top: balken.bottom; topMargin: 2 }
                     font.pixelSize: 14
                     color: "#a0a0a0"
@@ -125,6 +129,7 @@ Page {
             }
 
             Label {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 horizontalAlignment: Text.AlignHCenter

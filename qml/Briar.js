@@ -3,6 +3,7 @@
 // thing they share is the daemon.
 .pragma library
 
+// Nur noch der Rueckfall ohne Bruecke, siehe anfrage().
 var base = "http://127.0.0.1:8105"
 
 // Qt 4.7's QML engine on Harmattan has no JSON object. Both front ends share
@@ -78,12 +79,38 @@ function geheimnisHolen() {
     return geheimnis
 }
 
+// Seit 0.42.0 lauscht der Dienst auf einem Unix-Sockel (api.sock neben der
+// state.json), nicht mehr auf 127.0.0.1:8105 -- den erreichte jede Webseite
+// im Browser. XMLHttpRequest kann keinen Sockel, also schickt die C++-Seite
+// die Anfrage (Daemon.anfrage / dienst.anfrage) und meldet die Antwort als
+// Signal zurueck, das die QML-Wurzel an antwortErhalten weitergibt. Gesetzt
+// wird die Bruecke wie die Geheimnisquelle als Eigenschafts-Bindung der
+// Wurzel. Ohne Bruecke (Werkzeuge, qmlscene) geht es wie frueher ueber
+// XMLHttpRequest an base -- das braucht einen Dienst mit --api-port.
+var bruecke = null
+// Die Rueckrufe der laufenden Anfragen, nach ihrer Nummer.
+var offen = {}
+var naechsteId = 1
+
+function brueckeSetzen(obj) {
+    bruecke = obj
+    return true
+}
+
+/** Von der Wurzel gerufen, wenn die Bruecke eine Antwort meldet. */
+function antwortErhalten(nummer, code, rumpf) {
+    var auswerten = offen[nummer]
+    if (!auswerten)
+        return
+    delete offen[nummer]
+    auswerten(code, rumpf)
+}
+
 function request(method, path, body, callback) {
     anfrage(method, path, body, callback, true)
 }
 
 function anfrage(method, path, body, callback, nochmal) {
-    var xhr = new XMLHttpRequest()
     // Der Rueckruf muss genau einmal kommen -- auch wenn Zeitgrenze und
     // Antwort sich ueberholen.
     var erledigt = false
@@ -93,9 +120,53 @@ function anfrage(method, path, body, callback, nochmal) {
         erledigt = true
         callback(antwort)
     }
+    // Fuer beide Wege gleich: Status und Text der Antwort.
+    function auswerten(status, text) {
+        if (status === 200) {
+            var answer = {}
+            try {
+                answer = parse(text)
+            } catch (e) {
+                answer = { error: "the daemon sent nonsense: " + text }
+            }
+            fertig(answer)
+        } else if (status === 401 && nochmal) {
+            // Ein neuer Dienst, ein neues Geheimnis: einmal frisch lesen und
+            // die Anfrage wiederholen. Kommt wieder 401, war es das.
+            if (erledigt)
+                return
+            erledigt = true
+            geheimnis = ""
+            anfrage(method, path, body, callback, false)
+        } else {
+            // Kommt gar nichts (Status 0), ist der Dienst weg oder neu -- das
+            // Geheimnis dann lieber neu lesen, denn Qt 4.7 meldet womoeglich
+            // auch ein 401 als 0. Die Bruecke meldet 0 auch nach ihrer
+            // Zeitgrenze (90 s wie ZEITGRENZE).
+            if (status === 0)
+                geheimnis = ""
+            fertig({ error: status === 0
+                      ? "der Dienst antwortet nicht"
+                      : (status === 401
+                         ? "die Oberflaeche hat kein Geheimnis fuer den Dienst"
+                         : "Fehler " + status) })
+        }
+    }
+
+    var g = geheimnisHolen()
+    var rumpf = body === null ? "" : stringify(body)
+    if (bruecke) {
+        var id = naechsteId++
+        // Erst merken, dann schicken: die Antwort darf nie vor dem Eintrag
+        // da sein.
+        offen[id] = auswerten
+        bruecke.anfrage(id, method, path, rumpf, g)
+        return
+    }
+
+    var xhr = new XMLHttpRequest()
     xhr.open(method, base + path)
     xhr.setRequestHeader("Content-Type", "application/json")
-    var g = geheimnisHolen()
     if (g !== "") {
         // Zwei Schreibweisen: Qt 4.7 laesst nicht jeden Kopf durch.
         xhr.setRequestHeader("Authorization", "Bearer " + g)
@@ -110,37 +181,9 @@ function anfrage(method, path, body, callback, nochmal) {
     xhr.onreadystatechange = function() {
         if (xhr.readyState !== 4)
             return
-        if (xhr.status === 200) {
-            var answer = {}
-            try {
-                answer = parse(xhr.responseText)
-            } catch (e) {
-                answer = { error: "the daemon sent nonsense: " + xhr.responseText }
-            }
-            fertig(answer)
-        } else if (xhr.status === 401 && nochmal) {
-            // Ein neuer Dienst, ein neues Geheimnis: einmal frisch lesen und
-            // die Anfrage wiederholen. Kommt wieder 401, war es das.
-            if (erledigt)
-                return
-            erledigt = true
-            geheimnis = ""
-            anfrage(method, path, body, callback, false)
-        } else {
-            // status 0 means the daemon is not up yet
-            // Kommt gar nichts (Status 0), ist der Dienst weg oder neu -- das
-            // Geheimnis dann lieber neu lesen, denn Qt 4.7 meldet womoeglich
-            // auch ein 401 als 0.
-            if (xhr.status === 0)
-                geheimnis = ""
-            fertig({ error: xhr.status === 0
-                      ? "der Dienst antwortet nicht"
-                      : (xhr.status === 401
-                         ? "die Oberflaeche hat kein Geheimnis fuer den Dienst"
-                         : "Fehler " + xhr.status) })
-        }
+        auswerten(xhr.status, xhr.responseText)
     }
-    xhr.send(body === null ? "" : stringify(body))
+    xhr.send(rumpf)
 }
 
 function status(callback) {
@@ -164,8 +207,8 @@ function klartext(fehler) {
 // Protokoll. Fuer die Oberflaeche ist beides "so nicht".
 // Bevor ein Passwort ueber die Leitung geht, muss der Dienst sich frisch
 // ausgewiesen haben: das Geheimnis wird neu geholt, und die Quelle gibt es
-// nur heraus, wenn der Dienst auf dem Port den Nachweis darueber liefert
-// (Daemon.token / dienst.token). Ein Fremder auf dem Port bekommt so weder
+// nur heraus, wenn der Dienst auf dem Sockel den Nachweis darueber liefert
+// (Daemon.token / dienst.token). Ein Fremder am Sockel bekommt so weder
 // Geheimnis noch Passwort.
 function ausgewiesen(callback) {
     geheimnis = ""
@@ -305,12 +348,25 @@ function qrPayload(status) {
 }
 
 // The other direction: what a photographed code holds.
+//
+// Nur ein Kontaktlink kommt hierher: briar:// und 53 Zeichen Base32, wie
+// HandshakeLinkConstants.java:27 (LINK_REGEX) und qrPayload oben ihn
+// schreiben. Der zweite Code, den es gibt -- der zum Treffen (BQP) --, ist
+// kein Text; wo die Bytes vorliegen, erkennen die ScanPages ihn vorher
+// (istBqp). MeeScan auf dem N9 liefert nur Text -- dort faellt er hier
+// durch, wie jeder fremde Code.
+// Alles andere gibt einen leeren Link, und die Seiten sagen "kein
+// Briar-Code", statt beliebigen Text in AddContactPage zu tragen.
 function qrParse(text) {
     var result = { link: "", address: "", bluetooth: "", onion: "" }
     if (!text)
         return result
+    text = ("" + text).trim()
     var cut = text.indexOf("?")
-    result.link = (cut < 0 ? text : text.substring(0, cut)).trim()
+    var link = (cut < 0 ? text : text.substring(0, cut)).trim()
+    if (!/^briar:\/\/[a-z2-7]{53}$/i.test(link))
+        return result
+    result.link = link
     if (cut >= 0) {
         var pairs = text.substring(cut + 1).split("&")
         for (var i = 0; i < pairs.length; i++) {

@@ -81,6 +81,7 @@ Page {
             spacing: 12
 
             Label {
+                textFormat: Text.PlainText
                 text: fenster.tr("newGroup")
                 font.pixelSize: 30
                 color: "white"
@@ -107,6 +108,7 @@ Page {
 
     Label {
         id: kopf
+        textFormat: Text.PlainText
         anchors { top: parent.top; left: parent.left; margins: 16 }
         text: fenster.tr("groups")
         font.pixelSize: 32
@@ -131,11 +133,13 @@ Page {
                 width: parent.width - 32
 
                 Label {
+                    textFormat: Text.PlainText
                     text: modelData.name
                     font.pixelSize: 26
                     color: "white"
                 }
                 Label {
+                    textFormat: Text.PlainText
                     width: parent.width
                     elide: Text.ElideRight
                     font.pixelSize: 20
@@ -151,6 +155,7 @@ Page {
                 // Die Antwort der Gegenseite. Eigene Zeile, weil der Platz in
                 // der Zeile darueber schon vergeben ist.
                 Label {
+                    textFormat: Text.PlainText
                     width: parent.width
                     visible: modelData.event ? true : false
                     elide: Text.ElideRight
@@ -193,6 +198,7 @@ Page {
         }
 
         footer: Label {
+            textFormat: Text.PlainText
             visible: seite.gruppen.length === 0
             x: 16
             width: liste.width - 32

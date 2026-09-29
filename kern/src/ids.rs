@@ -84,13 +84,27 @@ pub fn raw_message(group_id: &SecretKey, timestamp: u64, body: &[u8]) -> Vec<u8>
     raw
 }
 
+/// Kopf einer Nachricht auf der Leitung: Gruppenkennung und Zeitstempel.
+pub const MESSAGE_HEADER_LEN: usize = ID_LEN + 8;
+/// Die groesste Nachricht, die Briar liest: Kopf plus 32 KiB Rumpf
+/// (SyncConstants.MAX_MESSAGE_LENGTH).
+pub const MAX_MESSAGE_LEN: usize = MESSAGE_HEADER_LEN + crate::sync::MAX_MESSAGE_BODY_LEN;
+
+/// Eine Nachricht vom Satz zerlegen -- mit Briars Pruefungen
+/// (SyncRecordReaderImpl.readMessage, Z. 124-137): nicht nur Kopf, nicht
+/// laenger als MAX_MESSAGE_LEN, Zeitstempel nicht negativ. Der Satz selbst
+/// darf 48 KiB tragen; ohne die Grenze hier nahmen wir Nachrichten an, an
+/// denen jedes Briar-Geraet, dem wir sie weiterreichen, die Sitzung abbricht.
 pub fn parse_raw_message(raw: &[u8]) -> Option<(SecretKey, u64, Vec<u8>)> {
-    if raw.len() <= ID_LEN + 8 {
+    if raw.len() <= MESSAGE_HEADER_LEN || raw.len() > MAX_MESSAGE_LEN {
         return None;
     }
     let mut group = [0u8; 32];
     group.copy_from_slice(&raw[..ID_LEN]);
     let timestamp = crate::util::read_u64(&raw[ID_LEN..ID_LEN + 8]);
+    if timestamp > i64::MAX as u64 {
+        return None;
+    }
     Some((group, timestamp, raw[ID_LEN + 8..].to_vec()))
 }
 
@@ -141,4 +155,41 @@ pub fn parse_handshake_link(link: &str) -> Option<[u8; 32]> {
 
 pub fn pending_contact_id(handshake_public_key: &[u8; 32]) -> SecretKey {
     crypto::hash(HANDSHAKE_KEY_ID_LABEL, &[handshake_public_key])
+}
+
+#[cfg(test)]
+mod laengen_tests {
+    use super::*;
+
+    fn roh(rumpf: usize, zeit: u64) -> Vec<u8> {
+        let mut r = vec![3u8; ID_LEN];
+        let mut t = [0u8; 8];
+        crate::util::write_u64(&mut t, zeit);
+        r.extend_from_slice(&t);
+        r.extend(std::iter::repeat(0u8).take(rumpf));
+        r
+    }
+
+    #[test]
+    fn nachricht_mit_voller_rumpflaenge_wird_gelesen() {
+        let (_, zeit, rumpf) =
+            parse_raw_message(&roh(crate::sync::MAX_MESSAGE_BODY_LEN, 5)).unwrap();
+        assert_eq!(zeit, 5);
+        assert_eq!(rumpf.len(), crate::sync::MAX_MESSAGE_BODY_LEN);
+    }
+
+    #[test]
+    fn zu_lange_nachricht_wird_verworfen() {
+        assert!(parse_raw_message(&roh(crate::sync::MAX_MESSAGE_BODY_LEN + 1, 5)).is_none());
+    }
+
+    #[test]
+    fn nachricht_ohne_rumpf_wird_verworfen() {
+        assert!(parse_raw_message(&roh(0, 5)).is_none());
+    }
+
+    #[test]
+    fn negativer_zeitstempel_wird_verworfen() {
+        assert!(parse_raw_message(&roh(4, 1u64 << 63)).is_none());
+    }
 }

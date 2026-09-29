@@ -192,6 +192,17 @@ impl Siegel {
         aus.extend_from_slice(&geheim);
         aus
     }
+
+    /// Das Gegenstueck zu `verschluesseln`, mit dem gehaltenen Schluessel --
+    /// **kein** scrypt. Gebraucht fuer die versiegelten Anhaenge, die bei
+    /// jedem Anzeigen gelesen werden. Salz und Paket im Kopf der Datei werden
+    /// uebergangen: sie gehoeren zu dem Passwort, unter dem die Datei
+    /// geschrieben wurde, und der Speicherschluessel darunter ist derselbe.
+    pub fn entschluesseln(&self, rohdaten: &[u8]) -> Result<Vec<u8>, String> {
+        let (_, _, _, _, _, nonce, geheim) = zerlegen(rohdaten)?;
+        secretbox_decrypt(&self.speicherschluessel, &nonce, &geheim)
+            .ok_or_else(|| "beschaedigte Datei oder fremder Schluessel".to_string())
+    }
 }
 
 impl Drop for Siegel {
@@ -296,6 +307,40 @@ mod tests {
         // Die Nonce dagegen MUSS sich aendern: gleicher Schluessel und gleiche
         // Nonce gaeben beide Klartexte preis.
         assert_ne!(a[bis..bis + NONCE_BYTES], b[bis..bis + NONCE_BYTES]);
+    }
+
+    #[test]
+    fn entschluesseln_mit_gehaltenem_schluessel() {
+        let siegel = Siegel::frisch("geheim").unwrap();
+        let datei = siegel.verschluesseln(b"Anhang");
+        assert_eq!(siegel.entschluesseln(&datei).unwrap(), b"Anhang");
+        // Dasselbe Format wie die Speicherdatei: auch oeffnen() liest es.
+        let (klar, _) = Siegel::oeffnen(&datei, "geheim").unwrap();
+        assert_eq!(klar, b"Anhang");
+    }
+
+    #[test]
+    fn entschluesseln_nach_passwortwechsel() {
+        // Der Speicherschluessel bleibt beim Wechsel -- alte Dateien bleiben
+        // ohne Umschreiben lesbar.
+        let alt = Siegel::frisch("alt").unwrap();
+        let datei = alt.verschluesseln(b"Anhang");
+        let neu = alt.neu_verpacken("neu").unwrap();
+        assert_eq!(neu.entschluesseln(&datei).unwrap(), b"Anhang");
+    }
+
+    #[test]
+    fn entschluesseln_lehnt_fremdes_ab() {
+        let a = Siegel::frisch("a").unwrap();
+        let b = Siegel::frisch("b").unwrap();
+        let datei = a.verschluesseln(b"Anhang");
+        assert!(b.entschluesseln(&datei).is_err(), "fremder Schluessel");
+        let mut kaputt = datei.clone();
+        let letzte = kaputt.len() - 1;
+        kaputt[letzte] ^= 1;
+        assert!(a.entschluesseln(&kaputt).is_err(), "verfaelscht");
+        assert!(a.entschluesseln(b"BRIARTR2kurz").is_err(), "zu kurz");
+        assert!(a.entschluesseln(b"").is_err(), "leer");
     }
 
     #[test]

@@ -29,16 +29,19 @@ Page {
         spacing: 8
 
         Label {
+            textFormat: Text.PlainText
             text: fenster.tr("revealWho")
             font.pixelSize: 32
             color: "white"
         }
         Label {
+            textFormat: Text.PlainText
             text: seite.name
             font.pixelSize: 22
             color: "#a0a0a0"
         }
         Label {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.Wrap
             text: fenster.tr("revealHint")
@@ -48,6 +51,7 @@ Page {
     }
 
     Label {
+        textFormat: Text.PlainText
         anchors { top: kopf.bottom; topMargin: 24; left: parent.left
                   right: parent.right; margins: 16 }
         visible: seite.kandidaten.length === 0
@@ -69,6 +73,7 @@ Page {
             height: 72
 
             Label {
+                textFormat: Text.PlainText
                 anchors { left: parent.left; leftMargin: 16
                           verticalCenter: parent.verticalCenter }
                 text: modelData.name

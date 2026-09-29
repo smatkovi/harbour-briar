@@ -59,16 +59,35 @@ impl Author {
         ])
     }
 
+    /// Liest einen Autor und prueft ihn wie Briars
+    /// ClientHelperImpl.parseAndValidateAuthor (Z. 378-393): Name 1 bis 50
+    /// Byte UTF-8, Schluessel ein Ed25519-Schluessel. Ohne die Pruefung nahmen
+    /// wir einen Beitrag mit langem Namen an und reichten ihn an
+    /// Briar-Mitglieder weiter -- deren Sitzung brach an diesem Satz ab, jede
+    /// Runde neu (7a, G4).
     pub fn from_bdf(value: &Bdf) -> Option<Author> {
         let items = value.as_list()?;
         if items.len() != 3 || items[0].as_int()? != ids::AUTHOR_FORMAT_VERSION as i64 {
             return None;
         }
+        let name = items[1].as_str()?;
+        let public_key = items[2].as_raw()?;
+        if !autor_gueltig(name, public_key) {
+            return None;
+        }
         Some(Author {
-            name: items[1].as_str()?.to_string(),
-            public_key: items[2].as_raw()?.to_vec(),
+            name: name.to_string(),
+            public_key: public_key.to_vec(),
         })
     }
+}
+
+/// Name 1..=MAX_AUTHOR_NAME_LEN Byte (UTF-8, wie ValidationUtils.checkLength
+/// zaehlt) und ein Signaturschluessel von 32 Byte -- Briars EdKeyParser nimmt
+/// keine andere Laenge.
+pub fn autor_gueltig(name: &str, public_key: &[u8]) -> bool {
+    (1..=crate::sync::MAX_AUTHOR_NAME_LEN).contains(&name.len())
+        && public_key.len() == crypto::KEY_LEN
 }
 
 /// The group descriptor: creator, name, salt -- and from it the group id.
@@ -203,7 +222,18 @@ fn raw32(value: &Bdf) -> Option<SecretKey> {
 
 /// Parses a group message and checks its signature, which is what makes the
 /// member's authorship worth anything.
-pub fn parse_body(group: &SecretKey, timestamp: u64, body: &[u8]) -> Option<GroupMessage> {
+///
+/// Ein JOIN wird wie in Briars GroupMessageValidator.validateJoin (Zeile
+/// 86-140) geprueft: der Ersteller tritt ohne Einladung bei, jeder andere nur
+/// mit einer, die der Ersteller unterschrieben hat und die echt vor dem JOIN
+/// liegt. Ohne diese Pruefung konnte jeder, der die Gruppenkennung kennt, sich
+/// selbst zum Mitglied erklaeren -- und wir reichten seine Beitraege weiter.
+pub fn parse_body(
+    group: &SecretKey,
+    creator: &Author,
+    timestamp: u64,
+    body: &[u8],
+) -> Option<GroupMessage> {
     let list = crate::bdf::from_bytes(body).ok()?;
     let items = list.as_list()?;
     match items.first()?.as_int()? {
@@ -214,12 +244,38 @@ pub fn parse_body(group: &SecretKey, timestamp: u64, body: &[u8]) -> Option<Grou
             let member = Author::from_bdf(&items[1])?;
             let invite = match &items[2] {
                 Bdf::Null => None,
-                Bdf::List(parts) if parts.len() == 2 => Some((
-                    parts[0].as_int()? as u64,
-                    parts[1].as_raw()?.to_vec(),
-                )),
+                Bdf::List(parts) if parts.len() == 2 => {
+                    // Briar liest den Zeitstempel als long; ein negativer
+                    // waere dort kleiner als jeder JOIN-Zeitstempel, bei uns
+                    // nach `as u64` riesig. Also gleich verwerfen.
+                    let t = parts[0].as_int()?;
+                    if t < 0 {
+                        return None;
+                    }
+                    Some((t as u64, parts[1].as_raw()?.to_vec()))
+                }
                 _ => return None,
             };
+            if member == *creator {
+                if invite.is_some() {
+                    return None;
+                }
+            } else {
+                let (invite_timestamp, creator_signature) = invite.as_ref()?;
+                if timestamp <= *invite_timestamp {
+                    return None;
+                }
+                if !verify_invite_signature(
+                    &creator.public_key,
+                    &creator.id(),
+                    &member.id(),
+                    group,
+                    *invite_timestamp,
+                    creator_signature,
+                ) {
+                    return None;
+                }
+            }
             let signature = items[3].as_raw()?;
             let invite_bdf = match &invite {
                 Some((t, s)) => Bdf::List(vec![Bdf::Int(*t as i64), Bdf::Raw(s.clone())]),
@@ -282,6 +338,25 @@ pub fn parse_body(group: &SecretKey, timestamp: u64, body: &[u8]) -> Option<Grou
         }
         _ => None,
     }
+}
+
+/// Worauf ein POST verweist: Autor, Elternbeitrag, vorige Nachricht -- ohne
+/// die Signatur zu pruefen. Nur fuer die Warteliste: dort liegen Beitraege,
+/// die `parse_body` schon einmal bestanden haben, und bei jedem angenommenen
+/// Beitrag wird die ganze Liste erneut angesehen. Die teure Pruefung kommt
+/// erst, wenn alles da ist, worauf der Beitrag wartet.
+pub fn post_verweise(body: &[u8]) -> Option<(SecretKey, Option<SecretKey>, SecretKey)> {
+    let list = crate::bdf::from_bytes(body).ok()?;
+    let items = list.as_list()?;
+    if items.len() != 6 || items.first()?.as_int()? != POST {
+        return None;
+    }
+    let member = Author::from_bdf(&items[1])?;
+    let parent = match &items[2] {
+        Bdf::Null => None,
+        other => Some(raw32(other)?),
+    };
+    Some((member.id(), parent, raw32(&items[3])?))
 }
 
 /// The group the invitation travels in: one per pair of contacts.
@@ -585,5 +660,207 @@ mod einladung_tests {
         let beitrag = vorgerueckt(jetzt, join);
         assert!(join > einladung, "JOIN muss hinter der Einladung liegen");
         assert!(beitrag > join, "Beitrag muss hinter dem JOIN liegen");
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    fn wer(name: &str, n: u8) -> (Author, SecretKey) {
+        let seed = [n; 32];
+        (
+            Author {
+                name: name.to_string(),
+                public_key: crypto::signature_public_key(&seed).to_vec(),
+            },
+            seed,
+        )
+    }
+
+    struct Lage {
+        ersteller: Author,
+        ersteller_seed: SecretKey,
+        mitglied: Author,
+        mitglied_seed: SecretKey,
+        gruppe: SecretKey,
+    }
+
+    fn lage() -> Lage {
+        let (ersteller, ersteller_seed) = wer("Erstellerin", 1);
+        let (mitglied, mitglied_seed) = wer("Mitglied", 2);
+        let gruppe = group_id(&ersteller, "Testgruppe", &[7u8; SALT_LEN]);
+        Lage {
+            ersteller,
+            ersteller_seed,
+            mitglied,
+            mitglied_seed,
+            gruppe,
+        }
+    }
+
+    fn einladung(l: &Lage, zeit: u64) -> (u64, Vec<u8>) {
+        let sig = invite_signature(
+            &l.ersteller_seed,
+            &l.ersteller.id(),
+            &l.mitglied.id(),
+            &l.gruppe,
+            zeit,
+        );
+        (zeit, sig)
+    }
+
+    #[test]
+    fn join_ohne_einladung_von_nicht_ersteller_wird_verworfen() {
+        let l = lage();
+        let rumpf = join_body(&l.gruppe, 500, &l.mitglied, &l.mitglied_seed, None);
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_none());
+    }
+
+    #[test]
+    fn join_mit_falscher_erstellersignatur_wird_verworfen() {
+        let l = lage();
+        // Das Mitglied unterschreibt seine "Einladung" selbst.
+        let sig = invite_signature(
+            &l.mitglied_seed,
+            &l.ersteller.id(),
+            &l.mitglied.id(),
+            &l.gruppe,
+            400,
+        );
+        let rumpf = join_body(&l.gruppe, 500, &l.mitglied, &l.mitglied_seed, Some((400, sig)));
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_none());
+    }
+
+    #[test]
+    fn join_mit_einladung_fuer_eine_andere_gruppe_wird_verworfen() {
+        let l = lage();
+        let andere = group_id(&l.ersteller, "Andere", &[8u8; SALT_LEN]);
+        let sig = invite_signature(
+            &l.ersteller_seed,
+            &l.ersteller.id(),
+            &l.mitglied.id(),
+            &andere,
+            400,
+        );
+        let rumpf = join_body(&l.gruppe, 500, &l.mitglied, &l.mitglied_seed, Some((400, sig)));
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_none());
+    }
+
+    #[test]
+    fn join_nicht_nach_der_einladung_wird_verworfen() {
+        let l = lage();
+        // Gleichstand ...
+        let rumpf = join_body(&l.gruppe, 500, &l.mitglied, &l.mitglied_seed, Some(einladung(&l, 500)));
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_none());
+        // ... und Einladung nach dem JOIN.
+        let rumpf = join_body(&l.gruppe, 500, &l.mitglied, &l.mitglied_seed, Some(einladung(&l, 600)));
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_none());
+    }
+
+    #[test]
+    fn gueltiges_join_mit_einladung_wird_angenommen() {
+        let l = lage();
+        let rumpf = join_body(&l.gruppe, 500, &l.mitglied, &l.mitglied_seed, Some(einladung(&l, 400)));
+        match parse_body(&l.gruppe, &l.ersteller, 500, &rumpf) {
+            Some(GroupMessage::Join { member, invite }) => {
+                assert_eq!(member, l.mitglied);
+                assert_eq!(invite.map(|(t, _)| t), Some(400));
+            }
+            other => panic!("erwartet ein JOIN, bekam {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ersteller_join_ohne_einladung_wird_angenommen() {
+        let l = lage();
+        let rumpf = join_body(&l.gruppe, 500, &l.ersteller, &l.ersteller_seed, None);
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_some());
+    }
+
+    #[test]
+    fn ersteller_join_mit_einladung_wird_verworfen() {
+        let l = lage();
+        let sig = invite_signature(
+            &l.ersteller_seed,
+            &l.ersteller.id(),
+            &l.ersteller.id(),
+            &l.gruppe,
+            400,
+        );
+        let rumpf = join_body(&l.gruppe, 500, &l.ersteller, &l.ersteller_seed, Some((400, sig)));
+        assert!(parse_body(&l.gruppe, &l.ersteller, 500, &rumpf).is_none());
+    }
+
+    #[test]
+    fn post_verweise_liest_autor_eltern_und_vorige() {
+        let l = lage();
+        let rumpf = post_body(
+            &l.gruppe,
+            600,
+            &l.mitglied,
+            &l.mitglied_seed,
+            Some([4u8; 32]),
+            &[5u8; 32],
+            "hallo",
+        );
+        assert_eq!(
+            post_verweise(&rumpf),
+            Some((l.mitglied.id(), Some([4u8; 32]), [5u8; 32]))
+        );
+        // Ein JOIN hat keine Verweise.
+        let join = join_body(&l.gruppe, 500, &l.ersteller, &l.ersteller_seed, None);
+        assert!(post_verweise(&join).is_none());
+    }
+}
+
+#[cfg(test)]
+mod autor_tests {
+    use super::*;
+
+    fn autor(name: &str, schluessel: usize) -> Bdf {
+        Author {
+            name: name.to_string(),
+            public_key: vec![7u8; schluessel],
+        }
+        .to_bdf()
+    }
+
+    #[test]
+    fn autor_mit_fuenfzig_byte_namen_gilt() {
+        assert!(Author::from_bdf(&autor(&"a".repeat(50), 32)).is_some());
+    }
+
+    #[test]
+    fn autor_mit_zu_langem_namen_faellt() {
+        assert!(Author::from_bdf(&autor(&"a".repeat(51), 32)).is_none());
+        // Gezaehlt wird in UTF-8-Byte: 26 Umlaute sind 52 Byte.
+        assert!(Author::from_bdf(&autor(&"ä".repeat(26), 32)).is_none());
+    }
+
+    #[test]
+    fn autor_ohne_namen_faellt() {
+        assert!(Author::from_bdf(&autor("", 32)).is_none());
+    }
+
+    #[test]
+    fn autor_mit_falscher_schluessellaenge_faellt() {
+        assert!(Author::from_bdf(&autor("x", 31)).is_none());
+        assert!(Author::from_bdf(&autor("x", 33)).is_none());
+    }
+
+    /// Ein POST mit zu langem Autorennamen besteht parse_body nicht, auch
+    /// wenn die Unterschrift stimmt.
+    #[test]
+    fn post_mit_zu_langem_autorennamen_wird_nicht_gelesen() {
+        let seed = [4u8; 32];
+        let lang = Author {
+            name: "n".repeat(51),
+            public_key: crypto::signature_public_key(&seed).to_vec(),
+        };
+        let gruppe = [1u8; 32];
+        let rumpf = post_body(&gruppe, 500, &lang, &seed, None, &[2u8; 32], "hallo");
+        assert!(parse_body(&gruppe, &lang, 500, &rumpf).is_none());
+        assert!(post_verweise(&rumpf).is_none());
     }
 }

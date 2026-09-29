@@ -27,6 +27,7 @@ Page {
             width: page.width
             PageHeader { title: app.tr("pickFile") }
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 text: page.folder.toString().replace("file://", "")
@@ -46,6 +47,7 @@ Page {
         delegate: ListItem {
             contentHeight: Theme.itemSizeSmall
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 anchors.verticalCenter: parent.verticalCenter
                 width: parent.width - 2 * Theme.horizontalPageMargin

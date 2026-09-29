@@ -17,6 +17,7 @@ Page {
             PageHeader { title: app.tr("about") + " " + app.tr("briar") }
 
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap

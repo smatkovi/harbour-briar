@@ -14,6 +14,7 @@ Page {
             width: parent.width
             PageHeader { title: app.tr("shareTitle") }
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
@@ -30,6 +31,7 @@ Page {
         delegate: ListItem {
             width: parent.width
             Label {
+                textFormat: Text.PlainText
                 x: Theme.horizontalPageMargin
                 anchors.verticalCenter: parent.verticalCenter
                 text: modelData.name
@@ -52,6 +54,9 @@ Page {
                     Briar.sendFile(modelData.id, app.pendingShareText,
                                    prepared, type,
                                    function(answer) {
+                        // Die verkleinerte Kopie wegraeumen, wie im Chat.
+                        if (prepared !== file)
+                            ImagePrep.aufraeumen(prepared)
                         app.lastError = answer.error ? answer.error : ""
                         app.pendingShareFiles = []
                         app.pendingShareText = ""
