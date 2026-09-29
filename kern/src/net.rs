@@ -855,6 +855,17 @@ impl Node {
     /// bevor die Gegenseite ihn suchen konnte -- und weil er als
     /// "veroeffentlicht" vermerkt war, wurde er nie wieder angemeldet.
     pub fn run_rendezvous(&self, tor_port: u16) {
+        // Wo unser Tor sein Cookie ablegt -- ohne das kommt keine
+        // Steuerverbindung mehr zustande.
+        let tor_dir = {
+            let store = self.store.lock().unwrap();
+            store
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("tor")
+        };
         let mut steuerung: Option<tor::Tor> = None;
         // Schwebender Kontakt -> Kennung des Dienstes, den Tor dafuer angelegt
         // hat. Gilt nur fuer die gerade gehaltene Verbindung: faellt sie,
@@ -917,7 +928,7 @@ impl Node {
                     // Niemand zu treffen: dann auch keine Verbindung halten.
                     continue;
                 }
-                steuerung = tor::connect();
+                steuerung = tor::connect(Some(&tor_dir));
                 if steuerung.is_none() {
                     continue;
                 }
@@ -1025,6 +1036,9 @@ impl Node {
             "Tor on control port {}, SOCKS {}",
             tor.control_port, tor.socks_port
         ));
+        // Den SOCKS-Port fuer den Waehler hinterlegen -- genau so lange, wie
+        // dieser Faden das Tor haelt.
+        let _socks = tor::SocksWache::merken(tor.socks_port);
         let stored_key = {
             let store = self.store.lock().unwrap();
             store.state.tor_key.clone()
@@ -3600,11 +3614,9 @@ fn short_transport(transport_id: &str) -> &str {
 
 fn dial(transport_id: &str, address: &str, kanal: Option<u8>) -> std::io::Result<Conn> {
     if transport_id == TOR_TRANSPORT_ID {
-        let socks = tor::connect()
-            .map(|t| t.socks_port)
-            .ok_or_else(|| bad("no Tor is running on this device"))?;
         // The control connection from the listener keeps Tor alive; here
-        // only the SOCKS port matters.
+        // only the SOCKS port matters, and the listener has left it behind.
+        let socks = tor::socks_port().ok_or_else(|| bad("no Tor is running on this device"))?;
         return Ok(Conn::Tcp(tor::connect_through_socks(socks, address)?));
     }
     if transport_id == BLUETOOTH_TRANSPORT_ID {

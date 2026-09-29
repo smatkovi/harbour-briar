@@ -12,9 +12,13 @@ DAEMON=${1:-/usr/bin/harbour-briar-briard}
 WORK=${WORK:-/tmp/briar-tor-e2e}
 rm -rf "$WORK"; mkdir -p "$WORK/a" "$WORK/b"
 
-start() {   # start <dir> <api> <lan> <torport>
+# Each daemon gets its own Tor: since the control port wants the cookie from
+# the daemon's own tor/ directory, the second daemon cannot share the first
+# one's Tor any more. BRIAR_TOR names the Tor binary when none is installed
+# where the packages put it (tools/build-tor.sh leaves them in /tmp/tor-build).
+start() {   # start <dir> <api> <lan> <torport> <torcontrol>
     "$DAEMON" --state "$WORK/$1/state.json" --api-port "$2" \
-        --lan-port "$3" --tor-port "$4" > "$WORK/$1.log" 2>&1 &
+        --lan-port "$3" --tor-port "$4" --tor-control-port "$5" > "$WORK/$1.log" 2>&1 &
     echo $!
 }
 api() {     # api <port> <method> <path> [json]
@@ -27,8 +31,8 @@ api() {     # api <port> <method> <path> [json]
 }
 feld() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval('d'+sys.argv[1]) or '')" "$1"; }
 
-PID_A=$(start a 8301 7401 7402)
-PID_B=$(start b 8302 7403 7404)
+PID_A=$(start a 8301 7401 7402 59051)
+PID_B=$(start b 8302 7403 7404 59061)
 trap 'kill $PID_A $PID_B 2>/dev/null' EXIT
 sleep 2
 api 8301 POST /identity '{"name":"Anna"}' > /dev/null

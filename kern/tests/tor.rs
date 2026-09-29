@@ -16,19 +16,27 @@ use std::sync::{Arc, Mutex};
 
 /// Ein Tor-Steuerport aus Pappe: merkt sich jeden Befehl und antwortet
 /// 250 OK -- ausser auf GETINFO config-file und process/pid, da nennt er,
-/// was ihm gesagt wurde, oder 552, wenn nichts. Schliesst die Gegenseite,
-/// steht "<zu>" in der Liste.
+/// was ihm gesagt wurde, oder 552, wenn nichts. Mit `cookie` verlangt er
+/// genau dieses Cookie (wie ein Tor mit CookieAuthentication 1) und schliesst
+/// nach einem Fehlversuch die Verbindung, wie Tor es tut; ohne nimmt er das
+/// leere Passwort (wie ein Tor bis 0.38.0). Schliesst die Gegenseite, steht
+/// "<zu>" in der Liste.
 struct Attrappe {
     port: u16,
     befehle: Arc<Mutex<Vec<String>>>,
 }
 
 fn attrappe(config_file: Option<&str>, pid: Option<u32>) -> Attrappe {
+    attrappe_mit(config_file, pid, None)
+}
+
+fn attrappe_mit(config_file: Option<&str>, pid: Option<u32>, cookie: Option<Vec<u8>>) -> Attrappe {
     let lauscher = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = lauscher.local_addr().unwrap().port();
     let befehle = Arc::new(Mutex::new(Vec::new()));
     let merker = Arc::clone(&befehle);
     let config = config_file.map(|s| s.to_string());
+    let erwartet = cookie.map(|c| format!("AUTHENTICATE {}", briarkern::util::to_hex(&c)));
     std::thread::spawn(move || {
         for socket in lauscher.incoming() {
             let socket = match socket {
@@ -37,6 +45,7 @@ fn attrappe(config_file: Option<&str>, pid: Option<u32>) -> Attrappe {
             };
             let merker = Arc::clone(&merker);
             let config = config.clone();
+            let erwartet = erwartet.clone();
             std::thread::spawn(move || {
                 let mut leser = BufReader::new(socket.try_clone().unwrap());
                 let mut schreiber = socket;
@@ -44,6 +53,19 @@ fn attrappe(config_file: Option<&str>, pid: Option<u32>) -> Attrappe {
                 while leser.read_line(&mut zeile).map(|n| n > 0).unwrap_or(false) {
                     let befehl = zeile.trim_end().to_string();
                     merker.lock().unwrap().push(befehl.clone());
+                    if befehl.starts_with("AUTHENTICATE") {
+                        let richtig = match &erwartet {
+                            Some(e) => &befehl == e,
+                            None => befehl == "AUTHENTICATE \"\"",
+                        };
+                        if richtig {
+                            let _ = schreiber.write_all(b"250 OK\r\n");
+                            zeile.clear();
+                            continue;
+                        }
+                        let _ = schreiber.write_all(b"515 Authentication failed\r\n");
+                        break;
+                    }
                     let antwort = match befehl.as_str() {
                         "GETINFO config-file" => match &config {
                             Some(p) => format!("250-config-file={}\r\n250 OK\r\n", p),
@@ -95,6 +117,14 @@ fn tor_verzeichnis(name: &str) -> PathBuf {
     d
 }
 
+/// Dasselbe mit einem Cookie, wie Tor es beim Oeffnen des Steuerports ablegt.
+fn tor_verzeichnis_mit_cookie(name: &str) -> (PathBuf, Vec<u8>) {
+    let d = tor_verzeichnis(name);
+    let cookie: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+    std::fs::write(tor::cookie_pfad(&d), &cookie).unwrap();
+    (d, cookie)
+}
+
 #[test]
 fn torrc_traegt_die_notbremse_und_sonst_nichts_neues() {
     let text = tor::torrc_text(59050, 59051, Path::new("/daten/tor"));
@@ -103,10 +133,15 @@ fn torrc_traegt_die_notbremse_und_sonst_nichts_neues() {
     assert!(text.contains("DataDirectory /daten/tor\n"));
     assert!(text.contains("MaxMemInQueues 64 MB\n"), "{}", text);
     assert!(text.contains("AvoidDiskWrites 1\n"));
-    // Kein Riegel, der Tor am Laden hinderte, und kein Padding-Schalter:
-    // beides spart nachgemessen keinen Speicher.
+    // Wie Briar: Cookie am Steuerport, keine nackten Adressen an SOCKS,
+    // keine Laenderdatenbank, keine Fuellzellen.
+    assert!(text.contains("CookieAuthentication 1\n"), "{}", text);
+    assert!(!text.contains("CookieAuthentication 0"));
+    assert!(text.contains("SafeSocks 1\n"));
+    assert!(text.contains("GeoIPFile\nGeoIPv6File\n"));
+    assert!(text.contains("ConnectionPadding 0\n"));
+    // Kein Riegel, der Tor am Laden hinderte.
     assert!(!text.contains("DisableNetwork"));
-    assert!(!text.contains("ConnectionPadding"));
 }
 
 #[test]
@@ -119,8 +154,11 @@ fn freier_platz_ist_messbar_und_fehlt_bei_fremden_pfaden() {
 #[test]
 fn verbinden_uebernimmt_nicht() {
     let a = attrappe(None, None);
-    let tor = tor::connect_to(a.port, 0).expect("Attrappe nimmt jede Anmeldung");
+    let tor = tor::connect_to(a.port, 0, None).expect("Attrappe nimmt das leere Passwort");
     assert_eq!(tor.control_port, a.port);
+    // Ohne Cookie angemeldet: nicht vertraut. Einordnen darf man so ein Tor,
+    // einen Dienst darauf anmelden nie.
+    assert!(!tor.vertraut);
     let gesehen = a.gesehen();
     assert!(gesehen.iter().any(|b| b.starts_with("AUTHENTICATE")), "keine Anmeldung: {:?}", gesehen);
     assert!(
@@ -134,7 +172,7 @@ fn verbinden_uebernimmt_nicht() {
 #[test]
 fn uebernehmen_bindet_tor_an_die_verbindung_und_stellt_die_pid_wache_ab() {
     let a = attrappe(None, None);
-    let mut tor = tor::connect_to(a.port, 0).unwrap();
+    let mut tor = tor::connect_to(a.port, 0, None).unwrap();
     tor.uebernehmen().expect("Attrappe sagt 250");
     let gesehen = a.gesehen();
     let pos = |s: &str| gesehen.iter().position(|b| b == s);
@@ -146,11 +184,11 @@ fn uebernehmen_bindet_tor_an_die_verbindung_und_stellt_die_pid_wache_ab() {
 #[test]
 fn getinfo_liest_datei_und_prozessnummer() {
     let a = attrappe(Some("/daten/tor/torrc"), Some(4711));
-    let mut tor = tor::connect_to(a.port, 0).unwrap();
+    let mut tor = tor::connect_to(a.port, 0, None).unwrap();
     assert_eq!(tor.konfigurationsdatei().as_deref(), Some("/daten/tor/torrc"));
     assert_eq!(tor.prozessnummer(), Some(4711));
     let b = attrappe(None, None);
-    let mut tor = tor::connect_to(b.port, 0).unwrap();
+    let mut tor = tor::connect_to(b.port, 0, None).unwrap();
     assert_eq!(tor.konfigurationsdatei(), None);
     assert_eq!(tor.prozessnummer(), None);
 }
@@ -172,17 +210,17 @@ fn fremdes_tor_wird_nur_mitbenutzt() {
     let d = tor_verzeichnis("fremd");
     // Liest eine andere torrc.
     let a = attrappe(Some("/etc/tor/torrc"), Some(std::process::id()));
-    let mut tor = tor::connect_to(a.port, 0).unwrap();
+    let mut tor = tor::connect_to(a.port, 0, None).unwrap();
     assert_eq!(tor::einordnen(&mut tor, &d), Vorgefunden::Fremd);
     assert!(!a.gesehen().iter().any(|b| b == "TAKEOWNERSHIP"));
     // Nennt keine Prozessnummer: nicht zu beurteilen, also auch fremd.
     let torrc = d.join("torrc").to_string_lossy().to_string();
     let b = attrappe(Some(&torrc), None);
-    let mut tor = tor::connect_to(b.port, 0).unwrap();
+    let mut tor = tor::connect_to(b.port, 0, None).unwrap();
     assert_eq!(tor::einordnen(&mut tor, &d), Vorgefunden::Fremd);
     // Unsere torrc gibt es nicht: ebenso.
     let c = attrappe(Some(&torrc), Some(std::process::id()));
-    let mut tor = tor::connect_to(c.port, 0).unwrap();
+    let mut tor = tor::connect_to(c.port, 0, None).unwrap();
     assert_eq!(tor::einordnen(&mut tor, Path::new("/gibt/es/nicht")), Vorgefunden::Fremd);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -194,7 +232,7 @@ fn waise_wird_erkannt_und_beendet_nicht_uebernommen() {
     let d = tor_verzeichnis("waise");
     let torrc = d.join("torrc").to_string_lossy().to_string();
     let a = attrappe(Some(&torrc), Some(std::process::id()));
-    let mut tor = tor::connect_to(a.port, 0).unwrap();
+    let mut tor = tor::connect_to(a.port, 0, None).unwrap();
     assert_eq!(tor::einordnen(&mut tor, &d), Vorgefunden::Waise);
     // Einordnen allein sendet noch kein TAKEOWNERSHIP.
     assert!(!a.gesehen().iter().any(|b| b == "TAKEOWNERSHIP"));
@@ -216,8 +254,65 @@ fn symlink_im_pfad_hindert_die_erkennung_nicht() {
     std::os::unix::fs::symlink(&d, &link).unwrap();
     let ueber_link = link.join("torrc").to_string_lossy().to_string();
     let a = attrappe(Some(&ueber_link), Some(std::process::id()));
-    let mut tor = tor::connect_to(a.port, 0).unwrap();
+    let mut tor = tor::connect_to(a.port, 0, None).unwrap();
     assert_eq!(tor::einordnen(&mut tor, &d), Vorgefunden::Waise);
     let _ = std::fs::remove_file(&link);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+
+#[test]
+fn mit_cookie_angemeldet_ist_vertraut() {
+    let (d, cookie) = tor_verzeichnis_mit_cookie("cookie");
+    let a = attrappe_mit(None, None, Some(cookie.clone()));
+    let tor = tor::connect_to(a.port, 0, Some(&d)).expect("Cookie passt");
+    assert!(tor.vertraut);
+    let gesehen = a.gesehen();
+    assert_eq!(
+        gesehen.first().map(|s| s.as_str()),
+        Some(format!("AUTHENTICATE {}", briarkern::util::to_hex(&cookie)).as_str()),
+        "{:?}",
+        gesehen
+    );
+    // Das leere Passwort wurde gar nicht erst probiert.
+    assert!(!gesehen.iter().any(|b| b == "AUTHENTICATE \"\""), "{:?}", gesehen);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn ohne_passendes_cookie_kommt_keine_verbindung_zustande() {
+    // Tor verlangt ein Cookie, wir haben ein anderes (oder gar keins): nach
+    // dem Fehlversuch schliesst Tor, das leere Passwort scheitert auch --
+    // Ergebnis ist ein Fehler, kein untergeschobenes Tor.
+    let (d, _) = tor_verzeichnis_mit_cookie("falsch");
+    let fremd: Vec<u8> = vec![0xaa; 32];
+    let a = attrappe_mit(None, None, Some(fremd));
+    assert!(tor::connect_to(a.port, 0, Some(&d)).is_err());
+    let gesehen = a.gesehen_bis_zu();
+    assert!(gesehen.iter().any(|b| b.starts_with("AUTHENTICATE ")), "{:?}", gesehen);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn ein_halb_geschriebenes_cookie_zaehlt_nicht() {
+    // Tor schreibt das Cookie beim Oeffnen des Steuerports; wer es zu frueh
+    // liest, sieht eine kurze Datei. Die darf nicht als Cookie gelten.
+    let d = tor_verzeichnis("kurz");
+    std::fs::write(tor::cookie_pfad(&d), [1u8; 10]).unwrap();
+    let a = attrappe(None, None);
+    let tor = tor::connect_to(a.port, 0, Some(&d)).unwrap();
+    assert!(!tor.vertraut);
+    let gesehen = a.gesehen();
+    assert_eq!(gesehen.first().map(|s| s.as_str()), Some("AUTHENTICATE \"\""), "{:?}", gesehen);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn socks_port_lebt_genau_so_lange_wie_die_wache() {
+    assert_eq!(tor::socks_port(), None);
+    {
+        let _wache = tor::SocksWache::merken(59050);
+        assert_eq!(tor::socks_port(), Some(59050));
+    }
+    assert_eq!(tor::socks_port(), None);
 }

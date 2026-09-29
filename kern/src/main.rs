@@ -102,10 +102,19 @@ fn main() {
                 tor_port = args[i + 1].parse().unwrap_or(tor_port);
                 i += 1;
             }
+            // Der Steuerport des eigenen Tor (SOCKS liegt eins darunter).
+            // Zwei Dienste auf einer Maschine brauchen je eines: mit
+            // Cookie-Anmeldung kann keiner das Tor des anderen mitbenutzen.
+            "--tor-control-port" if i + 1 < args.len() => {
+                if let Ok(port) = args[i + 1].parse::<u16>() {
+                    briarkern::tor::eigenen_port_setzen(port);
+                }
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!(
                     "briard [--state <file>] [--api-port <port>] [--lan-port <port>] \
-                     [--tor-port <port>]"
+                     [--tor-port <port>] [--tor-control-port <port>]"
                 );
                 return;
             }

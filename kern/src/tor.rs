@@ -13,12 +13,52 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 pub const VIRTUAL_PORT: u16 = 80;
 const TIMEOUT: Duration = Duration::from_secs(20);
-/// Briar's own Tor listens here; a system Tor uses the usual 9050/9051.
-const CANDIDATES: [(u16, u16); 2] = [(9051, 9050), (59051, 59050)];
+/// A system Tor uses the usual 9051/9050. It is only ever used with its
+/// cookie -- which a plain user cannot read on either device, so in practice
+/// the bundled Tor below is the one that runs.
+const SYSTEM: (u16, u16) = (9051, 9050);
+/// Der Steuerport unseres eigenen Tor; SOCKS liegt eins darunter. Nur fuer
+/// zwei Dienste auf einer Maschine (tools/tor-e2e.sh) umzustellen -- mit
+/// Cookie-Anmeldung kann der zweite das Tor des ersten nicht mitbenutzen,
+/// also braucht jeder seines.
+static EIGENER_CONTROL: AtomicU16 = AtomicU16::new(59051);
+pub fn eigenen_port_setzen(control_port: u16) {
+    EIGENER_CONTROL.store(control_port, Ordering::Relaxed);
+}
+fn eigener() -> (u16, u16) {
+    let c = EIGENER_CONTROL.load(Ordering::Relaxed);
+    (c, c.saturating_sub(1))
+}
+/// Der SOCKS-Port des Tor, das der Lauscher gerade haelt -- 0 heisst keins.
+/// Der Waehler liest ihn hier, statt fuer jeden ausgehenden Aufbau eine
+/// eigene Steuerverbindung zu oeffnen (und sich dafuer anmelden zu muessen).
+static SOCKS: AtomicU16 = AtomicU16::new(0);
+pub fn socks_port() -> Option<u16> {
+    match SOCKS.load(Ordering::Relaxed) {
+        0 => None,
+        p => Some(p),
+    }
+}
+/// Merkt den SOCKS-Port, solange sie lebt; faellt sie, ist er wieder weg.
+/// So bleibt kein Port stehen, wenn der Lauscher auf irgendeinem Weg
+/// zurueckkehrt.
+pub struct SocksWache;
+impl SocksWache {
+    pub fn merken(port: u16) -> SocksWache {
+        SOCKS.store(port, Ordering::Relaxed);
+        SocksWache
+    }
+}
+impl Drop for SocksWache {
+    fn drop(&mut self) {
+        SOCKS.store(0, Ordering::Relaxed);
+    }
+}
 /// Unterhalb dieser Grenze warnt der Dienst vor dem Start: der
 /// Verzeichniscache misst rund 40 MB, und beim Neuschreiben liegt er kurz
 /// doppelt da. Nur eine Warnung, kein Riegel -- ein Riegel bei 100 MB haette
@@ -40,6 +80,12 @@ pub struct Tor {
     /// Our own Tor, if we started it -- it is stopped again with us, so
     /// switching the transport off gives the memory back.
     child: Option<std::process::Child>,
+    /// Mit Cookie angemeldet. Ohne Cookie (altes Tor bis 0.38.0 mit
+    /// CookieAuthentication 0) darf diese Verbindung nur eines: das Tor
+    /// einordnen und, wenn es eine Waise ist, beenden. Nie einen Dienst
+    /// darauf anmelden -- wer auf unserem Port ohne Geheimnis antwortet,
+    /// bekaeme sonst unseren Onion-Schluessel.
+    pub vertraut: bool,
 }
 
 impl Drop for Tor {
@@ -57,10 +103,15 @@ impl Drop for Tor {
 /// ausgehenden Aufbau (net::dial) und laesst die Verbindung gleich wieder
 /// fallen. Tor stirbt nach TAKEOWNERSHIP mit genau der Verbindung, die es
 /// gesandt hat -- saesse die Uebernahme hier, toetete jeder Aufbau Tor.
-pub fn connect() -> Option<Tor> {
-    for (control_port, socks_port) in CANDIDATES {
-        if let Ok(tor) = connect_to(control_port, socks_port) {
-            return Some(tor);
+///
+/// Liefert nur ein Tor, dem zu trauen ist (Cookie-Anmeldung); `tor_dir` ist
+/// das Verzeichnis unseres eigenen Tor, wo sein Cookie liegt.
+pub fn connect(tor_dir: Option<&Path>) -> Option<Tor> {
+    for (control_port, socks_port) in [SYSTEM, eigener()] {
+        if let Ok(tor) = connect_to(control_port, socks_port, tor_dir) {
+            if tor.vertraut {
+                return Some(tor);
+            }
         }
     }
     None
@@ -68,34 +119,59 @@ pub fn connect() -> Option<Tor> {
 
 /// Verbindet sich mit dem Tor auf dem genannten Steuerport. Getrennt von
 /// `connect`, damit ein Pruefstand eine Attrappe auf einem eigenen Port
-/// unterschieben kann.
-pub fn connect_to(control_port: u16, socks_port: u16) -> std::io::Result<Tor> {
-    let control = open_control(control_port)?;
+/// unterschieben kann. Ob die Anmeldung mit Cookie gelang, steht in
+/// `vertraut`.
+pub fn connect_to(
+    control_port: u16,
+    socks_port: u16,
+    tor_dir: Option<&Path>,
+) -> std::io::Result<Tor> {
+    let (control, vertraut) = open_control(control_port, tor_dir)?;
     Ok(Tor {
         control_port,
         socks_port,
         control,
         child: None,
+        vertraut,
     })
 }
 
-/// Die torrc, die der Dienst fuer sein eigenes Tor schreibt.
+/// Die torrc, die der Dienst fuer sein eigenes Tor schreibt -- Zeile fuer
+/// Zeile das, was Briars AbstractTorWrapper auch schreibt, soweit es uns
+/// betrifft.
 ///
-/// Speicherseitig ist daran nichts mehr zu holen: alle Schalter zusammen
-/// bringen 0 MB (gemessen 28./29.09.2026, Jolla und arch/i486). Der Heap
-/// besteht aus Konsens und Mikrodeskriptoren, und den verkleinert nur der
-/// Bau-Patch in tools/build-tor.sh. MaxMemInQueues ist eine Notbremse gegen
-/// Lastspitzen, im Leerlauf ohne Wirkung: 64 MB ist der kleinste Wert, den
-/// Tor ohne Warnung nimmt (MIN_UNWARNED_CLIENT_MB), statt der Vorgabe von
-/// 768 MB, die es sich am N9 aus dem Arbeitsspeicher ableitet.
+/// Speicherseitig ist daran nichts zu holen: alle Schalter zusammen bringen
+/// 0 MB (gemessen 28./29.09.2026, Jolla und arch/i486). Der Heap besteht aus
+/// Konsens und Mikrodeskriptoren, und den verkleinert nur der Bau-Patch in
+/// tools/build-tor.sh. Was die Zeilen sonst tun:
+/// - CookieAuthentication 1: der Steuerport verlangt das Cookie aus dem
+///   Datenverzeichnis (0700). Ohne das konnte jeder lokale Prozess GETINFO,
+///   SIGNAL SHUTDOWN oder ADD_ONION sprechen (Sicherheitsbericht H3).
+/// - SafeSocks 1: SOCKS-Anfragen mit nackter IP-Adresse werden abgewiesen;
+///   wir schicken ohnehin nur Hostnamen (connect_through_socks, ATYP 3).
+/// - GeoIPFile/GeoIPv6File leer: keine Laenderdatenbank laden. Heute fehlt
+///   die Datei im statischen Bau ohnehin; die Zeilen halten das so, auch
+///   wenn einmal ein System-Tor mit geoip herhalten sollte.
+/// - ConnectionPadding 0: keine Fuellzellen. Spart keinen Speicher, aber
+///   Funk und Akku, auf 2G Datenvolumen; Briar setzt es ebenso.
+/// - MaxMemInQueues 64 MB: Notbremse gegen Lastspitzen, im Leerlauf ohne
+///   Wirkung. 64 MB ist der kleinste Wert, den Tor ohne Warnung nimmt
+///   (MIN_UNWARNED_CLIENT_MB), statt der Vorgabe von 768 MB am N9.
 pub fn torrc_text(socks_port: u16, control_port: u16, tor_dir: &Path) -> String {
     format!(
-        "SocksPort 127.0.0.1:{}\nControlPort 127.0.0.1:{}\nCookieAuthentication 0\n\
-         DataDirectory {}\nAvoidDiskWrites 1\nClientOnly 1\nMaxMemInQueues 64 MB\n",
+        "SocksPort 127.0.0.1:{}\nControlPort 127.0.0.1:{}\nCookieAuthentication 1\n\
+         SafeSocks 1\nDataDirectory {}\nAvoidDiskWrites 1\nClientOnly 1\n\
+         GeoIPFile\nGeoIPv6File\nConnectionPadding 0\nMaxMemInQueues 64 MB\n",
         socks_port,
         control_port,
         tor_dir.display()
     )
+}
+
+/// Wo unser eigenes Tor sein Cookie ablegt (CookieAuthFile-Vorgabe: im
+/// Datenverzeichnis).
+pub fn cookie_pfad(tor_dir: &Path) -> std::path::PathBuf {
+    tor_dir.join("control_auth_cookie")
 }
 
 /// Freier Platz unter `pfad` in MB; None, wenn das Dateisystem nicht
@@ -211,12 +287,27 @@ fn warten_bis_frei(port: u16) -> bool {
 }
 
 /// Where a Tor shipped with this port would be. Neither device can install
-/// one from a repository, so the package brings its own.
+/// one from a repository, so the package brings its own. BRIAR_TOR in der
+/// Umgebung geht vor -- fuer den Pruefstand auf dem Baurechner, wo keines
+/// dieser Verzeichnisse existiert (tools/tor-e2e.sh).
 const BUNDLED: [&str; 3] = [
     "/usr/bin/harbour-briar-tor",
     "/opt/briar/bin/tor",
     "/usr/bin/tor",
 ];
+
+fn tor_binary() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("BRIAR_TOR") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    BUNDLED
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+}
 
 /// Starts the bundled Tor if none is running, and waits for its control
 /// port. Returns the connection, or None when there is no Tor at all.
@@ -236,30 +327,42 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
     // ohne Datei da, die als fremd durchginge und bis zum Neustart des
     // Geraets weiterliefe. Der Inhalt haengt nur an Ports und Verzeichnis;
     // ein laufendes Tor liest die Datei nicht noch einmal.
-    let (control_port, socks_port) = CANDIDATES[1];
+    let (control_port, socks_port) = eigener();
     let torrc = tor_dir.join("torrc");
     let _ = std::fs::write(&torrc, torrc_text(socks_port, control_port, &tor_dir));
-    if let Some(mut tor) = connect() {
-        // Der System-Tor auf 9051 bleibt, was er ist. Nur auf unserem
-        // eigenen Port kann ein zurueckgelassenes Tor stehen.
-        if tor.control_port != CANDIDATES[1].0 {
+    // Ein System-Tor: nur mit seinem Cookie, und das kann ein gewoehnlicher
+    // Benutzer auf keinem der Geraete lesen. Bleibt also in aller Regel aus.
+    if let Ok(tor) = connect_to(SYSTEM.0, SYSTEM.1, Some(&tor_dir)) {
+        if tor.vertraut {
             return Some(tor);
         }
+    }
+    if let Ok(mut tor) = connect_to(control_port, socks_port, Some(&tor_dir)) {
         match einordnen(&mut tor, &tor_dir) {
             Vorgefunden::Waise => {
                 // Nicht weiterbetreiben: es ist das alte Programm mit der
                 // alten torrc (der laufende Prozess behaelt seine Datei, auch
-                // wenn das Paket sie ersetzt hat), also ohne den Bau-Patch
-                // und ohne Notbremse. Beenden und frisch starten.
-                let port = tor.control_port;
+                // wenn das Paket sie ersetzt hat), also ohne den Bau-Patch,
+                // ohne Cookie und ohne Notbremse. Beenden und frisch starten.
                 crate::net::log("Tor: ein zurueckgelassenes Tor gefunden -- wird beendet und neu gestartet");
                 if !tor.beenden() {
                     crate::net::log("Tor: die Waise nahm TAKEOWNERSHIP nicht an");
                 }
-                if !warten_bis_frei(port) {
+                if !warten_bis_frei(control_port) {
                     crate::net::log("Tor: die Waise gibt den Steuerport nicht frei");
                     return None;
                 }
+            }
+            Vorgefunden::Lebendig | Vorgefunden::Fremd if !tor.vertraut => {
+                // Ohne Cookie angemeldet: ein altes Tor (bis 0.38.0) oder
+                // eines, das jemand ohne Geheimnis auf unseren Port gelegt
+                // hat. Kein Dienst wird darauf angemeldet -- lieber gar kein
+                // Tor als unser Onion-Schluessel bei einem Fremden.
+                crate::net::log(&format!(
+                    "Tor auf Port {} verlangt kein Cookie und gehoert nicht uns -- nicht benutzt",
+                    control_port
+                ));
+                return None;
             }
             Vorgefunden::Lebendig => {
                 crate::net::log("Tor: ein anderer Dienst haelt das Tor auf unserem Port -- nur mitbenutzt");
@@ -268,13 +371,13 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
             Vorgefunden::Fremd => {
                 crate::net::log(&format!(
                     "Tor auf Port {} ist nicht unseres -- nur mitbenutzt",
-                    tor.control_port
+                    control_port
                 ));
                 return Some(tor);
             }
         }
     }
-    let binary = BUNDLED.iter().find(|path| Path::new(path).exists())?;
+    let binary = tor_binary()?;
     // Wird die Platte knapp, scheitert spaeter das Neuschreiben des
     // Verzeichniscaches, und Tor haelt die Mikrodeskriptoren im Heap statt in
     // der Datei -- am N9 der Unterschied zwischen 22 und 60 MB. Gestartet
@@ -289,9 +392,12 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
             ));
         }
     }
+    // Ein altes Cookie weg, bevor Tor das neue schreibt -- sonst laese die
+    // Warteschleife unten womoeglich das veraltete (Briar tut dasselbe).
+    let _ = std::fs::remove_file(cookie_pfad(&tor_dir));
     let log = std::fs::File::create(tor_dir.join("tor.log")).ok()?;
     let errors = log.try_clone().ok()?;
-    let mut child = std::process::Command::new(binary)
+    let mut child = std::process::Command::new(&binary)
         .arg("-f")
         .arg(&torrc)
         .arg(EIGENTUEMER)
@@ -304,25 +410,23 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
     // comes up long before that.
     for _ in 0..30 {
         std::thread::sleep(Duration::from_secs(1));
-        if let Ok(control) = open_control(control_port) {
-            let mut tor = Tor {
-                control_port,
-                socks_port,
-                control,
-                child: None,
-            };
+        // Anmelden mit dem Cookie, das Tor beim Oeffnen des Steuerports
+        // schreibt; solange es fehlt, scheitert der Versuch und die Schleife
+        // kommt wieder.
+        if let Ok(mut tor) = connect_to(control_port, socks_port, Some(&tor_dir)) {
             // Ist das auch unser Kind? Tor oeffnet seine Ports, bevor es das
             // Datenverzeichnis sperrt: war der Steuerport schon belegt, ist
             // unser Kind laengst wieder gestorben, und hier antwortet das Tor
             // eines anderen -- das darf nicht unseres werden.
-            if tor.prozessnummer() != Some(child.id()) {
+            if !tor.vertraut || tor.prozessnummer() != Some(child.id()) {
                 crate::net::log(&format!(
-                    "Tor auf Port {} ist nicht das gestartete Kind -- nur mitbenutzt",
-                    control_port
+                    "Tor auf Port {} ist nicht das gestartete Kind -- {}",
+                    control_port,
+                    if tor.vertraut { "nur mitbenutzt" } else { "ohne Cookie, nicht benutzt" }
                 ));
                 let _ = child.kill();
                 let _ = child.wait();
-                return Some(tor);
+                return if tor.vertraut { Some(tor) } else { None };
             }
             tor.child = Some(child);
             // Our Tor, so it may die with us: after TAKEOWNERSHIP it shuts
@@ -339,22 +443,27 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
     None
 }
 
-fn open_control(port: u16) -> std::io::Result<TcpStream> {
-    let address = format!("127.0.0.1:{}", port);
-    let socket = TcpStream::connect(&address)?;
-    socket.set_read_timeout(Some(TIMEOUT))?;
-    socket.set_write_timeout(Some(TIMEOUT))?;
-    let mut tor = socket;
-    // Cookie first, empty password second: a stock Tor uses one or the other.
-    if let Some(cookie) = read_cookie() {
+/// Oeffnet den Steuerport und meldet sich an. Erst mit jedem Cookie, das
+/// zu lesen ist (unseres zuerst, dann die des Systems), zuletzt ohne -- und
+/// das Ergebnis sagt, welcher Weg es war. Tor schliesst die Verbindung nach
+/// einem Fehlversuch, darum je Versuch eine neue.
+///
+/// Der Weg ohne Cookie bleibt nur, um ein altes Tor (CookieAuthentication 0,
+/// Fassungen bis 0.38.0) einordnen und als Waise beenden zu koennen. Er
+/// verraet kein Geheimnis, und eine so gewonnene Verbindung wird nie fuer
+/// einen Dienst benutzt (`Tor::vertraut` ist dann false).
+fn open_control(port: u16, tor_dir: Option<&Path>) -> std::io::Result<(TcpStream, bool)> {
+    for cookie in cookies(tor_dir) {
+        let mut tor = verbinden(port)?;
         let (code, _) = command(&mut tor, &format!("AUTHENTICATE {}\r\n", cookie))?;
         if code == 250 {
-            return Ok(tor);
+            return Ok((tor, true));
         }
     }
+    let mut tor = verbinden(port)?;
     let (code, message) = command(&mut tor, "AUTHENTICATE \"\"\r\n")?;
     if code == 250 {
-        Ok(tor)
+        Ok((tor, false))
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -363,17 +472,34 @@ fn open_control(port: u16) -> std::io::Result<TcpStream> {
     }
 }
 
-fn read_cookie() -> Option<String> {
-    for path in [
+fn verbinden(port: u16) -> std::io::Result<TcpStream> {
+    let socket = TcpStream::connect(("127.0.0.1", port))?;
+    socket.set_read_timeout(Some(TIMEOUT))?;
+    socket.set_write_timeout(Some(TIMEOUT))?;
+    Ok(socket)
+}
+
+/// Alle Cookies, die zu lesen sind, als Hex: das unseres eigenen Tor
+/// zuerst, dann die ueblichen Ablagen eines System-Tor. Ein Cookie hat 32
+/// Byte; was kuerzer ist, ist eine halb geschriebene Datei.
+fn cookies(tor_dir: Option<&Path>) -> Vec<String> {
+    let mut pfade: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = tor_dir {
+        pfade.push(cookie_pfad(dir));
+    }
+    for p in [
         "/var/lib/tor/control_auth_cookie",
         "/run/tor/control.authcookie",
         "/var/run/tor/control.authcookie",
     ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Some(crate::util::to_hex(&bytes));
-        }
+        pfade.push(std::path::PathBuf::from(p));
     }
-    None
+    pfade
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .filter(|bytes| bytes.len() >= 32)
+        .map(|bytes| crate::util::to_hex(&bytes))
+        .collect()
 }
 
 /// Sends one command and reads the reply, following Tor's multi-line form.
