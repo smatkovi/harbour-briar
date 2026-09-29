@@ -1412,15 +1412,20 @@ impl Node {
                 // die Rolle am Schluesselpaar haengt, bei diesem Gegenueber
                 // jedes Mal wieder.
                 writer.flush()?;
-                self.finish_handshake(
+                let abgleich = conn.try_clone()?;
+                let neu = self.finish_handshake(
                     conn,
                     transport_id,
                     index,
                     writer,
                     Some((header_key, stream_number)),
                     alice,
-                    peer_ip,
-                )
+                    peer_ip.clone(),
+                )?;
+                if let Some(id) = neu {
+                    self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip);
+                }
+                Ok(())
             }
             Some(Recognised::Contact {
                 id,
@@ -1484,7 +1489,20 @@ impl Node {
         let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
         let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
-        self.finish_handshake(conn, transport_id, index, writer, None, alice, peer_ip)
+        let abgleich = conn.try_clone()?;
+        let neu = self.finish_handshake(
+            conn,
+            transport_id,
+            index,
+            writer,
+            None,
+            alice,
+            peer_ip.clone(),
+        )?;
+        if let Some(id) = neu {
+            self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip);
+        }
+        Ok(())
     }
 
     pub fn connect_pending(&self, index: usize, transport_id: &str) -> std::io::Result<()> {
@@ -1520,7 +1538,20 @@ impl Node {
         let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
         let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
-        self.finish_handshake(conn, transport_id, index, writer, None, alice, peer_ip)
+        let abgleich = conn.try_clone()?;
+        let neu = self.finish_handshake(
+            conn,
+            transport_id,
+            index,
+            writer,
+            None,
+            alice,
+            peer_ip.clone(),
+        )?;
+        if let Some(id) = neu {
+            self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip);
+        }
+        Ok(())
     }
 
     /// Runs the handshake and then the contact exchange, and stores the new
@@ -1535,7 +1566,7 @@ impl Node {
         incoming: Option<(SecretKey, u64)>,
         alice: bool,
         peer_ip: Option<String>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Option<u32>> {
         let (their_public_hex, alias, pending_bluetooth) = {
             let store = self.store.lock().unwrap();
             let pending = store
@@ -1720,7 +1751,7 @@ impl Node {
                     "handshake with {} again -- staying contact {}",
                     remote.name, id
                 ));
-                return Ok(());
+                return Ok(Some(id));
             }
         }
 
@@ -1738,7 +1769,7 @@ impl Node {
                 .any(|p| p.public_key == their_public_hex)
             {
                 log("the waiting contact was removed while the handshake ran -- dropping it");
-                return Ok(());
+                return Ok(None);
             }
             let id = store.state.next_contact_id;
             store.state.next_contact_id += 1;
@@ -1816,7 +1847,38 @@ impl Node {
             "contact exchange succeeded: {} is contact {}",
             remote.name, contact_id
         ));
-        Ok(())
+        Ok(Some(contact_id))
+    }
+
+    /// Die Handschlagverbindung gleich als Abgleichverbindung weiterbenutzen.
+    ///
+    /// Briar tut genau das (ConnectionManagerImpl auf beiden Handschlagseiten:
+    /// "Reuse the connection as a transport connection", und
+    /// ContactExchangeManagerImpl am Ende des Treffens nebeneinander): der
+    /// neue Kontakt bekommt Versionsansage und Adressen sofort, nicht erst
+    /// beim naechsten Takt -- und ueber Tor ist der naechste Takt eine Minute
+    /// und einen neuen Rendezvous entfernt. Ohne diese Runde blieb die
+    /// Nachrichtengruppe bei Briar bis dahin unsichtbar, und was in der
+    /// Zwischenzeit geschrieben wurde, verwarf es.
+    ///
+    /// Beide Seiten schreiben zuerst und lesen dann die Marke der anderen --
+    /// so verhaelt sich Briars ausgehende Duplex-Verbindung, und so wartet
+    /// keine Seite auf die andere. Eine Gegenseite mit einer aelteren Fassung
+    /// legt nach dem Austausch auf; das ist dann eine Zeile im Protokoll,
+    /// kein Fehler.
+    fn abgleich_nach_handschlag(
+        &self,
+        conn: Conn,
+        transport_id: &str,
+        contact_id: u32,
+        peer_ip: Option<String>,
+    ) {
+        if let Err(e) = self.run_sync(conn, transport_id, contact_id, None, peer_ip) {
+            log(&format!(
+                "no sync round on the handshake connection with contact {}: {}",
+                contact_id, e
+            ));
+        }
     }
 
     /// Dials a contact over one transport and runs one sync round.
@@ -5679,12 +5741,21 @@ impl Node {
             alice,
         )?;
         log("BQP: die Einigung steht");
-        let id = self.bqp_austausch(strom, master, alice, gegen_ip)?;
+        let abgleich = strom.try_clone()?;
+        let verkehrsweg = match &strom {
+            Conn::Tcp(_) => LAN_TRANSPORT_ID,
+            Conn::Bluetooth(_) => BLUETOOTH_TRANSPORT_ID,
+        };
+        let id = self.bqp_austausch(strom, master, alice, gegen_ip.clone())?;
         *BQP_ERGEBNIS.lock().unwrap() = Some(id);
         if let Some(lauf) = BQP.lock().unwrap().as_ref() {
             lauf.kontakt.store(id, std::sync::atomic::Ordering::Relaxed);
             lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Wie nach dem Handschlag ueber den Link: dieselbe Verbindung traegt
+        // gleich die erste Abgleichrunde (ContactExchangeManagerImpl:
+        // manageOutgoingConnection am Ende des Austauschs).
+        self.abgleich_nach_handschlag(abgleich, verkehrsweg, id, gegen_ip);
         Ok(id)
     }
 }

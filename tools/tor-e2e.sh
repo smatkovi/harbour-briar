@@ -73,6 +73,25 @@ import json,sys; d=json.load(sys.stdin); print('   Kontakte B:', [c['name'] for 
 ID=$(api 8301 GET /status | feld "['contacts'][0]['id']")
 [ -n "$ID" ] || { echo "FEHLER: kein Kontakt zustande gekommen"; tail -15 "$WORK"/a.log; exit 1; }
 
+# Seit 0.40.0 traegt die Handschlagverbindung gleich die erste Abgleichrunde
+# (wie bei Briar: "Reuse the connection as a transport connection"). Beide
+# Seiten muessen also eine Runde protokolliert haben, bevor irgendjemand
+# angewaehlt hat -- und keine der beiden darf "no sync round on the
+# handshake connection" melden.
+echo "== Abgleich auf der Handschlagverbindung"
+for i in $(seq 1 10); do
+    grep -q "sync round with contact 1" "$WORK/a.log" \
+        && grep -q "sync round with contact 1" "$WORK/b.log" && break
+    sleep 1
+done
+for seite in a b; do
+    grep -q "sync round with contact 1" "$WORK/$seite.log" \
+        || { echo "FEHLER: $seite hat nach dem Handschlag keine Runde gemacht"; grep -i "handshake\|sync" "$WORK/$seite.log" | tail -8; exit 1; }
+    grep -q "no sync round on the handshake connection" "$WORK/$seite.log" \
+        && { echo "FEHLER: bei $seite scheiterte die Runde auf der Handschlagverbindung"; grep "no sync round" "$WORK/$seite.log"; exit 1; }
+done
+echo "   beide Seiten haben auf der Handschlagverbindung abgeglichen"
+
 echo "== Nachricht über Tor"
 api 8301 POST /send "$(python3 -c "
 import json,sys; print(json.dumps({'contact': int(sys.argv[1]), 'text': 'Hallo durch Tor'}))" "$ID")" > /dev/null
