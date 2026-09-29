@@ -51,7 +51,38 @@ function stringify(value) {
 // Knopf laesst sich nicht mehr druecken. Genau das ist am N9 passiert.
 var ZEITGRENZE = 90000
 
+// Das Geheimnis der Schnittstelle. Der Dienst legt es bei jedem Start neben
+// die state.json (api-token, nur fuer den Benutzer lesbar); ohne diesen Kopf
+// gibt er nichts heraus -- so bleibt eine Webseite im Browser oder eine App
+// eines anderen Kontos draussen (Sicherheitsbefund K1). Woher die
+// Oberflaeche es liest, sagt ihr die QML-Wurzel ueber geheimnisQuelleSetzen;
+// nach einem 401 wird es einmal neu gelesen, denn der Dienst wuerfelt bei
+// jedem Start ein neues.
+var geheimnis = ""
+var geheimnisQuelle = null
+
+function geheimnisQuelleSetzen(quelle) {
+    geheimnisQuelle = quelle
+    geheimnis = ""
+    return true
+}
+
+function geheimnisHolen() {
+    if (geheimnis === "" && geheimnisQuelle) {
+        try {
+            geheimnis = "" + (geheimnisQuelle() || "")
+        } catch (e) {
+            geheimnis = ""
+        }
+    }
+    return geheimnis
+}
+
 function request(method, path, body, callback) {
+    anfrage(method, path, body, callback, true)
+}
+
+function anfrage(method, path, body, callback, nochmal) {
     var xhr = new XMLHttpRequest()
     // Der Rueckruf muss genau einmal kommen -- auch wenn Zeitgrenze und
     // Antwort sich ueberholen.
@@ -64,6 +95,12 @@ function request(method, path, body, callback) {
     }
     xhr.open(method, base + path)
     xhr.setRequestHeader("Content-Type", "application/json")
+    var g = geheimnisHolen()
+    if (g !== "") {
+        // Zwei Schreibweisen: Qt 4.7 laesst nicht jeden Kopf durch.
+        xhr.setRequestHeader("Authorization", "Bearer " + g)
+        xhr.setRequestHeader("X-Briar-Geheimnis", g)
+    }
     // Qt 5 kennt beides; Qt 4.7 (Harmattan) ignoriert es stillschweigend,
     // dort haengt die Zeitgrenze am Zeitgeber der jeweiligen Seite.
     xhr.timeout = ZEITGRENZE
@@ -81,11 +118,21 @@ function request(method, path, body, callback) {
                 answer = { error: "the daemon sent nonsense: " + xhr.responseText }
             }
             fertig(answer)
+        } else if (xhr.status === 401 && nochmal) {
+            // Ein neuer Dienst, ein neues Geheimnis: einmal frisch lesen und
+            // die Anfrage wiederholen. Kommt wieder 401, war es das.
+            if (erledigt)
+                return
+            erledigt = true
+            geheimnis = ""
+            anfrage(method, path, body, callback, false)
         } else {
             // status 0 means the daemon is not up yet
             fertig({ error: xhr.status === 0
                       ? "der Dienst antwortet nicht"
-                      : "Fehler " + xhr.status })
+                      : (xhr.status === 401
+                         ? "die Oberflaeche hat kein Geheimnis fuer den Dienst"
+                         : "Fehler " + xhr.status) })
         }
     }
     xhr.send(body === null ? "" : stringify(body))

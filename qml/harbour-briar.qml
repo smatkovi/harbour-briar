@@ -13,6 +13,10 @@ ApplicationWindow {
     // The daemon's last answer to /status, shared by every page.
     property var status: ({ contacts: [], pending: [], identity: null })
     property string lastError: ""
+    // Das Geheimnis der Schnittstelle: als Eigenschaft verdrahtet, nicht in
+    // onCompleted -- die Seiten fragen den Dienst, bevor die Wurzel fertig
+    // ist, und Bindungen stehen vorher.
+    property bool geheimnisVerdrahtet: Briar.geheimnisQuelleSetzen(function() { return Daemon.token() })
     // Bumped when the language changes, so every binding that calls
     // Strings.t() is re-evaluated.
     property int languageRevision: 0

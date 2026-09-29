@@ -135,6 +135,14 @@ void Dienst::starten()
     dienstStarten();
 }
 
+QString Dienst::token()
+{
+    QFile f(QDir::homePath() + QLatin1String("/.local/share/harbour-briar/api-token"));
+    if (!f.open(QIODevice::ReadOnly))
+        return QString();
+    return QString::fromLatin1(f.readAll()).trimmed();
+}
+
 static void dienstStarten()
 {
     if (dienstAntwortet()) {

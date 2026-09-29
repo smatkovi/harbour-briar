@@ -146,6 +146,20 @@ fn main() {
     // ADD_ONION mit in den Tod gerissen, minuetlich.
     instanzsperre(&state_path);
 
+    // Das Geheimnis der Schnittstelle, bevor irgendjemand auf dem Port
+    // lauscht -- auch der Wartedienst vor dem Entsperren bedient /unlock und
+    // /account/delete. Ohne Geheimnis kein Start: eine Schnittstelle ohne
+    // Geheimnis ist genau das, was hier abgeschafft wird (Sicherheitsbefund
+    // K1).
+    if let Err(e) = briarkern::api::geheimnis_anlegen(&state_path) {
+        eprintln!(
+            "cannot write the API secret beside {}: {}",
+            state_path.display(),
+            e
+        );
+        std::process::exit(1);
+    }
+
     let mut store = if Store::ist_verschluesselt(&state_path) {
         briarkern::entsperren::warten(&state_path, api_port, DEFAULT_PORT)
     } else {

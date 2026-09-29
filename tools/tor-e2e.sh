@@ -22,11 +22,15 @@ start() {   # start <dir> <api> <lan> <torport> <torcontrol>
     echo $!
 }
 api() {     # api <port> <method> <path> [json]
+    # Seit 0.41.0 verlangt die Schnittstelle das Geheimnis, das der Dienst
+    # neben seine state.json legt.
+    case $1 in 8301) seite=a ;; 8302) seite=b ;; *) seite=a ;; esac
+    G=$(cat "$WORK/$seite/api-token" 2>/dev/null)
     if [ -n "$4" ]; then
-        curl -s -X "$2" -H 'Content-Type: application/json' -d "$4" \
+        curl -s -X "$2" -H "Authorization: Bearer $G" -H 'Content-Type: application/json' -d "$4" \
             "http://127.0.0.1:$1$3"
     else
-        curl -s -X "$2" "http://127.0.0.1:$1$3"
+        curl -s -X "$2" -H "Authorization: Bearer $G" "http://127.0.0.1:$1$3"
     fi
 }
 feld() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval('d'+sys.argv[1]) or '')" "$1"; }

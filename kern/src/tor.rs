@@ -563,7 +563,7 @@ fn safecookie(tor: &mut TcpStream, cookie: &[u8]) -> std::io::Result<bool> {
     Ok(code == 250)
 }
 
-fn gleich_in_konstanter_zeit(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn gleich_in_konstanter_zeit(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

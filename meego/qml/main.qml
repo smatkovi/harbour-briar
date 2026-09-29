@@ -14,6 +14,8 @@ PageStackWindow {
 
     property variant zustand: { "contacts": [], "pending": [], "groups": [], "identity": null }
     property string fehler: ""
+    // Das Geheimnis der Schnittstelle, siehe harbour-briar.qml.
+    property bool geheimnisVerdrahtet: Briar.geheimnisQuelleSetzen(function() { return dienst.token() })
     property int sprachStand: 0
 
     // Alle Beschriftungen gehen hier durch, damit ein Sprachwechsel sofort

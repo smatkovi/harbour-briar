@@ -65,27 +65,34 @@ pub fn warten(pfad: &Path, api_port: u16, default_port: u16) -> Store {
 }
 
 fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Store> {
-    let mut leser = BufReader::new(strom.try_clone().ok()?);
+    // Begrenzt wie die grosse Schnittstelle (Sicherheitsbefund H2).
+    let mut leser = BufReader::new(strom.try_clone().ok()?).take(64 * 1024 + 4096);
     let mut zeile = String::new();
     leser.read_line(&mut zeile).ok()?;
     let mut teile = zeile.split_whitespace();
     let verb = teile.next().unwrap_or("");
     let weg = teile.next().unwrap_or("");
 
-    // Kopfzeilen ueberlesen, dabei die Laenge merken.
-    let mut laenge = 0usize;
-    loop {
-        let mut kopf = String::new();
-        if leser.read_line(&mut kopf).ok()? == 0 || kopf.trim().is_empty() {
-            break;
-        }
-        let kopf = kopf.to_ascii_lowercase();
-        if let Some(wert) = kopf.strip_prefix("content-length:") {
-            laenge = wert.trim().parse().unwrap_or(0);
-        }
-    }
+    // Kopfzeilen lesen: Laenge, Host, Geheimnis -- dieselbe Pruefung wie in
+    // api::serve, denn dieser Weg bedient /unlock und /account/delete, bevor
+    // der Speicher offen ist (Sicherheitsbefund H0).
+    let koepfe = crate::api::koepfe_lesen(&mut leser).ok()?;
+    let laenge = koepfe.laenge;
 
-    let (code, rumpf, store) = if verb == "POST" && weg.starts_with("/unlock") {
+    let (code, rumpf, store) = if !crate::api::host_passt(koepfe.host.as_deref()) {
+        (400, "{\"error\":\"wrong host\"}".to_string(), None)
+    } else if !crate::api::berechtigt(&koepfe) {
+        // Ohne Geheimnis nur das Noetigste, als 401 (siehe api::serve):
+        // laeuft, gesperrt, Fassung. Aufsperren und Loeschen gibt es nur mit.
+        (
+            401,
+            format!(
+                "{{\"error\":\"unauthorised\",\"locked\":true,\"running\":true,\"version\":\"{}\"}}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            None,
+        )
+    } else if verb == "POST" && weg.starts_with("/unlock") {
         let mut rumpf = vec![0u8; laenge.min(4096)];
         if leser.read_exact(&mut rumpf).is_err() {
             rumpf.clear();
@@ -203,6 +210,8 @@ mod nebenlaeufig_tests {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             l.local_addr().unwrap().port()
         };
+        crate::api::geheimnis_anlegen(&pfad).unwrap();
+        let geheimnis = crate::api::geheimnis().to_string();
         let pfad2 = pfad.clone();
         let dienst = std::thread::spawn(move || warten(&pfad2, port, 7399));
 
@@ -241,13 +250,36 @@ mod nebenlaeufig_tests {
             antwort
         );
 
+        // Ohne Geheimnis kein Aufsperren, auch nicht mit dem richtigen
+        // Passwort (Sicherheitsbefund H0/K1).
+        let rumpf = "{\"password\":\"Probewort123\"}";
+        let mut ohne = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        ohne.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        ohne.write_all(
+            format!(
+                "POST /unlock HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                rumpf.len(),
+                rumpf
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut abgewiesen = String::new();
+        let _ = ohne.read_to_string(&mut abgewiesen);
+        assert!(
+            abgewiesen.starts_with("HTTP/1.1 401") && abgewiesen.contains("unauthorised"),
+            "ohne Geheimnis muss 401 kommen: {:?}",
+            abgewiesen
+        );
+
         // Zum Schluss richtig entsperren, damit der Faden zurueckkommt.
         let mut dritte = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let rumpf = "{\"password\":\"Probewort123\"}";
         dritte
             .write_all(
                 format!(
-                    "POST /unlock HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                    "POST /unlock HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{}",
+                    geheimnis,
                     rumpf.len(),
                     rumpf
                 )

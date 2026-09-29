@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(feature = "sfos")]
@@ -20,6 +21,161 @@ fn close_notification(key: &str) {
 
 #[cfg(not(feature = "sfos"))]
 fn close_notification(_key: &str) {}
+
+/// Das Geheimnis dieser Sitzung -- die Schnittstelle gibt ohne es nichts
+/// heraus und nimmt nichts an.
+///
+/// Sicherheitsbefund K1: 127.0.0.1:8105 war fuer jede App desselben
+/// Benutzers und -- ueber fetch() -- fuer jede Webseite im Browser offen,
+/// samt "Access-Control-Allow-Origin: *". Briar auf Android hat keine lokale
+/// Schnittstelle; sein briar-headless verlangt je Anfrage einen Bearer-Token
+/// (Router.kt). So auch hier: der Dienst wuerfelt beim Start 32 Byte, legt sie
+/// als Hexzahl neben die state.json (api-token, 0600), und nur die
+/// Oberflaeche liest sie dort. Was ein Prozess desselben Benutzers ohne
+/// Sandkasten lesen kann, kann er weiterhin lesen -- dagegen hilft nur ein
+/// Sandkasten, den es hier nicht gibt; Webseiten und andere Konten sind
+/// draussen, und mit ihnen H0 (Konto loeschen ohne Pruefung) und M5 (das
+/// Schluesselbund-Passwort ueber 8105).
+static GEHEIMNIS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Der Dateiname neben der state.json.
+pub const GEHEIMNIS_DATEI: &str = "api-token";
+/// Hoechstens so viel Rumpf nimmt eine Anfrage an (Sicherheitsbefund H2: ein
+/// erfundener Content-Length von 4 GB war eine Zuteilung, die auf einem
+/// 1-GB-Geraet den Dienst beendete).
+const MAX_RUMPF: usize = 1024 * 1024;
+/// ... und so viel Kopf, Anfragezeile eingeschlossen.
+const MAX_KOPF: u64 = 64 * 1024;
+
+/// Das Geheimnis erzeugen (einmal je Prozess) und neben die state.json legen.
+/// Mehrmals aufrufbar: die Datei wird jedes Mal geschrieben, das Geheimnis
+/// bleibt -- so findet jede Pruefung in ihrem Verzeichnis eines.
+pub fn geheimnis_anlegen(state_path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let wert = GEHEIMNIS.get_or_init(|| to_hex(&crate::util::random(32)));
+    let dir = state_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let pfad = dir.join(GEHEIMNIS_DATEI);
+    // Mit 0600 angelegt, nicht nachtraeglich enger gemacht -- dazwischen
+    // laege ein Fenster. Eine alte Datei wird ueberschrieben und bekommt die
+    // Rechte ausdruecklich.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&pfad)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(wert.as_bytes())?;
+    f.flush()
+}
+
+/// Das Geheimnis dieser Sitzung -- leer, solange keines angelegt ist; dann
+/// ist niemand berechtigt.
+pub fn geheimnis() -> &'static str {
+    GEHEIMNIS.get().map(|s| s.as_str()).unwrap_or("")
+}
+
+/// Die Kopfzeilen einer Anfrage, soweit sie hier zaehlen.
+pub struct Koepfe {
+    pub laenge: usize,
+    pub geheimnis: Option<String>,
+    pub host: Option<String>,
+}
+
+/// Kopfzeilen lesen -- begrenzt: eine Gegenseite, die nie einen Zeilenumbruch
+/// schickt, darf den Speicher nicht fuellen.
+pub fn koepfe_lesen(leser: &mut impl BufRead) -> std::io::Result<Koepfe> {
+    let mut k = Koepfe {
+        laenge: 0,
+        geheimnis: None,
+        host: None,
+    };
+    let mut gelesen = 0u64;
+    loop {
+        let mut zeile = String::new();
+        let n = leser.read_line(&mut zeile)?;
+        gelesen += n as u64;
+        if n == 0 || zeile.trim().is_empty() {
+            break;
+        }
+        if gelesen > MAX_KOPF {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headers too long",
+            ));
+        }
+        let Some((name, wert)) = zeile.split_once(':') else {
+            continue;
+        };
+        let wert = wert.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => k.laenge = wert.parse().unwrap_or(0),
+            // Zwei Schreibweisen, weil Qt 4.7 nicht jeden Kopf durchlaesst.
+            "authorization" => {
+                if let Some(t) = wert.strip_prefix("Bearer ") {
+                    k.geheimnis = Some(t.trim().to_string());
+                }
+            }
+            "x-briar-geheimnis" => k.geheimnis = Some(wert.to_string()),
+            "host" => k.host = Some(wert.to_string()),
+            _ => {}
+        }
+    }
+    Ok(k)
+}
+
+/// Traegt die Anfrage das Geheimnis? Vergleich in konstanter Zeit.
+pub fn berechtigt(koepfe: &Koepfe) -> bool {
+    let g = geheimnis();
+    if g.is_empty() {
+        return false;
+    }
+    match &koepfe.geheimnis {
+        Some(t) => crate::tor::gleich_in_konstanter_zeit(t.as_bytes(), g.as_bytes()),
+        None => false,
+    }
+}
+
+/// Der Host-Kopf: fehlt er, ist das ein Werkzeug mit HTTP/1.0 (die App selbst
+/// fragt so nach der Fassung); steht er da, muss er auf uns zeigen. Ein
+/// fremder Name ist DNS-Rebinding -- eine Webseite, deren Name gerade auf
+/// 127.0.0.1 aufgeloest wird.
+pub fn host_passt(host: Option<&str>) -> bool {
+    let Some(h) = host else {
+        return true;
+    };
+    let ohne_port = match h.rsplit_once(':') {
+        Some((a, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => a,
+        _ => h,
+    };
+    matches!(ohne_port, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+fn antworten(mut socket: TcpStream, code: u16, wert: &Value) -> std::io::Result<()> {
+    let text = serde_json::to_string(wert).unwrap_or_else(|_| "{}".to_string());
+    let grund = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        413 => "Payload Too Large",
+        414 => "URI Too Long",
+        _ => "Error",
+    };
+    // Kein Access-Control-Allow-Origin mehr: eine Webseite bekommt die
+    // Antwort nicht zu lesen -- und ohne Geheimnis ohnehin keine.
+    write!(
+        socket,
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        code,
+        grund,
+        text.as_bytes().len(),
+        text
+    )?;
+    socket.flush()
+}
 
 pub fn run(store: Shared, port: u16) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
@@ -46,26 +202,43 @@ pub fn run(store: Shared, port: u16) {
 }
 
 fn serve(store: Shared, socket: TcpStream) -> std::io::Result<()> {
-    let mut reader = BufReader::new(socket.try_clone()?);
+    // Alles zusammen begrenzt, Kopf wie Rumpf: mehr liest der Dienst nicht.
+    let mut reader = BufReader::new(socket.try_clone()?).take(MAX_KOPF + MAX_RUMPF as u64);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
+    if request_line.len() > 8192 {
+        return antworten(socket, 414, &json!({"error": "request line too long"}));
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
-    let mut content_length = 0usize;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.trim().is_empty() {
-            break;
-        }
-        let lower = line.to_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
-        }
+    let koepfe = koepfe_lesen(&mut reader)?;
+    if !host_passt(koepfe.host.as_deref()) {
+        return antworten(socket, 400, &json!({"error": "wrong host"}));
     }
-    let mut raw = vec![0u8; content_length];
-    if content_length > 0 {
+    if koepfe.laenge > MAX_RUMPF {
+        return antworten(socket, 413, &json!({"error": "request too large"}));
+    }
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.clone(), String::new()),
+    };
+    if !berechtigt(&koepfe) {
+        // Ohne Geheimnis nur, was die App zum Anlaufen braucht: laeuft der
+        // Dienst, welche Fassung, gesperrt oder nicht. Als 401, nicht als
+        // 200 -- die Oberflaeche liest bei 401 ihr Geheimnis neu und fragt
+        // noch einmal; die Fassungsabfrage der App sucht nur nach "version"
+        // im Text. Der Rumpf wird gar nicht erst gelesen.
+        let mut antwort = json!({"error": "unauthorised"});
+        if method == "GET" && path == "/status" {
+            antwort["running"] = json!(true);
+            antwort["version"] = json!(env!("CARGO_PKG_VERSION"));
+            antwort["locked"] = json!(ist_gesperrt());
+        }
+        return antworten(socket, 401, &antwort);
+    }
+    let mut raw = vec![0u8; koepfe.laenge];
+    if koepfe.laenge > 0 {
         reader.read_exact(&mut raw)?;
     }
     let body: Value = if raw.is_empty() {
@@ -73,21 +246,8 @@ fn serve(store: Shared, socket: TcpStream) -> std::io::Result<()> {
     } else {
         serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}))
     };
-
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target.clone(), String::new()),
-    };
     let response = handle(store, &method, &path, &query, &body);
-    let text = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-    let mut socket = socket;
-    write!(
-        socket,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-        text.as_bytes().len(),
-        text
-    )?;
-    socket.flush()
+    antworten(socket, 200, &response)
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {

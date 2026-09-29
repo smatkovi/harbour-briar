@@ -195,10 +195,13 @@ fn json_string(text: &str) -> String {
 /// Our own HTTP interface, so a reply from the notification takes exactly
 /// the same path as one typed in the app.
 fn post(port: u16, path: &str, body: &str) {
+    // Mit dem Geheimnis der Schnittstelle: wir sind zwar derselbe Prozess,
+    // gehen aber denselben Weg wie die Oberflaeche.
     let request = format!(
-        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
+        crate::api::geheimnis(),
         body.len(),
         body
     );

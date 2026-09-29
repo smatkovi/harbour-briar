@@ -15,6 +15,7 @@
 #include <QThread>
 #include <csignal>
 #include <QDir>
+#include <QFile>
 
 #include <sailfishapp.h>
 
@@ -89,6 +90,13 @@ static void stopDaemon()
     }
 }
 
+/// Wo der Dienst seinen Zustand hat -- und daneben sein api-token.
+static QString dataDir()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+            + QStringLiteral("/harbour-briar");
+}
+
 void startDaemon()
 {
     if (daemonAnswers()) {
@@ -114,8 +122,7 @@ void startDaemon()
         for (int i = 0; i < 20 && daemonAnswers(); ++i)
             QThread::msleep(100);
     }
-    const QString data = QStandardPaths::writableLocation(
-                QStandardPaths::GenericDataLocation) + QStringLiteral("/harbour-briar");
+    const QString data = dataDir();
     QDir().mkpath(data);
     QStringList arguments;
     arguments << QStringLiteral("--state") << data + QStringLiteral("/state.json")
@@ -134,6 +141,18 @@ class Daemon : public QObject
     Q_OBJECT
 public:
     Q_INVOKABLE void ensureRunning() { startDaemon(); }
+
+    /// Das Geheimnis der Schnittstelle, das der Dienst beim Start neben die
+    /// state.json legt (api-token). Jedes Mal frisch gelesen: der Dienst
+    /// wuerfelt bei jedem Start ein neues, und Briar.js fragt nur nach einem
+    /// 401 noch einmal.
+    Q_INVOKABLE QString token()
+    {
+        QFile f(dataDir() + QStringLiteral("/api-token"));
+        if (!f.open(QIODevice::ReadOnly))
+            return QString();
+        return QString::fromLatin1(f.readAll()).trimmed();
+    }
 
     /// Whether the user unit is enabled -- systemctl answers "enabled" or
     /// "disabled" and exits non-zero for the latter, so the text is read.
