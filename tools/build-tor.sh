@@ -117,14 +117,18 @@ for ARCH in $ARCHES; do
     # Arbeitsspeicher wirklich etwas bewegt. Nach dem Bootstrap haelt Tor
     # alle Mikrodeskriptoren 30 Minuten lang im Heap, bevor es sie in die
     # Datei cached-microdescs schreibt und von da an nur noch einblendet
-    # (mmap, vom Kernel verdraengbar). Am N9 mit 1 GB heisst das 30 Minuten
-    # zu 60 MB statt 22 MB anonym -- und weil Tor dort selten so lange
-    # laeuft, bei jedem Start. Mit 120 s statt 30 Minuten, gemessen am
-    # armv7-Binary (arch, 28.09.2026): anonym 60,0 -> 22,6 MB, RSS
-    # 64,8 -> 44,3 MB, ab zwei Minuten nach dem Bootstrap. Ueber die
-    # Leitung geht dadurch nichts anders: die Deskriptoren liegen ohnehin
-    # ab Empfang im Journal cached-microdescs.new, nur der Heap wird
-    # frueher frei. Die torrc kennt dafuer keinen Schalter.
+    # (mmap, vom Kernel verdraengbar). Das trifft nur den ERSTEN Lauf eines
+    # frischen Verzeichnisses: beim naechsten Start liest Tor das Journal
+    # und schreibt den Cache sofort beim Laden (microdesc.c:556). Am N9 mit
+    # 1 GB heisst der erste Lauf trotzdem 28 Minuten zu 60 MB statt 22 MB
+    # anonym -- und endet er vor der 30. Minute, hat der zweite Start eine
+    # Spitze von 83 MB, weil er das ganze Journal einliest. Mit 120 s statt
+    # 30 Minuten, gemessen am N9 (28.09.2026, Summe Private_Dirty aus
+    # smaps): anonym 60,0 -> 22,6 MB, RSS 64,8 -> 44,3 MB, ab zwei Minuten
+    # nach dem Bootstrap. Ueber die Leitung geht dadurch nichts anders: die
+    # Deskriptoren liegen ohnehin ab Empfang im Journal
+    # cached-microdescs.new, nur der Heap wird frueher frei. Die torrc kennt
+    # dafuer keinen Schalter.
     #
     # Die Wache darunter: schlaegt sed ins Leere, weil eine neue Tor-Fassung
     # die Zeile anders schreibt, bricht der Bau ab, statt still ein
