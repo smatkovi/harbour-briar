@@ -138,6 +138,45 @@ pub(crate) fn anforderungen_fortschreiben(
     }
 }
 
+/// Die Handschlaege, die gerade laufen, nach dem Schluessel des Wartenden.
+///
+/// Zwei Handschlaege mit demselben Wartenden zugleich -- einer angewaehlt,
+/// einer angenommen, oder zwei Treffpunkte im selben Takt -- enden mit zwei
+/// verschiedenen Hauptschluesseln: jede Seite speichert den aus dem
+/// Handschlag, den sie zuletzt abgeschlossen hat, und das ist nicht auf
+/// beiden Seiten derselbe. Danach passt keine Marke mehr ("unrecognised
+/// tag"), fuer immer. Im Netzraumtest ueber Tor ist genau das passiert, als
+/// der Treffpunkt alle drei Sekunden angewaehlt wurde. Briar kennt das
+/// Problem nicht: ContactExchangeManager entfernt den Wartenden beim ersten
+/// Erfolg, der zweite Versuch scheitert an NoSuchPendingContactException --
+/// bei uns lief der zweite aber schon, bevor der erste fertig war.
+static HANDSCHLAEGE: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Der Platz eines laufenden Handschlags; wird beim Fallenlassen frei.
+struct Handschlagmarke(String);
+
+impl Drop for Handschlagmarke {
+    fn drop(&mut self) {
+        HANDSCHLAEGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Einen Handschlag mit diesem Wartenden beginnen -- oder ablehnen, wenn
+/// schon einer laeuft. Treffen beide Seiten gleichzeitig aufeinander,
+/// scheitern in dieser Runde beide Versuche; der Taktgeber probiert es in der
+/// naechsten wieder.
+fn handschlag_beginnen(schwebend: &str) -> std::io::Result<Handschlagmarke> {
+    let mut laufend = HANDSCHLAEGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !laufend.insert(schwebend.to_string()) {
+        return Err(bad("a handshake with this contact is already running"));
+    }
+    Ok(Handschlagmarke(schwebend.to_string()))
+}
+
 /// Die WLAN-Beschreiber fuer den eigenen Code, in der Reihenfolge, in der sie
 /// hinausgehen. `adressen` kommt engste Maske zuerst (local_ips); Briar
 /// behaelt je Verkehrsweg den LETZTEN Beschreiber (KeyAgreementConnector:122,
@@ -1400,6 +1439,7 @@ impl Node {
                 );
                 let period = current_time_period();
                 let keys = derive_handshake_keys(transport_id, &root, period, alice);
+                let _marke = handschlag_beginnen(&schwebend)?;
                 let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
                 let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
                 // Unseren Stromkopf hinaus, bevor wir zu lesen anfangen.
@@ -1486,6 +1526,7 @@ impl Node {
         // zu zwei Tage lang angewaehlt und meist ist niemand dran -- sonst
         // waere das Fenster der Gegenseite binnen einer halben Stunde
         // ueberholt.
+        let _marke = handschlag_beginnen(&schwebend)?;
         let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
         let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
@@ -1535,6 +1576,7 @@ impl Node {
         };
         // Auch hier erst nach dem Waehlen: ein fehlgeschlagener Anwahlversuch
         // hat keine Marke gesendet.
+        let _marke = handschlag_beginnen(&schwebend)?;
         let nummer = self.stromnummer_vergeben(&schwebend, transport_id, period)?;
         let mut writer = StreamWriter::new(conn.try_clone()?, &keys, nummer);
         writer.flush()?;
@@ -6382,5 +6424,17 @@ mod abgleich_tests {
             descriptors: b,
         };
         assert_eq!(p.lan_alle(), vec!["192.168.1.5:4321", "10.0.0.5:4321"]);
+    }
+
+    #[test]
+    fn zweiter_handschlag_mit_demselben_wartenden_wird_abgelehnt() {
+        let erste = handschlag_beginnen("abgleich-test-abc").expect("frei");
+        assert!(handschlag_beginnen("abgleich-test-abc").is_err());
+        assert!(
+            handschlag_beginnen("abgleich-test-xyz").is_ok(),
+            "ein anderer Wartender stoert nicht"
+        );
+        drop(erste);
+        assert!(handschlag_beginnen("abgleich-test-abc").is_ok(), "nach dem Ende wieder frei");
     }
 }

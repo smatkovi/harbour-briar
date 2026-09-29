@@ -91,6 +91,15 @@ for seite in a b; do
         && { echo "FEHLER: bei $seite scheiterte die Runde auf der Handschlagverbindung"; grep "no sync round" "$WORK/$seite.log"; exit 1; }
 done
 echo "   beide Seiten haben auf der Handschlagverbindung abgeglichen"
+# Und der Handschlag lief genau einmal je Seite: die Wache gegen parallele
+# Handschlaege (0.40.0) laesst den zweiten Versuch nicht mehr zu, solange
+# der erste laeuft -- vorher standen hier bis zu sieben, und zwei davon
+# hinterliessen verschiedene Hauptschluessel.
+for seite in a b; do
+    N=$(grep -c "contact exchange succeeded" "$WORK/$seite.log")
+    [ "$N" -eq 1 ] || { echo "FEHLER: $seite hat $N Handschlaege abgeschlossen statt einem"; exit 1; }
+done
+echo "   je Seite genau ein abgeschlossener Handschlag"
 
 echo "== Nachricht über Tor"
 api 8301 POST /send "$(python3 -c "
