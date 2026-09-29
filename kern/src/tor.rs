@@ -100,6 +100,14 @@ impl Drop for Tor {
             // Einschalten laege es fuer jeden bereit, der unseren Port
             // belegt. SIGKILL nur, wenn Tor nicht binnen fuenf Sekunden geht.
             let _ = self.control.shutdown(std::net::Shutdown::Both);
+            // Dazu SIGTERM: ein Tor als reiner Client endet darauf ebenso
+            // sauber -- auch dann, wenn es TAKEOWNERSHIP abgelehnt hatte und
+            // das Schliessen der Verbindung ihm nichts sagt.
+            // Sicher: die Prozessnummer gehoert unserem noch nicht
+            // abgeholten Kind, sie kann nicht wiederverwendet sein.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
             for _ in 0..50 {
                 if let Ok(Some(_)) = child.try_wait() {
                     return;
@@ -459,6 +467,10 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
 /// das Cookie kennt; erst dann beweisen wir dasselbe. Das Cookie selbst
 /// geht nie ueber die Leitung. Wer unseren Port belegt, ohne die Datei
 /// lesen zu koennen, bleibt damit ein Fremder (Gegenpruefung 0.39.0, B1).
+/// Die Grenze ist der Unix-Benutzer: wer die Datei lesen oder ueberschreiben
+/// kann -- ein Prozess desselben Benutzers, ohne Sandkasten --, kann sich als
+/// unser Tor ausgeben, und dagegen hilft kein Verfahren am Port. Genau so
+/// weit reicht auch Briars Schutz.
 ///
 /// Der Weg ohne Cookie bleibt nur, um ein altes Tor (CookieAuthentication 0,
 /// Fassungen bis 0.38.0) einordnen und als Waise beenden zu koennen. Er

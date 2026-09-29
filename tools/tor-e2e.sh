@@ -85,3 +85,21 @@ echo "$OUT" | grep -q "Hallo durch Tor" \
     && echo "   angekommen: $OUT" \
     || { echo "FEHLER: nichts angekommen"; tail -15 "$WORK"/a.log "$WORK"/b.log; exit 1; }
 echo "== Tor-Weg steht"
+
+# Abschalten: der Lauscher laesst sein Tor fallen (Drop), das Tor soll von
+# selbst enden und sein Cookie wegraeumen -- ein liegengebliebenes Cookie
+# waere die Ablage, aus der sich ein Fremder auf unserem Port bedienen
+# koennte. Geprueft werden beide: kein Prozess mehr, keine Cookie-Datei.
+echo "== Tor aus bei A"
+api 8301 POST /tor '{"enabled":false}' > /dev/null
+for i in $(seq 1 30); do
+    if ! pgrep -f "$WORK/a/tor/torrc" > /dev/null 2>&1 \
+        && [ ! -e "$WORK/a/tor/control_auth_cookie" ]; then
+        echo "   Tor von A ist weg, Cookie auch (nach $i s)"
+        break
+    fi
+    sleep 1
+done
+pgrep -f "$WORK/a/tor/torrc" > /dev/null 2>&1 && { echo "FEHLER: Tor von A laeuft noch"; exit 1; }
+[ -e "$WORK/a/tor/control_auth_cookie" ] && { echo "FEHLER: das Cookie von A liegt noch da"; exit 1; }
+echo "== Abschalten sauber"

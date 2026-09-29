@@ -67,8 +67,16 @@ fn attrappe_mit(
                     merker.lock().unwrap().push(befehl.clone());
                     if let Some(rest) = befehl.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
                         if faelscher {
+                            // Ein Hash in voller Laenge, damit der Vergleich
+                            // Byte fuer Byte laeuft und nicht schon an der
+                            // Laenge scheitert.
                             let _ = schreiber.write_all(
-                                b"250 AUTHCHALLENGE SERVERHASH=00 SERVERNONCE=00\r\n",
+                                format!(
+                                    "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                                    "AB".repeat(32),
+                                    "CD".repeat(32)
+                                )
+                                .as_bytes(),
                             );
                             zeile.clear();
                             continue;
@@ -93,11 +101,13 @@ fn attrappe_mit(
                             "AUTHENTICATE {}",
                             to_hex(&tor::hmac_sha256(CLIENT_SCHLUESSEL, &m))
                         ));
+                        // Tor schreibt Hex in Grossbuchstaben (binascii.c);
+                        // die Attrappe auch, damit unser Leser das kann.
                         let _ = schreiber.write_all(
                             format!(
                                 "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
-                                to_hex(&server_hash),
-                                to_hex(&server_nonce)
+                                to_hex(&server_hash).to_uppercase(),
+                                to_hex(&server_nonce).to_uppercase()
                             )
                             .as_bytes(),
                         );
