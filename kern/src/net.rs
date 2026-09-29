@@ -138,6 +138,22 @@ pub(crate) fn anforderungen_fortschreiben(
     }
 }
 
+/// Einen Kontakt in die Verteilliste einer Gruppe nehmen -- wenn die Gruppe
+/// noch steht und er nicht gegangen ist.
+fn mitglied_eintragen(store: &mut Store, group_hex: &str, contact_id: u32) {
+    use crate::store::Sitzungszustand;
+    if let Some(g) = store.group_mut(group_hex) {
+        let draussen = g.aufgeloest
+            || matches!(
+                g.einladungen.get(&contact_id).map(|s| s.zustand),
+                Some(Sitzungszustand::Gegangen) | Some(Sitzungszustand::Fehler)
+            );
+        if !draussen && !g.contacts.contains(&contact_id) {
+            g.contacts.push(contact_id);
+        }
+    }
+}
+
 pub type Shared = Arc<Mutex<Store>>;
 
 /// Wohin das Protokoll ausser auf die Standardausgabe noch geht.
@@ -3006,6 +3022,11 @@ impl Node {
             s.eigener_zeitstempel = zeitstempel;
             s.zustand = Sitzungszustand::Beigetreten;
         }
+        // Ab jetzt ist er fuer uns Mitglied: Beitraege gehen auch an ihn. Der
+        // Weg ueber receive_group_message trug ihn schon ein, der ueber ein
+        // PEER-JOIN von Briar (receive_einladung_join) nicht -- dort blieb die
+        // Beziehung halb: er schickte uns alles, wir ihm nichts.
+        mitglied_eintragen(store, group_hex, contact_id);
         log(&format!(
             "Kontakt {} ist auch in Gruppe {} -- JOIN als Mitglied geschickt",
             contact_id, group_hex
@@ -3091,6 +3112,12 @@ impl Node {
             // zurueck. Eines hinnehmen muessen wir also: abbrechen, wie Briars
             // Eingeladener es in JOINED taete, wuerde eine laufende Gruppe
             // zerlegen.
+            //
+            // Und er gehoert in die Verteilliste: Briars PeerProtocolEngine
+            // stellt die Beziehung mit dem zweiten JOIN auf "beide drin", ab
+            // da gehen Beitraege unmittelbar zwischen den beiden. Wer hier nur
+            // vermerkte, schickte ihm weiter nichts.
+            mitglied_eintragen(store, &group_hex, contact_id);
             if let Some(s) = store.sitzung_mut(&group_hex, contact_id) {
                 s.letzte_fremde = Some(to_hex(id));
             }
@@ -4467,6 +4494,43 @@ mod einladungsantwort_tests {
 
     fn kennung(n: u8) -> SecretKey {
         [n; 32]
+    }
+
+    /// Briars Einladender schickt nach unserer Zusage selbst ein JOIN. Damit
+    /// ist er fuer uns Mitglied -- vorher wurde es nur vermerkt, und unsere
+    /// Beitraege gingen an ihn nie hinaus.
+    #[test]
+    fn zweites_join_traegt_das_mitglied_ein() {
+        let mut store = speicher("zweites-join");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Beigetreten), false);
+        store.group_mut(GRUPPE).unwrap().contacts.clear();
+        let n = knoten();
+        assert!(n.receive_einladung_join(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            Some([0xaa; 32]),
+        ));
+        assert_eq!(store.group(GRUPPE).unwrap().contacts, vec![1]);
+        // Aber nicht in eine aufgeloeste Gruppe.
+        let mut store = speicher("zweites-join-aufgeloest");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Beigetreten), false);
+        {
+            let g = store.group_mut(GRUPPE).unwrap();
+            g.contacts.clear();
+            g.aufgeloest = true;
+        }
+        let _ = n.receive_einladung_join(
+            &mut store,
+            1,
+            &kennung(9),
+            300,
+            &key_from_hex(GRUPPE),
+            Some([0xaa; 32]),
+        );
+        assert!(store.group(GRUPPE).unwrap().contacts.is_empty());
     }
 
     #[test]
