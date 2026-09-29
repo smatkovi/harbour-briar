@@ -69,6 +69,74 @@ pub const MIN_VERNUENFTIGE_ZEIT_MS: u64 = 1_609_459_200_000;
 /// nichts mehr kommt, zeigt sich nur an der Ruhe. Kurz genug, dass eine Runde
 /// nicht haengt, lang genug fuer die Datenbankarbeit auf der anderen Seite.
 const RUHE: Duration = Duration::from_millis(1500);
+/// Dasselbe ueber Tor. Dort liegen zwischen Frage und Antwort mehrere
+/// Sekunden Laufzeit durch drei Zwischenstationen und einen Rendezvouspunkt;
+/// anderthalb Sekunden Ruhe hiessen dort: die Runde ist zu Ende, bevor die
+/// Antwort ueberhaupt unterwegs sein kann.
+const RUHE_TOR: Duration = Duration::from_secs(5);
+/// Hoechstens so viele Kennungen bleiben fuer die naechste Runde vorgemerkt.
+/// Was die Gegenseite nie schickt, darf die Liste nicht ohne Ende wachsen
+/// lassen.
+const MAX_ANGEFORDERT: usize = 2000;
+
+/// Wie lange auf das naechste Byte gewartet wird, je Verkehrsweg.
+fn ruhe_fuer(transport_id: &str) -> Duration {
+    if transport_id == TOR_TRANSPORT_ID {
+        RUHE_TOR
+    } else {
+        RUHE
+    }
+}
+
+/// Solange eine Anforderung aus dieser Runde offen ist, wird laenger gewartet:
+/// die Gegenseite hat sie gerade erst gelesen, holt die Nachrichten aus ihrer
+/// Datenbank und schickt sie dann -- ueber Tor mit der ganzen Laufzeit.
+fn nachfrist(ruhe: Duration) -> Duration {
+    ruhe * 4
+}
+
+/// Aus einem Angebot das heraussuchen, was uns fehlt: nicht in der Geschichte,
+/// nicht schon in dieser Runde angefordert.
+fn unbekannte_angebote(
+    angeboten: &[SecretKey],
+    bekannt: &std::collections::BTreeSet<String>,
+    schon_angefordert: &std::collections::BTreeSet<SecretKey>,
+) -> Vec<SecretKey> {
+    angeboten
+        .iter()
+        .copied()
+        .filter(|id| !bekannt.contains(&to_hex(id)) && !schon_angefordert.contains(id))
+        .collect()
+}
+
+/// Die Anforderungsliste fuer die naechste Runde fortschreiben.
+///
+/// Was angefordert war und nicht kam, bleibt stehen; was neu angeboten wurde
+/// und uns fehlt, kommt dazu. Frueher wurde die Liste nach jeder Runde
+/// geleert -- "kommt die Nachricht nicht, bietet die Gegenseite sie erneut
+/// an". Briar tut das aber erst nach seinem Wiederholabstand, und ein
+/// REQUEST setzt dort das Kennzeichen `requested` auch fuer eine Nachricht
+/// neu, die es schon als geschickt zaehlt (DatabaseComponentImpl
+/// .receiveRequest: raiseRequestedFlag und resetExpiryTime): wer wieder
+/// fragt, bekommt sie in der naechsten Runde statt eine Minute spaeter.
+pub(crate) fn anforderungen_fortschreiben(
+    to_request: &mut Vec<String>,
+    angeboten: &[SecretKey],
+    erhalten: &std::collections::BTreeSet<String>,
+    bekannt: &std::collections::BTreeSet<String>,
+) {
+    to_request.retain(|id| !erhalten.contains(id) && !bekannt.contains(id));
+    for id in angeboten {
+        let hex = to_hex(id);
+        if !bekannt.contains(&hex) && !erhalten.contains(&hex) && !to_request.contains(&hex) {
+            to_request.push(hex);
+        }
+    }
+    if to_request.len() > MAX_ANGEFORDERT {
+        let ueber = to_request.len() - MAX_ANGEFORDERT;
+        to_request.drain(..ueber);
+    }
+}
 
 pub type Shared = Arc<Mutex<Store>>;
 
@@ -2088,8 +2156,13 @@ impl Node {
         // Kurze Zeitgrenze fuer diese Phase: eine Gegenseite, die ihren Strom
         // nicht beendet (genau das tut Briar), erkennt man nur an der Ruhe.
         // Eine Fassung bis 0.27.1 schickt ihr Ende sofort, dort wartet also
-        // niemand.
-        let _ = conn.set_read_timeout(RUHE);
+        // niemand. Wie kurz, haengt am Verkehrsweg (ruhe_fuer).
+        let ruhe = ruhe_fuer(transport_id);
+        let _ = conn.set_read_timeout(ruhe);
+        // Was in DIESER Runde angefordert wurde und noch nicht da ist. Solange
+        // hier etwas steht, gilt die Nachfrist statt der Ruhe.
+        let mut ausstehend: std::collections::BTreeSet<SecretKey> =
+            std::collections::BTreeSet::new();
         loop {
             match read_record(&mut reader) {
                 Ok(Some(record)) => {
@@ -2100,7 +2173,36 @@ impl Node {
                         sync::ACK => acked_ids.extend(sync::parse_ids(&record.payload)),
                         // Ein Angebot: die Gegenseite haelt diese Nachrichten
                         // bereit und schickt sie erst, wenn wir sie anfordern.
-                        sync::OFFER => offered_ids.extend(sync::parse_ids(&record.payload)),
+                        //
+                        // Anfordern sofort, in derselben Runde, nicht erst in
+                        // der naechsten. Briars Sitzung liest den REQUEST und
+                        // schickt das Angeforderte noch ueber dieselbe
+                        // Verbindung (DuplexOutgoingSession: nach jedem
+                        // RequestReceivedEvent ein generateRequestedBatch).
+                        // Vorher wanderte das Angebot nur in die Liste fuer die
+                        // naechste Runde: eine Nachricht von Briar brauchte
+                        // zwei Verbindungen, und ueber Tor heisst das Minuten.
+                        sync::OFFER => {
+                            let angeboten = sync::parse_ids(&record.payload);
+                            let neu = {
+                                let store = self.store.lock().unwrap();
+                                match store.contact(contact_id) {
+                                    Some(c) => {
+                                        let bekannt: std::collections::BTreeSet<String> =
+                                            c.messages.iter().map(|m| m.id.clone()).collect();
+                                        unbekannte_angebote(&angeboten, &bekannt, &ausstehend)
+                                    }
+                                    None => Vec::new(),
+                                }
+                            };
+                            if !neu.is_empty() {
+                                sync::write_request(&mut writer, &neu)?;
+                                writer.flush()?;
+                                ausstehend.extend(neu.iter().copied());
+                                let _ = conn.set_read_timeout(nachfrist(ruhe));
+                            }
+                            offered_ids.extend(angeboten);
+                        }
                         // Eine Anforderung: sie will etwas, das wir ihr
                         // angeboten haben. Das geht gleich in dieser Runde
                         // hinaus, nicht erst in der naechsten.
@@ -2110,6 +2212,10 @@ impl Node {
                                 ids::parse_raw_message(&record.payload)
                             {
                                 let id = ids::message_id(&group, timestamp, &body);
+                                // Das Angeforderte ist da: zurueck zur Ruhe.
+                                if ausstehend.remove(&id) && ausstehend.is_empty() {
+                                    let _ = conn.set_read_timeout(ruhe);
+                                }
                                 received.push((id, group, timestamp, body));
                             }
                         }
@@ -2142,23 +2248,22 @@ impl Node {
         {
             let mut store = self.store.lock().unwrap();
             if let Some(contact) = store.contact_mut(contact_id) {
-                // Angefordert ist angefordert: die Liste gilt als erledigt,
-                // sobald der Satz draussen ist. Kommt die Nachricht nicht,
-                // bietet die Gegenseite sie in der naechsten Runde erneut an.
-                contact.to_request.clear();
-                // Was neu angeboten wurde, kommt in die naechste Runde --
-                // ausser wir haben es schon.
+                // Die Anforderungsliste fuer die naechste Runde: was nicht kam,
+                // bleibt; was neu angeboten wurde und fehlt, kommt dazu
+                // (anforderungen_fortschreiben sagt, warum nicht geleert wird).
                 let bekannt: std::collections::BTreeSet<String> = contact
                     .messages
                     .iter()
                     .map(|m| m.id.clone())
                     .collect();
-                for id in &offered_ids {
-                    let hex = to_hex(id);
-                    if !bekannt.contains(&hex) && !contact.to_request.contains(&hex) {
-                        contact.to_request.push(hex);
-                    }
-                }
+                let erhalten: std::collections::BTreeSet<String> =
+                    received.iter().map(|(id, ..)| to_hex(id)).collect();
+                anforderungen_fortschreiben(
+                    &mut contact.to_request,
+                    &offered_ids,
+                    &erhalten,
+                    &bekannt,
+                );
                 let peer_acked: std::collections::BTreeSet<String> =
                     acked_ids.iter().map(|id| to_hex(id)).collect();
                 for message in contact.outbox.iter_mut() {
@@ -5992,5 +6097,60 @@ mod bqp_ergebnis_tests {
         let gesehen = *BQP_ERGEBNIS.lock().unwrap();
         assert_eq!(gesehen, Some(7));
         *BQP_ERGEBNIS.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod abgleich_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn k(n: u8) -> SecretKey {
+        [n; 32]
+    }
+
+    #[test]
+    fn angebot_wird_um_bekanntes_und_angefordertes_gekuerzt() {
+        let bekannt: BTreeSet<String> = [to_hex(&k(1))].into_iter().collect();
+        let schon: BTreeSet<SecretKey> = [k(2)].into_iter().collect();
+        assert_eq!(
+            unbekannte_angebote(&[k(1), k(2), k(3)], &bekannt, &schon),
+            vec![k(3)]
+        );
+    }
+
+    /// Was angefordert war und nicht kam, bleibt stehen; was kam, geht; was
+    /// neu angeboten wurde, kommt dazu -- und nichts doppelt.
+    #[test]
+    fn nicht_gekommenes_bleibt_angefordert() {
+        let mut liste = vec![to_hex(&k(1)), to_hex(&k(2))];
+        let erhalten: BTreeSet<String> = [to_hex(&k(1))].into_iter().collect();
+        anforderungen_fortschreiben(&mut liste, &[k(2), k(3), k(1)], &erhalten, &BTreeSet::new());
+        assert_eq!(liste, vec![to_hex(&k(2)), to_hex(&k(3))]);
+    }
+
+    #[test]
+    fn bekanntes_faellt_aus_der_liste() {
+        let mut liste = vec![to_hex(&k(4))];
+        let bekannt: BTreeSet<String> = [to_hex(&k(4))].into_iter().collect();
+        anforderungen_fortschreiben(&mut liste, &[k(4)], &BTreeSet::new(), &bekannt);
+        assert!(liste.is_empty());
+    }
+
+    #[test]
+    fn die_liste_waechst_nicht_ohne_ende() {
+        let mut liste: Vec<String> = (0..MAX_ANGEFORDERT).map(|i| format!("{:064x}", i)).collect();
+        anforderungen_fortschreiben(&mut liste, &[k(9)], &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(liste.len(), MAX_ANGEFORDERT);
+        assert_eq!(liste.last().unwrap(), &to_hex(&k(9)), "das Neueste bleibt");
+        assert_ne!(liste[0], format!("{:064x}", 0), "das Aelteste geht");
+    }
+
+    #[test]
+    fn ueber_tor_wird_laenger_gewartet() {
+        assert!(ruhe_fuer(TOR_TRANSPORT_ID) > ruhe_fuer(LAN_TRANSPORT_ID));
+        assert_eq!(ruhe_fuer(LAN_TRANSPORT_ID), RUHE);
+        assert_eq!(ruhe_fuer(BLUETOOTH_TRANSPORT_ID), RUHE);
+        assert!(nachfrist(RUHE) > RUHE);
     }
 }
