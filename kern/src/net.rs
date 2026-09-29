@@ -74,10 +74,16 @@ const RUHE: Duration = Duration::from_millis(1500);
 /// anderthalb Sekunden Ruhe hiessen dort: die Runde ist zu Ende, bevor die
 /// Antwort ueberhaupt unterwegs sein kann.
 const RUHE_TOR: Duration = Duration::from_secs(5);
-/// Hoechstens so viele Kennungen bleiben fuer die naechste Runde vorgemerkt.
-/// Was die Gegenseite nie schickt, darf die Liste nicht ohne Ende wachsen
-/// lassen.
-const MAX_ANGEFORDERT: usize = 2000;
+/// Hoechstens so viele Kennungen bleiben fuer die naechste Runde vorgemerkt --
+/// Briars MAX_OFFERED_MESSAGES. Was die Gegenseite nie schickt, darf die
+/// Liste nicht ohne Ende wachsen lassen.
+const MAX_ANGEFORDERT: usize = 1000;
+/// So oft wird eine Kennung hoechstens angefordert. Was dann noch nicht kam,
+/// kommt nicht mehr: bei Briar gelöschte Nachrichten (der REQUEST setzt zwar
+/// das Kennzeichen, aber getRequestedMessagesToSend filtert deleted = FALSE)
+/// oder ein Rumpf, den wir nicht lesen koennen. Ohne Grenze gingen solche
+/// Kennungen in jeder Runde als REQUEST hinaus, ueber Tor bis zu 32 KB.
+const MAX_ANFORDERUNGS_RUNDEN: u8 = 4;
 
 /// Wie lange auf das naechste Byte gewartet wird, je Verkehrsweg.
 fn ruhe_fuer(transport_id: &str) -> Duration {
@@ -119,16 +125,28 @@ fn unbekannte_angebote(
 /// neu, die es schon als geschickt zaehlt (DatabaseComponentImpl
 /// .receiveRequest: raiseRequestedFlag und resetExpiryTime): wer wieder
 /// fragt, bekommt sie in der naechsten Runde statt eine Minute spaeter.
+///
+/// `runden` zaehlt je Kennung, wie oft sie schon angefordert wurde; nach
+/// MAX_ANFORDERUNGS_RUNDEN faellt sie heraus. Bietet Briar sie spaeter
+/// erneut an, zaehlt sie von vorn.
 pub(crate) fn anforderungen_fortschreiben(
     to_request: &mut Vec<String>,
+    runden: &mut BTreeMap<String, u8>,
     angeboten: &[SecretKey],
     erhalten: &std::collections::BTreeSet<String>,
     bekannt: &std::collections::BTreeSet<String>,
 ) {
     to_request.retain(|id| !erhalten.contains(id) && !bekannt.contains(id));
+    // Was bleibt, ist eine Runde aelter -- und was zu oft blieb, geht.
+    to_request.retain(|id| {
+        let n = runden.entry(id.clone()).or_insert(0);
+        *n += 1;
+        *n <= MAX_ANFORDERUNGS_RUNDEN
+    });
     for id in angeboten {
         let hex = to_hex(id);
         if !bekannt.contains(&hex) && !erhalten.contains(&hex) && !to_request.contains(&hex) {
+            runden.insert(hex.clone(), 0);
             to_request.push(hex);
         }
     }
@@ -136,6 +154,8 @@ pub(crate) fn anforderungen_fortschreiben(
         let ueber = to_request.len() - MAX_ANGEFORDERT;
         to_request.drain(..ueber);
     }
+    let bleibt: std::collections::BTreeSet<&String> = to_request.iter().collect();
+    runden.retain(|id, _| bleibt.contains(id));
 }
 
 /// Die Handschlaege, die gerade laufen, nach dem Schluessel des Wartenden.
@@ -1463,7 +1483,7 @@ impl Node {
                     peer_ip.clone(),
                 )?;
                 if let Some(id) = neu {
-                    self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip);
+                    self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip, false);
                 }
                 Ok(())
             }
@@ -1483,6 +1503,7 @@ impl Node {
                     id,
                     Some((header_key, stream_number, period)),
                     peer_ip,
+                    false,
                 )
             }
             None => {
@@ -1541,7 +1562,15 @@ impl Node {
             peer_ip.clone(),
         )?;
         if let Some(id) = neu {
-            self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip);
+            // In einem eigenen Faden: connect_pending laeuft im Taktgeber,
+            // connect_pending_at in der Treffpunktschleife -- die duerfen nicht
+            // eine ganze Abgleichrunde lang stehen, bis IO_TIMEOUT, wenn die
+            // Gegenseite eine alte Fassung ist und aufgelegt hat.
+            let store = Arc::clone(&self.store);
+            let transport = transport_id.to_string();
+            std::thread::spawn(move || {
+                Node { store }.abgleich_nach_handschlag(abgleich, &transport, id, peer_ip, true);
+            });
         }
         Ok(())
     }
@@ -1591,7 +1620,15 @@ impl Node {
             peer_ip.clone(),
         )?;
         if let Some(id) = neu {
-            self.abgleich_nach_handschlag(abgleich, transport_id, id, peer_ip);
+            // In einem eigenen Faden: connect_pending laeuft im Taktgeber,
+            // connect_pending_at in der Treffpunktschleife -- die duerfen nicht
+            // eine ganze Abgleichrunde lang stehen, bis IO_TIMEOUT, wenn die
+            // Gegenseite eine alte Fassung ist und aufgelegt hat.
+            let store = Arc::clone(&self.store);
+            let transport = transport_id.to_string();
+            std::thread::spawn(move || {
+                Node { store }.abgleich_nach_handschlag(abgleich, &transport, id, peer_ip, true);
+            });
         }
         Ok(())
     }
@@ -1877,6 +1914,7 @@ impl Node {
                 loesch_stempel: 0,
                 fremde_fassungen: Default::default(),
                 fremde_ansage_nummer: 0,
+                anforderungs_runden: Default::default(),
             });
             store
                 .state
@@ -1894,32 +1932,40 @@ impl Node {
 
     /// Die Handschlagverbindung gleich als Abgleichverbindung weiterbenutzen.
     ///
-    /// Briar tut genau das (ConnectionManagerImpl auf beiden Handschlagseiten:
-    /// "Reuse the connection as a transport connection", und
-    /// ContactExchangeManagerImpl am Ende des Treffens nebeneinander): der
-    /// neue Kontakt bekommt Versionsansage und Adressen sofort, nicht erst
-    /// beim naechsten Takt -- und ueber Tor ist der naechste Takt eine Minute
-    /// und einen neuen Rendezvous entfernt. Ohne diese Runde blieb die
-    /// Nachrichtengruppe bei Briar bis dahin unsichtbar, und was in der
-    /// Zwischenzeit geschrieben wurde, verwarf es.
+    /// Briar tut genau das ("Reuse the connection as a transport connection"
+    /// in ConnectionManagerImpl.OutgoingHandshakeConnection und
+    /// .IncomingHandshakeConnection; nach dem Treffen nebeneinander ruft
+    /// AddNearbyContactViewModel manageOutgoingConnection): der neue Kontakt
+    /// bekommt Versionsansage und Adressen sofort, nicht erst beim naechsten
+    /// Takt -- und ueber Tor ist der naechste Takt eine Minute und einen neuen
+    /// Rendezvous entfernt. Ohne diese Runde blieb die Nachrichtengruppe bei
+    /// Briar bis dahin unsichtbar, und was in der Zwischenzeit geschrieben
+    /// wurde, verwarf es.
     ///
-    /// Beide Seiten schreiben zuerst und lesen dann die Marke der anderen --
-    /// so verhaelt sich Briars ausgehende Duplex-Verbindung, und so wartet
-    /// keine Seite auf die andere. Eine Gegenseite mit einer aelteren Fassung
-    /// legt nach dem Austausch auf; das ist dann eine Zeile im Protokoll,
-    /// kein Fehler.
+    /// Beide Seiten schreiben zuerst und lesen dann die Marke der anderen.
+    /// Briars waehlende Seite tut dasselbe; seine annehmende liest zuerst
+    /// (manageIncomingConnection) -- und kommt mit unserem Schreiben ebenso
+    /// zurecht wie eine, die selbst zuerst schreibt. So wartet keine Seite
+    /// auf die andere. `gewaehlt` entscheidet nur ueber den PRIORITY-Satz.
+    /// Eine Gegenseite mit einer aelteren Fassung legt nach dem Austausch
+    /// auf; das ist dann eine Zeile im Protokoll, kein Fehler.
     fn abgleich_nach_handschlag(
         &self,
         conn: Conn,
         transport_id: &str,
         contact_id: u32,
         peer_ip: Option<String>,
+        gewaehlt: bool,
     ) {
-        if let Err(e) = self.run_sync(conn, transport_id, contact_id, None, peer_ip) {
-            log(&format!(
+        match self.run_sync(conn, transport_id, contact_id, None, peer_ip, gewaehlt) {
+            Ok(()) => log(&format!(
+                "sync round on the handshake connection with contact {} done",
+                contact_id
+            )),
+            Err(e) => log(&format!(
                 "no sync round on the handshake connection with contact {}: {}",
                 contact_id, e
-            ));
+            )),
         }
     }
 
@@ -2028,7 +2074,7 @@ impl Node {
             Conn::Tcp(s) => s.peer_addr().ok().map(|a| a.ip().to_string()),
             Conn::Bluetooth(_) => None,
         };
-        self.run_sync(conn, transport_id, id, None, peer_ip)
+        self.run_sync(conn, transport_id, id, None, peer_ip, true)
     }
 
     /// Tries a contact over every transport it has an address for, newest
@@ -2078,6 +2124,7 @@ impl Node {
         contact_id: u32,
         incoming: Option<(SecretKey, u64, u64)>,
         peer_ip: Option<String>,
+        gewaehlt: bool,
     ) -> std::io::Result<()> {
         conn.set_timeouts()?;
         let period = current_time_period();
@@ -2252,8 +2299,11 @@ impl Node {
         // Duplex-Verbindung (DuplexOutgoingSession: "priority != null") und
         // liest ihn auf der annehmenden Seite, um bei zwei gleichzeitigen
         // Verbindungen eine zu schliessen. Von der annehmenden Seite war er
-        // fuer Briar ein Satz ohne Sinn -- geduldet, aber falsch.
-        if incoming.is_none() {
+        // fuer Briar ein Satz ohne Sinn -- geduldet ("Ignoring priority for
+        // outgoing connection"), aber falsch. `gewaehlt` sagt es ausdruecklich:
+        // nach einem angenommenen Handschlag schreiben wir zwar auch zuerst
+        // (abgleich_nach_handschlag), haben aber nicht gewaehlt.
+        if incoming.is_none() && gewaehlt {
             sync::write_priority(&mut writer, &crate::util::random(16))?;
         }
         sync::write_ack(&mut writer, &to_ack)?;
@@ -2310,10 +2360,25 @@ impl Node {
         // niemand. Wie kurz, haengt am Verkehrsweg (ruhe_fuer).
         let ruhe = ruhe_fuer(transport_id);
         let _ = conn.set_read_timeout(ruhe);
-        // Was in DIESER Runde angefordert wurde und noch nicht da ist. Solange
-        // hier etwas steht, gilt die Nachfrist statt der Ruhe.
+        // Was angefordert wurde und noch nicht da ist. Solange hier etwas
+        // steht, gilt die Nachfrist statt der Ruhe -- auch fuer das, was am
+        // Rundenanfang angefordert wurde: dafuer muss die Gegenseite ebenso
+        // erst ihre Datenbank fragen.
         let mut ausstehend: std::collections::BTreeSet<SecretKey> =
-            std::collections::BTreeSet::new();
+            to_request.iter().copied().collect();
+        if !ausstehend.is_empty() {
+            let _ = conn.set_read_timeout(nachfrist(ruhe));
+        }
+        // Die Bestandsmenge einmal, nicht je Angebot -- und fortgeschrieben
+        // mit dem, was in dieser Runde kommt. Je Angebot neu gebaut hiesse:
+        // die ganze Geschichte unter dem Speicherschloss, bei jedem Satz.
+        let mut bekannt: std::collections::BTreeSet<String> = {
+            let store = self.store.lock().unwrap();
+            store
+                .contact(contact_id)
+                .map(|c| c.messages.iter().map(|m| m.id.clone()).collect())
+                .unwrap_or_default()
+        };
         loop {
             match read_record(&mut reader) {
                 Ok(Some(record)) => {
@@ -2329,26 +2394,25 @@ impl Node {
                         // der naechsten. Briars Sitzung liest den REQUEST und
                         // schickt das Angeforderte noch ueber dieselbe
                         // Verbindung (DuplexOutgoingSession: nach jedem
-                        // RequestReceivedEvent ein generateRequestedBatch).
+                        // MessageRequestedEvent ein generateBatch, das die
+                        // angeforderten Nachrichten aus der Datenbank holt).
                         // Vorher wanderte das Angebot nur in die Liste fuer die
                         // naechste Runde: eine Nachricht von Briar brauchte
                         // zwei Verbindungen, und ueber Tor heisst das Minuten.
                         sync::OFFER => {
                             let angeboten = sync::parse_ids(&record.payload);
-                            let neu = {
-                                let store = self.store.lock().unwrap();
-                                match store.contact(contact_id) {
-                                    Some(c) => {
-                                        let bekannt: std::collections::BTreeSet<String> =
-                                            c.messages.iter().map(|m| m.id.clone()).collect();
-                                        unbekannte_angebote(&angeboten, &bekannt, &ausstehend)
-                                    }
-                                    None => Vec::new(),
-                                }
-                            };
+                            let neu = unbekannte_angebote(&angeboten, &bekannt, &ausstehend);
                             if !neu.is_empty() {
-                                sync::write_request(&mut writer, &neu)?;
-                                writer.flush()?;
+                                // Ein Schreibfehler hier darf die Runde nicht
+                                // verwerfen: was schon gekommen ist, wird
+                                // unten verbucht. Die Quittungen danach
+                                // scheitern dann ohnehin, das ist harmlos.
+                                if let Err(e) = sync::write_request(&mut writer, &neu)
+                                    .and_then(|_| writer.flush())
+                                {
+                                    log(&format!("request could not be written: {}", e));
+                                    break;
+                                }
                                 ausstehend.extend(neu.iter().copied());
                                 let _ = conn.set_read_timeout(nachfrist(ruhe));
                             }
@@ -2367,6 +2431,7 @@ impl Node {
                                 if ausstehend.remove(&id) && ausstehend.is_empty() {
                                     let _ = conn.set_read_timeout(ruhe);
                                 }
+                                bekannt.insert(to_hex(&id));
                                 received.push((id, group, timestamp, body));
                             }
                         }
@@ -2375,9 +2440,9 @@ impl Node {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let ruhe = e.kind() == std::io::ErrorKind::WouldBlock
+                    let stille = e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut;
-                    if ruhe || e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    if stille || e.kind() == std::io::ErrorKind::UnexpectedEof {
                         break;
                     }
                     log(&format!("sync read stopped: {}", e));
@@ -2411,6 +2476,7 @@ impl Node {
                     received.iter().map(|(id, ..)| to_hex(id)).collect();
                 anforderungen_fortschreiben(
                     &mut contact.to_request,
+                    &mut contact.anforderungs_runden,
                     &offered_ids,
                     &erhalten,
                     &bekannt,
@@ -3149,11 +3215,13 @@ impl Node {
             s.eigener_zeitstempel = zeitstempel;
             s.zustand = Sitzungszustand::Beigetreten;
         }
-        // Ab jetzt ist er fuer uns Mitglied: Beitraege gehen auch an ihn. Der
-        // Weg ueber receive_group_message trug ihn schon ein, der ueber ein
-        // PEER-JOIN von Briar (receive_einladung_join) nicht -- dort blieb die
-        // Beziehung halb: er schickte uns alles, wir ihm nichts.
-        mitglied_eintragen(store, group_hex, contact_id);
+        // In die Verteilliste kommt er hier noch NICHT. Kam sein PEER-JOIN
+        // zuerst, steht er schon drin (receive_einladung_join, Start-Zweig);
+        // schicken wir zuerst (beziehung_zeigen), steht Briar in START und
+        // haelt die Gruppe fuer uns unsichtbar, bis es antwortet -- Beitraege
+        // dazwischen wuerden verworfen und nicht quittiert. Erst sein JOIN
+        // zurueck (Beigetreten-Zweig) traegt ihn ein, so wie Briars
+        // PeerProtocolEngine erst in BOTH_JOINED teilt.
         log(&format!(
             "Kontakt {} ist auch in Gruppe {} -- JOIN als Mitglied geschickt",
             contact_id, group_hex
@@ -4452,6 +4520,7 @@ mod versionsansage_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         }
     }
 
@@ -4557,6 +4626,7 @@ mod einladungsantwort_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         });
         store
     }
@@ -4658,6 +4728,21 @@ mod einladungsantwort_tests {
             Some([0xaa; 32]),
         );
         assert!(store.group(GRUPPE).unwrap().contacts.is_empty());
+    }
+
+    #[test]
+    fn wer_gegangen_ist_kommt_nicht_in_die_verteilliste() {
+        let mut store = speicher("gegangen-verteilliste");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Gegangen), false);
+        store.group_mut(GRUPPE).unwrap().contacts.clear();
+        mitglied_eintragen(&mut store, GRUPPE, 1);
+        assert!(store.group(GRUPPE).unwrap().contacts.is_empty());
+        let mut store = speicher("drin-verteilliste");
+        gruppe(&mut store, UNSER, Some(Sitzungszustand::Beigetreten), false);
+        store.group_mut(GRUPPE).unwrap().contacts.clear();
+        mitglied_eintragen(&mut store, GRUPPE, 1);
+        mitglied_eintragen(&mut store, GRUPPE, 1);
+        assert_eq!(store.group(GRUPPE).unwrap().contacts, vec![1], "einmal, nicht zweimal");
     }
 
     #[test]
@@ -5119,10 +5204,11 @@ impl Node {
         //
         // Briar legt die Beschreiber in eine HashMap nach Verkehrsweg
         // (KeyAgreementConnector:122), dort gewinnt also der LETZTE -- und nur
-        // den waehlt es an. Darum steht bei uns das engste Netz zuletzt
-        // (lan_beschreiber): bei zwei Geraeten nebeneinander ist es das
-        // aussichtsreichste. Unser eigener Anwaehler probiert alle; fuer Briar
-        // zaehlt allein die Reihenfolge.
+        // den waehlt es an, und auch den nur, wenn er im Netz seines eigenen
+        // Lauschers liegt (LanTcpPlugin.isConnectable). Mehr als eine Adresse
+        // ist bei Briar also nicht unterzubringen; die beste Wette ist das
+        // engste Netz, darum steht es zuletzt (lan_beschreiber). Unser eigener
+        // Anwaehler probiert alle.
         let adressen: Vec<std::net::Ipv4Addr> = local_ips()
             .into_iter()
             .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
@@ -5531,7 +5617,11 @@ impl Node {
         // scannt, wartet damit einfach, bis die Gegenseite ihren Code zeigt.
         // Ohne das muesste der Benutzer noch einmal scannen.
         let mut letzter = bad("keine Adresse im Code");
-        let adressen = payload.lan_alle();
+        // Im Code steht das engste Netz zuletzt (Briar nimmt den letzten
+        // Beschreiber); wir probieren alle und fangen mit dem engsten an --
+        // jeder Fehlversuch kostet CONNECT_TIMEOUT.
+        let mut adressen = payload.lan_alle();
+        adressen.reverse();
         // Die Kennung des Dienstes der Gegenseite kommt aus IHRER
         // Verpflichtung -- Briar macht es genauso
         // (AbstractBluetoothPlugin.createKeyAgreementConnection:464).
@@ -5752,6 +5842,7 @@ impl Node {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         });
         store.save()?;
         log(&format!("BQP: neuer Kontakt {} ({})", id, remote.name));
@@ -5770,6 +5861,9 @@ impl Node {
     ) -> std::io::Result<u32> {
         let ihr = crate::bqp::parse(&ihr_rumpf).ok_or_else(|| bad("kein BQP-Code"))?;
         let unser = crate::bqp::parse(&unser_rumpf).ok_or_else(|| bad("eigener Code kaputt"))?;
+        // Ueber Bluetooth kommt hier eine leere Adresse an; als Some("") wuerde
+        // sie in der Abgleichrunde als gesehene Adresse gespeichert.
+        let gegen_ip = gegen_ip.filter(|s| !s.is_empty());
         let alice = crate::bqp::ist_alice(&unser.commitment, &ihr.commitment);
         strom.set_bqp_timeouts()?;
         let mut strom = strom;
@@ -5795,9 +5889,10 @@ impl Node {
             lauf.fertig.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Wie nach dem Handschlag ueber den Link: dieselbe Verbindung traegt
-        // gleich die erste Abgleichrunde (ContactExchangeManagerImpl:
-        // manageOutgoingConnection am Ende des Austauschs).
-        self.abgleich_nach_handschlag(abgleich, verkehrsweg, id, gegen_ip);
+        // gleich die erste Abgleichrunde. Briar ruft dafuer auf BEIDEN Seiten
+        // manageOutgoingConnection (AddNearbyContactViewModel), also mit
+        // PRIORITY.
+        self.abgleich_nach_handschlag(abgleich, verkehrsweg, id, gegen_ip, true);
         Ok(id)
     }
 }
@@ -6018,21 +6113,22 @@ pub fn loeschuhr_starten(nachricht: &mut crate::store::Message, jetzt: u64) {
 /// Alles wegraeumen, dessen Frist um ist. Gibt zurueck, ob sich etwas
 /// geaendert hat -- dann muss der Speicher geschrieben werden.
 pub fn verschwundenes_fegen(store: &mut Store, jetzt: u64) -> bool {
-    let mut anhaenge: Vec<String> = Vec::new();
-    let mut ids: Vec<String> = Vec::new();
+    // Mengen, nicht Listen: unten wird je Korbeintrag nachgeschlagen.
+    let mut anhaenge: std::collections::BTreeSet<String> = Default::default();
+    let mut ids: std::collections::BTreeSet<String> = Default::default();
     for contact in store.state.contacts.iter_mut() {
         contact.messages.retain(|m| {
             let weg = m.loesch_frist.map(|f| f <= jetzt).unwrap_or(false);
             if weg {
                 for kopf in &m.anhaenge {
-                    anhaenge.push(kopf.id.clone());
+                    anhaenge.insert(kopf.id.clone());
                 }
                 if m.anhaenge.is_empty() {
                     if let Some(a) = &m.attachment {
-                        anhaenge.push(a.clone());
+                        anhaenge.insert(a.clone());
                     }
                 }
-                ids.push(m.id.clone());
+                ids.insert(m.id.clone());
             }
             !weg
         });
@@ -6089,6 +6185,7 @@ mod verschwinden_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         });
         store
     }
@@ -6288,6 +6385,7 @@ mod zusage_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         };
         assert!(leer.darf_zuenddauer_bekommen(), "keine Ansage heisst nicht 'kann es nicht'");
         assert!(!leer.zuenddauer_bestaetigt(), "bestaetigt ist sie deshalb nicht");
@@ -6353,6 +6451,170 @@ mod bqp_ergebnis_tests {
 }
 
 #[cfg(test)]
+mod angebots_tests {
+    use super::*;
+
+    const IHR: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn knoten(name: &str, period: u64) -> Node {
+        let mut p = std::env::temp_dir();
+        p.push(format!("briar-angebot-{}.json", name));
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        store.state.contacts.push(Contact {
+            id: 1,
+            name: "Gegenueber".to_string(),
+            author_id: IHR.to_string(),
+            signature_public: IHR.to_string(),
+            handshake_public: Some(IHR.to_string()),
+            master_key: IHR.to_string(),
+            alice: true,
+            creation_period: period,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
+        });
+        Node::new(Arc::new(Mutex::new(store)))
+    }
+
+    /// Die Gegenseite spielt Briar: sie bietet an, statt zu schicken, und
+    /// schickt erst auf den REQUEST. Der muss in DERSELBEN Runde kommen -- vor
+    /// unserem Stromende --, und die Nachricht muss noch in dieser Runde
+    /// quittiert werden. Genau das konnte 0.39.0 nicht: dort brauchte eine
+    /// Nachricht von Briar zwei Verbindungen.
+    #[test]
+    fn angebot_wird_in_derselben_runde_angefordert_und_quittiert() {
+        let period = current_time_period();
+        let node = knoten("runde", period);
+        let master = key_from_hex(IHR);
+        let group: SecretKey = [9u8; 32];
+        let zeit = 1_700_000_000_000u64;
+        let rumpf = b"hallo".to_vec();
+        let id = ids::message_id(&group, zeit, &rumpf);
+
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let gegenseite = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut roh = strom.try_clone().unwrap();
+            // Unsere Marke ueberlesen: der Dienst schreibt zuerst.
+            let mut marke = [0u8; TAG_LEN];
+            roh.read_exact(&mut marke).unwrap();
+            // Die Gegenseite ist Bob -- der Kontakt bei uns ist Alice.
+            let ihre = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, false);
+            let unsere = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, true);
+            let mut schreiber = StreamWriter::new(strom.try_clone().unwrap(), &ihre, 0);
+            sync::write_versions(&mut schreiber).unwrap();
+            sync::write_offer(&mut schreiber, &[id]).unwrap();
+            schreiber.flush().unwrap();
+            // Lesen, was der Dienst schreibt -- bis zum REQUEST, und zwar VOR
+            // seinem Stromende.
+            let mut leser = StreamReader::new(roh, unsere.header_key, 0);
+            let mut angefordert = false;
+            let mut ende_vor_anforderung = false;
+            loop {
+                match read_record(&mut leser) {
+                    Ok(Some(r)) if r.record_type == sync::REQUEST => {
+                        angefordert = sync::parse_ids(&r.payload).contains(&id);
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        ende_vor_anforderung = true;
+                        break;
+                    }
+                    Err(e) => panic!("Lesen bei der Gegenseite: {}", e),
+                }
+            }
+            // Das Angeforderte hinterher, dann unser Ende ...
+            sync::write_message(&mut schreiber, &group, zeit, &rumpf).unwrap();
+            schreiber.send_end_of_stream().unwrap();
+            // ... und die Quittung des Dienstes abwarten.
+            let mut quittiert = false;
+            loop {
+                match read_record(&mut leser) {
+                    Ok(Some(r)) if r.record_type == sync::ACK => {
+                        quittiert |= sync::parse_ids(&r.payload).contains(&id);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => panic!("Lesen der Quittung: {}", e),
+                }
+            }
+            (angefordert, ende_vor_anforderung, quittiert)
+        });
+
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        node.run_sync(Conn::Tcp(strom), LAN_TRANSPORT_ID, 1, None, None, true)
+            .expect("die Runde geht durch");
+        let (angefordert, ende_vor_anforderung, quittiert) = gegenseite.join().unwrap();
+        assert!(!ende_vor_anforderung, "der Dienst beendete seinen Strom, bevor er anforderte");
+        assert!(angefordert, "das Angebot wurde nicht angefordert");
+        assert!(quittiert, "die angeforderte Nachricht wurde nicht in derselben Runde quittiert");
+        let s = node.store.lock().unwrap();
+        let c = s.contact(1).unwrap();
+        assert!(
+            !c.to_request.contains(&to_hex(&id)),
+            "erhalten heisst: nicht noch einmal anfordern"
+        );
+        assert!(c.anforderungs_runden.is_empty());
+    }
+
+    /// Ein Angebot, auf das nichts folgt: die Kennung bleibt fuer die naechste
+    /// Runde vorgemerkt, mit Zaehler null.
+    #[test]
+    fn unbeantwortetes_angebot_bleibt_vorgemerkt() {
+        let period = current_time_period();
+        let node = knoten("vorgemerkt", period);
+        let master = key_from_hex(IHR);
+        let id: SecretKey = [3u8; 32];
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let gegenseite = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            let mut roh = strom.try_clone().unwrap();
+            let mut marke = [0u8; TAG_LEN];
+            roh.read_exact(&mut marke).unwrap();
+            let ihre = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, false);
+            let mut schreiber = StreamWriter::new(strom.try_clone().unwrap(), &ihre, 0);
+            sync::write_versions(&mut schreiber).unwrap();
+            sync::write_offer(&mut schreiber, &[id]).unwrap();
+            // Kein Ende, keine Nachricht: der Dienst muss an der Stille merken,
+            // dass nichts mehr kommt.
+            schreiber.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            drop(schreiber);
+            drop(roh);
+        });
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = node.run_sync(Conn::Tcp(strom), LAN_TRANSPORT_ID, 1, None, None, true);
+        gegenseite.join().unwrap();
+        let s = node.store.lock().unwrap();
+        let c = s.contact(1).unwrap();
+        assert_eq!(c.to_request, vec![to_hex(&id)]);
+        assert_eq!(c.anforderungs_runden.get(&to_hex(&id)), Some(&0));
+    }
+}
+
+#[cfg(test)]
 mod abgleich_tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -6376,24 +6638,56 @@ mod abgleich_tests {
     #[test]
     fn nicht_gekommenes_bleibt_angefordert() {
         let mut liste = vec![to_hex(&k(1)), to_hex(&k(2))];
+        let mut runden = BTreeMap::new();
         let erhalten: BTreeSet<String> = [to_hex(&k(1))].into_iter().collect();
-        anforderungen_fortschreiben(&mut liste, &[k(2), k(3), k(1)], &erhalten, &BTreeSet::new());
+        anforderungen_fortschreiben(
+            &mut liste,
+            &mut runden,
+            &[k(2), k(3), k(1)],
+            &erhalten,
+            &BTreeSet::new(),
+        );
         assert_eq!(liste, vec![to_hex(&k(2)), to_hex(&k(3))]);
+        assert_eq!(runden.get(&to_hex(&k(2))), Some(&1), "einmal geblieben");
+        assert_eq!(runden.get(&to_hex(&k(3))), Some(&0), "neu");
+        assert!(!runden.contains_key(&to_hex(&k(1))), "erhalten: kein Zaehler mehr");
+    }
+
+    /// Was nach ein paar Runden nicht kam, kommt nicht mehr -- Briar schickt
+    /// Geloeschtes trotz gesetztem Kennzeichen nicht, und wir fragten sonst
+    /// in jeder Runde danach.
+    #[test]
+    fn zu_oft_angefordertes_faellt_heraus() {
+        let mut liste = vec![to_hex(&k(5))];
+        let mut runden = BTreeMap::new();
+        for runde in 1..=MAX_ANFORDERUNGS_RUNDEN {
+            anforderungen_fortschreiben(&mut liste, &mut runden, &[], &BTreeSet::new(), &BTreeSet::new());
+            assert_eq!(liste.len(), 1, "Runde {} noch dabei", runde);
+        }
+        anforderungen_fortschreiben(&mut liste, &mut runden, &[], &BTreeSet::new(), &BTreeSet::new());
+        assert!(liste.is_empty(), "nach {} Runden weg", MAX_ANFORDERUNGS_RUNDEN);
+        assert!(runden.is_empty());
+        // Erneut angeboten: zaehlt von vorn.
+        anforderungen_fortschreiben(&mut liste, &mut runden, &[k(5)], &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(liste, vec![to_hex(&k(5))]);
+        assert_eq!(runden.get(&to_hex(&k(5))), Some(&0));
     }
 
     #[test]
     fn bekanntes_faellt_aus_der_liste() {
         let mut liste = vec![to_hex(&k(4))];
         let bekannt: BTreeSet<String> = [to_hex(&k(4))].into_iter().collect();
-        anforderungen_fortschreiben(&mut liste, &[k(4)], &BTreeSet::new(), &bekannt);
+        anforderungen_fortschreiben(&mut liste, &mut BTreeMap::new(), &[k(4)], &BTreeSet::new(), &bekannt);
         assert!(liste.is_empty());
     }
 
     #[test]
     fn die_liste_waechst_nicht_ohne_ende() {
         let mut liste: Vec<String> = (0..MAX_ANGEFORDERT).map(|i| format!("{:064x}", i)).collect();
-        anforderungen_fortschreiben(&mut liste, &[k(9)], &BTreeSet::new(), &BTreeSet::new());
+        let mut runden = BTreeMap::new();
+        anforderungen_fortschreiben(&mut liste, &mut runden, &[k(9)], &BTreeSet::new(), &BTreeSet::new());
         assert_eq!(liste.len(), MAX_ANGEFORDERT);
+        assert_eq!(runden.len(), MAX_ANGEFORDERT, "Zaehler nur fuer das, was in der Liste steht");
         assert_eq!(liste.last().unwrap(), &to_hex(&k(9)), "das Neueste bleibt");
         assert_ne!(liste[0], format!("{:064x}", 0), "das Aelteste geht");
     }

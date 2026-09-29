@@ -92,8 +92,9 @@ pub struct Payload {
 }
 
 impl Payload {
-    /// Die erste WLAN-Adresse. Nur noch fuer Aufrufer, die eine einzige
-    /// wollen; zum Anwaehlen ist `lan_alle()` richtig.
+    /// Die erste WLAN-Adresse in Code-Reihenfolge -- seit 0.40.0 also die
+    /// mit dem weitesten Netz. Nur noch in Pruefungen; zum Anwaehlen ist
+    /// `lan_alle()` richtig.
     pub fn lan(&self) -> Option<String> {
         self.lan_alle().into_iter().next()
     }
@@ -291,7 +292,9 @@ pub fn confirmation(
 ///
 /// Scheitert die Sitzung bei uns, erfaehrt die Gegenseite es: ein ABORT geht
 /// hinaus, bevor der Fehler zurueckkehrt (Briars KeyAgreementProtocol
-/// .perform: jeder Fehlerfall endet in sendAbort). Ohne ihn wartete sie bis
+/// .perform: jeder Verfahrensfehler, eine AbortException, endet in sendAbort;
+/// bei einem Schreibfehler schweigt Briar, wir versuchen es trotzdem, das
+/// kostet nichts). Ohne ihn wartete sie bis
 /// zur Zeitgrenze auf einen Satz, der nie kommt -- eine Minute bei Briar,
 /// und die Anzeige stand die ganze Zeit auf "verbinde".
 #[allow(clippy::too_many_arguments)]

@@ -372,6 +372,13 @@ pub fn write_ack(out: &mut impl Write, ids: &[SecretKey]) -> std::io::Result<()>
     write_kennungen(out, ACK, ids)
 }
 
+/// Nachrichten anbieten statt schicken -- so macht es Briar ueber
+/// Duplex-Transporte. Der Dienst selbst schickt unaufgefordert; der Schreiber
+/// steht hier, damit eine Pruefung die Gegenseite spielen kann.
+pub fn write_offer(out: &mut impl Write, ids: &[SecretKey]) -> std::io::Result<()> {
+    write_kennungen(out, OFFER, ids)
+}
+
 /// Kennungen in Saetze von hoechstens MAX_MESSAGE_IDS stueckeln.
 ///
 /// Mehr passt in keinen Satz -- und es geht nicht bloss der Satz verloren:

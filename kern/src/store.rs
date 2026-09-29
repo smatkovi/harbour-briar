@@ -267,6 +267,11 @@ pub struct Contact {
     /// Die Nummer ihrer letzten Ansage -- eine aeltere zaehlt nicht mehr.
     #[serde(default)]
     pub fremde_ansage_nummer: u64,
+    /// Wie oft jede Kennung in `to_request` schon angefordert wurde -- nach
+    /// ein paar Runden ohne Antwort faellt sie heraus (net.rs,
+    /// anforderungen_fortschreiben).
+    #[serde(default)]
+    pub anforderungs_runden: BTreeMap<String, u8>,
 }
 
 /// -1: keine Zuenddauer -- dieselbe Zahl wie Briars NO_AUTO_DELETE_TIMER.
@@ -361,7 +366,8 @@ pub struct GroupPost {
 /// Der Zustand der Einladungssitzung mit EINEM Kontakt, eingekocht auf die
 /// Zustaende, die hier wirklich gelesen werden. Briars CreatorState und
 /// InviteeState unterscheiden mehr, weil dort die Sichtbarkeit der Gruppe am
-/// Zustand haengt; wir teilen die Gruppe schon beim Einladen.
+/// Zustand haengt; bei uns entscheidet `PrivateGroup::empfaenger()` allein an
+/// "Eingeladen", wer Beitraege bekommt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum Sitzungszustand {
     /// Nichts offen. Briars CreatorState.START -- auch der Zustand nach einer
@@ -605,7 +611,7 @@ pub struct State {
 }
 
 /// The newest layout this build knows.
-const STATE_VERSION: u32 = 5;
+const STATE_VERSION: u32 = 6;
 
 /// Transports are on unless switched off -- a state file written before a
 /// transport existed should not leave it disabled for ever.
@@ -886,6 +892,28 @@ impl Store {
                 }
             }
         }
+        // Fassung 5 legte Beitraege auch fuer Kontakte mit offener Einladung
+        // in den Korb. Ein echtes Briar verwirft sie dort und quittiert sie
+        // nicht -- der Korb schickte sie in jeder Runde erneut, bis zur Zusage
+        // oder fuer immer. Einmal ausraeumen; mit der Zusage geht der Verlauf
+        // ohnehin geschlossen hinaus (net.rs, receive_einladung_join).
+        if store.state.state_version < 6 {
+            let offen: Vec<(u32, String)> = store
+                .state
+                .groups
+                .iter()
+                .flat_map(|g| {
+                    g.einladungen
+                        .iter()
+                        .filter(|(_, s)| s.zustand == Sitzungszustand::Eingeladen)
+                        .map(|(c, _)| (*c, g.id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (contact_id, group_hex) in offen {
+                store.verwerfe_gruppenpost(contact_id, &group_hex);
+            }
+        }
         if store.state.state_version != STATE_VERSION {
             store.state.state_version = STATE_VERSION;
             let _ = store.save();
@@ -1159,6 +1187,110 @@ mod gruppen_tests {
 }
 
 #[cfg(test)]
+mod korbwanderung_tests {
+    use super::*;
+
+    fn kontakt(id: u32) -> Contact {
+        Contact {
+            id,
+            name: format!("k{}", id),
+            author_id: format!("{:064x}", id),
+            signature_public: format!("{:064x}", id),
+            handshake_public: None,
+            master_key: format!("{:064x}", id),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: kein_timer(),
+            loesch_vorher: keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
+        }
+    }
+
+    fn eintrag(group: &str, id: &str) -> OutMessage {
+        OutMessage {
+            id: id.to_string(),
+            group: group.to_string(),
+            timestamp: 1,
+            body: String::new(),
+            acked: false,
+            intern: false,
+            loesch_dauer: None,
+        }
+    }
+
+    /// Fassung 5 legte Gruppenbeitraege auch fuer offene Einladungen in den
+    /// Korb; die Wanderung auf 6 raeumt genau die aus -- und nur die.
+    #[test]
+    fn alter_korbbestand_an_offene_einladungen_wird_ausgeraeumt() {
+        let mut p = std::env::temp_dir();
+        p.push("briar-korbwanderung.json");
+        let _ = std::fs::remove_file(&p);
+        let gruppe = "aa".repeat(32);
+        let andere = "bb".repeat(32);
+        {
+            let mut store = Store::open(&p, 7327).unwrap();
+            store.state.contacts.push(kontakt(1));
+            store.state.contacts.push(kontakt(2));
+            let mut einladungen = BTreeMap::new();
+            let mut offen = Einladungssitzung::default();
+            offen.zustand = Sitzungszustand::Eingeladen;
+            einladungen.insert(1, offen);
+            let mut drin = Einladungssitzung::default();
+            drin.zustand = Sitzungszustand::Beigetreten;
+            einladungen.insert(2, drin);
+            store.state.groups.push(PrivateGroup {
+                id: gruppe.clone(),
+                name: "g".to_string(),
+                salt: "00".to_string(),
+                creator_name: "ich".to_string(),
+                creator_public: "00".to_string(),
+                creator_author_id: "00".to_string(),
+                joined: true,
+                invited_by: None,
+                invite_timestamp: None,
+                invite_signature: None,
+                member_names: BTreeMap::new(),
+                last_read: 0,
+                messages: Vec::new(),
+                our_previous: None,
+                einladungen,
+                einladung_previous: None,
+                aufgeloest: false,
+                letztes_ereignis: None,
+                contacts: vec![1, 2],
+            });
+            for (c, k) in [(1, "p1"), (1, "p2"), (2, "p3")] {
+                store.contact_mut(c).unwrap().outbox.push(eintrag(&gruppe, k));
+            }
+            // Die Einladung selbst und Fremdes bleiben.
+            store.contact_mut(1).unwrap().outbox.push(eintrag(&andere, "inv"));
+            store.state.state_version = 5;
+            store.save().unwrap();
+        }
+        let store = Store::open(&p, 7327).unwrap();
+        assert_eq!(store.state.state_version, STATE_VERSION);
+        let korb1: Vec<&str> = store.contact(1).unwrap().outbox.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(korb1, vec!["inv"], "nur die Gruppenbeitraege gehen");
+        let korb2: Vec<&str> = store.contact(2).unwrap().outbox.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(korb2, vec!["p3"], "wer drin ist, behaelt alles");
+    }
+}
+
+#[cfg(test)]
 mod wanderung_tests {
     use super::*;
 
@@ -1230,7 +1362,8 @@ mod wanderung_tests {
         let roh = std::fs::read_to_string(&p).unwrap();
         assert!(!roh.contains("einladung_previous"), "{}", roh);
         assert!(
-            roh.replace(' ', "").contains("\"state_version\":5"),
+            roh.replace(' ', "")
+                .contains(&format!("\"state_version\":{}", STATE_VERSION)),
             "{}",
             roh
         );

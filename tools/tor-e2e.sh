@@ -79,16 +79,14 @@ ID=$(api 8301 GET /status | feld "['contacts'][0]['id']")
 # angewaehlt hat -- und keine der beiden darf "no sync round on the
 # handshake connection" melden.
 echo "== Abgleich auf der Handschlagverbindung"
-for i in $(seq 1 10); do
-    grep -q "sync round with contact 1" "$WORK/a.log" \
-        && grep -q "sync round with contact 1" "$WORK/b.log" && break
+for i in $(seq 1 20); do
+    grep -q "sync round on the handshake connection with contact 1 done" "$WORK/a.log" \
+        && grep -q "sync round on the handshake connection with contact 1 done" "$WORK/b.log" && break
     sleep 1
 done
 for seite in a b; do
-    grep -q "sync round with contact 1" "$WORK/$seite.log" \
-        || { echo "FEHLER: $seite hat nach dem Handschlag keine Runde gemacht"; grep -i "handshake\|sync" "$WORK/$seite.log" | tail -8; exit 1; }
-    grep -q "no sync round on the handshake connection" "$WORK/$seite.log" \
-        && { echo "FEHLER: bei $seite scheiterte die Runde auf der Handschlagverbindung"; grep "no sync round" "$WORK/$seite.log"; exit 1; }
+    grep -q "sync round on the handshake connection with contact 1 done" "$WORK/$seite.log" \
+        || { echo "FEHLER: $seite hat auf der Handschlagverbindung keine Runde gemacht"; grep -i "handshake\|sync" "$WORK/$seite.log" | tail -8; exit 1; }
 done
 echo "   beide Seiten haben auf der Handschlagverbindung abgeglichen"
 # Und der Handschlag lief genau einmal je Seite: die Wache gegen parallele
@@ -96,8 +94,10 @@ echo "   beide Seiten haben auf der Handschlagverbindung abgeglichen"
 # der erste laeuft -- vorher standen hier bis zu sieben, und zwei davon
 # hinterliessen verschiedene Hauptschluessel.
 for seite in a b; do
-    N=$(grep -c "contact exchange succeeded" "$WORK/$seite.log")
-    [ "$N" -eq 1 ] || { echo "FEHLER: $seite hat $N Handschlaege abgeschlossen statt einem"; exit 1; }
+    # Beide Ausgaenge zaehlen: ein zweiter, parallel abgeschlossener Handschlag
+    # landet im "again"-Zweig -- genau der gefaehrliche Fall.
+    N=$(grep -c "contact exchange succeeded\|handshake with .* again" "$WORK/$seite.log")
+    [ "$N" -eq 1 ] || { echo "FEHLER: $seite hat $N Handschlaege abgeschlossen statt einem"; grep "contact exchange\|again" "$WORK/$seite.log"; exit 1; }
 done
 echo "   je Seite genau ein abgeschlossener Handschlag"
 

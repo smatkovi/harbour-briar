@@ -1932,6 +1932,7 @@ mod gruppenablehnung_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         });
         let mut einladungen = BTreeMap::new();
         einladungen.insert(
@@ -2010,6 +2011,109 @@ mod gruppenablehnung_tests {
 }
 
 #[cfg(test)]
+mod gruppenversand_tests {
+    use super::*;
+    use crate::store::{Einladungssitzung, PrivateGroup, Sitzungszustand};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    fn kontakt(id: u32) -> crate::store::Contact {
+        crate::store::Contact {
+            id,
+            name: format!("k{}", id),
+            author_id: format!("{:064x}", id),
+            signature_public: format!("{:064x}", id),
+            handshake_public: None,
+            master_key: format!("{:064x}", id),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
+        }
+    }
+
+    /// Ein Beitrag geht an Mitglieder, nicht an offene Einladungen: fuer ein
+    /// echtes Briar gibt es die Gruppe vor der Zusage nicht, es verwirft ohne
+    /// Quittung, und der Korb schickte bis 0.39.0 in jeder Runde erneut.
+    #[test]
+    fn beitrag_geht_nicht_an_offene_einladungen() {
+        let mut p = std::env::temp_dir();
+        p.push("briar-gruppenversand.json");
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        let ich = store.create_identity("ich").unwrap();
+        store.state.contacts.push(kontakt(1));
+        store.state.contacts.push(kontakt(2));
+        let gruppe = "cc".repeat(32);
+        let mut einladungen = BTreeMap::new();
+        let mut offen = Einladungssitzung::default();
+        offen.zustand = Sitzungszustand::Eingeladen;
+        einladungen.insert(1, offen);
+        let mut drin = Einladungssitzung::default();
+        drin.zustand = Sitzungszustand::Beigetreten;
+        einladungen.insert(2, drin);
+        store.state.groups.push(PrivateGroup {
+            id: gruppe.clone(),
+            name: "g".to_string(),
+            salt: "00".repeat(32),
+            creator_name: "ich".to_string(),
+            creator_public: ich.signature_public.clone(),
+            creator_author_id: ich.author_id.clone(),
+            joined: true,
+            invited_by: None,
+            invite_timestamp: None,
+            invite_signature: None,
+            member_names: BTreeMap::new(),
+            last_read: 0,
+            // Unser eigenes JOIN: ohne das laesst /group/send nichts hinaus.
+            messages: vec![GroupPost {
+                id: "j1".to_string(),
+                author_id: ich.author_id.clone(),
+                author_name: "ich".to_string(),
+                timestamp: 1_700_000_000_000,
+                text: String::new(),
+                body: String::new(),
+                join: true,
+            }],
+            our_previous: Some("j1".to_string()),
+            einladungen,
+            einladung_previous: None,
+            aufgeloest: false,
+            letztes_ereignis: None,
+            contacts: vec![1, 2],
+        });
+        let shared: Shared = Arc::new(Mutex::new(store));
+        let antwort = handle(
+            Arc::clone(&shared),
+            "POST",
+            "/group/send",
+            "",
+            &json!({"group": gruppe, "text": "hallo"}),
+        );
+        assert!(antwort.get("error").is_none(), "{}", antwort);
+        let s = shared.lock().unwrap();
+        let im_korb = |id: u32| s.contact(id).unwrap().outbox.iter().filter(|m| m.group == gruppe).count();
+        assert_eq!(im_korb(1), 0, "die offene Einladung bekommt nichts");
+        assert_eq!(im_korb(2), 1, "das Mitglied bekommt den Beitrag");
+    }
+}
+
+#[cfg(test)]
 mod loeschen_tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -2052,6 +2156,7 @@ mod loeschen_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         });
         {
             let c = store.contact_mut(1).unwrap();
@@ -2138,6 +2243,7 @@ mod zeitstempel_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         });
         // Die Gegenseite hat zuletzt einen Stempel weit in der Zukunft
         // gesehen -- so sieht es aus, wenn unsere eigene Uhr nachgeht.
@@ -2208,6 +2314,7 @@ mod zeigen_tests {
             loesch_stempel: 0,
             fremde_fassungen: Default::default(),
             fremde_ansage_nummer: 0,
+            anforderungs_runden: Default::default(),
         }
     }
 
