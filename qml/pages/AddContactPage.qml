@@ -35,6 +35,17 @@ Dialog {
             placeholderText: app.tr("name")
         }
 
+        // Die drei Adressfelder gehoeren zu den eigenen Fassungen: ein Briar
+        // auf Android hat keine und findet den Weg ueber Tor selbst.
+        Label {
+            x: Theme.horizontalPageMargin
+            width: parent.width - 2 * Theme.horizontalPageMargin
+            wrapMode: Text.Wrap
+            color: Theme.secondaryHighlightColor
+            font.pixelSize: Theme.fontSizeExtraSmall
+            text: app.tr("addressOwnHint")
+        }
+
         TextField {
             id: addressField
             width: parent.width

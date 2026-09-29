@@ -43,6 +43,13 @@ Page {
             width: parent.width
             elide: Text.ElideLeft
         }
+        Label {
+            width: parent.width
+            wrapMode: Text.Wrap
+            font.pixelSize: 18
+            color: "#a0a0a0"
+            text: fenster.tr("attachOthersHint")
+        }
     }
 
     ListView {

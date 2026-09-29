@@ -12,6 +12,9 @@ Page {
     // Verschwindende Nachrichten: die Dauer in Millisekunden, -1 heisst aus.
     property int zuenddauer: -1
     property bool zuendbereit: false
+    // Ein Hinweis ueber dem Eingabefeld -- kein Fehler, nur etwas, das man
+    // wissen sollte (etwa: dieser Anhang kommt bei Android nicht an).
+    property string hinweis: ""
 
     function neuLaden() {
         Briar.messages(kontakt, function(antwort) {
@@ -42,6 +45,9 @@ Page {
         }
         if (fertig !== pfad)
             typ = "image/jpeg"
+        // Nicht verboten, aber gesagt: Briar auf Android zeigt fuer alles
+        // ausser Bildern nur einen Fehler; zwischen MeeGo und Sailfish geht es.
+        seite.hinweis = typ.indexOf("image/") === 0 ? "" : fenster.tr("attachOthersHint")
         Briar.sendFile(seite.kontakt, feld.text, fertig, typ, function(antwort) {
             if (antwort.error)
                 fenster.fehler = antwort.error
@@ -147,7 +153,7 @@ Page {
 
     ListView {
         id: liste
-        anchors { top: parent.top; left: parent.left; right: parent.right; bottom: eingabe.top }
+        anchors { top: parent.top; left: parent.left; right: parent.right; bottom: hinweisZeile.top }
         clip: true
         model: seite.nachrichten
         onCountChanged: positionViewAtEnd()
@@ -269,6 +275,17 @@ Page {
         }
     }
 
+    Label {
+        id: hinweisZeile
+        anchors { left: parent.left; right: parent.right; bottom: eingabe.top; margins: 8 }
+        visible: seite.hinweis.length > 0
+        height: visible ? paintedHeight + 8 : 0
+        wrapMode: Text.Wrap
+        color: "#a0a0a0"
+        font.pixelSize: 18
+        text: seite.hinweis
+    }
+
     Row {
         id: eingabe
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
@@ -304,6 +321,7 @@ Page {
                 if (text.length === 0)
                     return
                 feld.text = ""
+                seite.hinweis = ""
                 Briar.send(seite.kontakt, text, function(antwort) {
                     if (antwort.error)
                         fenster.fehler = antwort.error

@@ -16,6 +16,9 @@ Page {
     property bool autoDeleteReady: false
     // Wieviele fremde Nachrichten schon als gelesen gemeldet sind.
     property int fremdeGesehen: 0
+    // Ein Hinweis ueber dem Eingabefeld -- kein Fehler, nur etwas, das man
+    // wissen sollte (etwa: dieser Anhang kommt bei Android nicht an).
+    property string hinweis: ""
 
     function reload() {
         Briar.messages(contactId, function(answer) {
@@ -58,6 +61,9 @@ Page {
         }
         if (prepared !== path)
             type = "image/jpeg"
+        // Nicht verboten, aber gesagt: Briar auf Android zeigt fuer alles
+        // ausser Bildern nur einen Fehler; zwischen MeeGo und Sailfish geht es.
+        page.hinweis = type.indexOf("image/") === 0 ? "" : app.tr("attachOthersHint")
         Briar.sendFile(page.contactId, field.text.trim(), prepared, type,
                        function(answer) {
             if (answer.error)
@@ -146,6 +152,14 @@ Page {
                     }
                     onClicked: pageStack.replace(dateiAuswahl)
                 }
+                Label {
+                    x: Theme.horizontalPageMargin
+                    width: parent.width - 2 * Theme.horizontalPageMargin
+                    wrapMode: Text.Wrap
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    color: Theme.secondaryColor
+                    text: app.tr("attachOthersHint")
+                }
             }
         }
     }
@@ -207,7 +221,7 @@ Page {
 
     SilicaListView {
         id: view
-        anchors { left: parent.left; right: parent.right; top: parent.top; bottom: input.top }
+        anchors { left: parent.left; right: parent.right; top: parent.top; bottom: hinweisZeile.top }
         model: page.messages
         clip: true
         header: Column {
@@ -400,6 +414,20 @@ Page {
         VerticalScrollDecorator { }
     }
 
+    Label {
+        id: hinweisZeile
+        anchors {
+            left: parent.left; right: parent.right; bottom: input.top
+            leftMargin: Theme.horizontalPageMargin; rightMargin: Theme.horizontalPageMargin
+        }
+        visible: page.hinweis.length > 0
+        height: visible ? implicitHeight + Theme.paddingSmall : 0
+        wrapMode: Text.Wrap
+        font.pixelSize: Theme.fontSizeExtraSmall
+        color: Theme.secondaryHighlightColor
+        text: page.hinweis
+    }
+
     Row {
         id: input
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
@@ -436,6 +464,7 @@ Page {
                 if (text.length === 0)
                     return
                 field.text = ""
+                page.hinweis = ""
                 Briar.send(page.contactId, text, function(answer) {
                     if (answer.error)
                         app.lastError = answer.error

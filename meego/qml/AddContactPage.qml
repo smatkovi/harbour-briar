@@ -48,6 +48,16 @@ Page {
                 placeholderText: fenster.tr("nameFree")
             }
 
+            // Die drei Adressfelder gehoeren zu den eigenen Fassungen: ein
+            // Briar auf Android hat keine und findet den Weg ueber Tor selbst.
+            Label {
+                width: parent.width
+                wrapMode: Text.Wrap
+                color: "#a0a0a0"
+                font.pixelSize: 20
+                text: fenster.tr("addressOwnHint")
+            }
+
             TextField {
                 id: adressFeld
                 width: parent.width
