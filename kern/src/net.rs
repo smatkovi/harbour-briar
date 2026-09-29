@@ -220,6 +220,28 @@ pub(crate) fn lan_beschreiber(
         .collect()
 }
 
+/// Die Quittungen der Gegenseite verbuchen: im Korb erledigt, in der
+/// Geschichte als angekommen -- und die Uhr einer verschwindenden Nachricht
+/// laeuft ab jetzt (vorher waere sie hier verschwunden und drueben
+/// liegengeblieben). Quittiertes verlaesst den Korb: die Nachricht selbst
+/// bleibt in der Geschichte, nur die wartende Kopie geht, damit die
+/// Speicherdatei nicht ohne Ende waechst.
+fn quittungen_verbuchen(contact: &mut Contact, peer_acked: &std::collections::BTreeSet<String>) {
+    for message in contact.outbox.iter_mut() {
+        if peer_acked.contains(&message.id) {
+            message.acked = true;
+        }
+    }
+    let jetzt = now_ms();
+    for message in contact.messages.iter_mut() {
+        if message.outgoing && peer_acked.contains(&message.id) {
+            message.acked = true;
+            loeschuhr_starten(message, jetzt);
+        }
+    }
+    contact.outbox.retain(|m| !m.acked);
+}
+
 /// Einen Kontakt in die Verteilliste einer Gruppe nehmen -- wenn die Gruppe
 /// noch steht und er nicht gegangen ist.
 fn mitglied_eintragen(store: &mut Store, group_hex: &str, contact_id: u32) {
@@ -2379,6 +2401,9 @@ impl Node {
                 .map(|c| c.messages.iter().map(|m| m.id.clone()).collect())
                 .unwrap_or_default()
         };
+        // Hat die Gegenseite ihren Strom beendet, oder endete die Schleife an
+        // der Stille? Danach richtet sich die Nachlese unten.
+        let mut fremdes_ende_gelesen = false;
         loop {
             match read_record(&mut reader) {
                 Ok(Some(record)) => {
@@ -2438,7 +2463,10 @@ impl Node {
                         _ => {}
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    fremdes_ende_gelesen = true;
+                    break;
+                }
                 Err(e) => {
                     let stille = e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut;
@@ -2483,26 +2511,7 @@ impl Node {
                 );
                 let peer_acked: std::collections::BTreeSet<String> =
                     acked_ids.iter().map(|id| to_hex(id)).collect();
-                for message in contact.outbox.iter_mut() {
-                    if peer_acked.contains(&message.id) {
-                        message.acked = true;
-                    }
-                }
-                let jetzt = now_ms();
-                for message in contact.messages.iter_mut() {
-                    if message.outgoing && peer_acked.contains(&message.id) {
-                        message.acked = true;
-                        // Angekommen heisst: die Uhr einer verschwindenden
-                        // Nachricht laeuft ab jetzt. Vorher waere sie hier
-                        // verschwunden und drueben liegengeblieben.
-                        loeschuhr_starten(message, jetzt);
-                    }
-                }
-                // Acknowledged means delivered, and the queue has done its
-                // job. The message itself stays in the history; only the copy
-                // waiting to be sent goes, so the state file cannot grow
-                // without end.
-                contact.outbox.retain(|m| !m.acked);
+                quittungen_verbuchen(contact, &peer_acked);
                 // Our own acks count as sent only for what this round
                 // actually acknowledged.
                 contact.to_ack.retain(|id| !acked_now.contains(id));
@@ -2633,6 +2642,70 @@ impl Node {
             ));
         }
         writer.send_end_of_stream()?;
+
+        // Nachlese: endete die Schleife an der Stille, schreibt die Gegenseite
+        // noch, nachdem sie UNSER Ende gelesen hat -- ihre Quittungen fuer
+        // diese Runde, was wir ihr abverlangt haben, und ihr eigenes Ende.
+        // Briars eingehende Sitzung liest bis zum Ende des fremden Stroms,
+        // gleich, wann die eigene ausgehende fertig ist, und die ausgehende
+        // schickt nach dem Unterbrechen noch ihr Ende
+        // (DuplexOutgoingSession.run: sendEndOfStream). Wer stattdessen gleich
+        // auflegt, verliert die Quittungen -- die Gegenseite schickt dann
+        // alles noch einmal --, und ueber Tor scheitert ihr Schreiben mit
+        // "Broken pipe", weil ein SOCKS-Strom keine halbe Schliessung kennt.
+        // Genau so ist es im Netztest passiert, als beide Seiten zugleich
+        // in die Stille liefen.
+        if !fremdes_ende_gelesen {
+            let _ = conn.set_read_timeout(ruhe);
+            let mut spaete_quittungen: Vec<SecretKey> = Vec::new();
+            let mut spaete_nachrichten: Vec<(SecretKey, SecretKey, u64, Vec<u8>)> = Vec::new();
+            loop {
+                match read_record(&mut reader) {
+                    Ok(Some(record)) => {
+                        if record.protocol_version != sync::PROTOCOL_VERSION {
+                            continue;
+                        }
+                        match record.record_type {
+                            sync::ACK => {
+                                spaete_quittungen.extend(sync::parse_ids(&record.payload))
+                            }
+                            sync::MESSAGE => {
+                                if let Some((group, timestamp, body)) =
+                                    ids::parse_raw_message(&record.payload)
+                                {
+                                    let id = ids::message_id(&group, timestamp, &body);
+                                    spaete_nachrichten.push((id, group, timestamp, body));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Ihr Ende, oder nichts mehr: beides beendet die Nachlese.
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            if !spaete_quittungen.is_empty() || !spaete_nachrichten.is_empty() {
+                let mut store = self.store.lock().unwrap();
+                if let Some(contact) = store.contact_mut(contact_id) {
+                    let peer_acked: std::collections::BTreeSet<String> =
+                        spaete_quittungen.iter().map(|id| to_hex(id)).collect();
+                    quittungen_verbuchen(contact, &peer_acked);
+                }
+                // Was spaet kam, wird in der naechsten Runde quittiert.
+                for (id, group, timestamp, body) in &spaete_nachrichten {
+                    if self.receive_message(&mut store, contact_id, id, group, *timestamp, body) {
+                        new_messages += 1;
+                    }
+                    if let Some(contact) = store.contact_mut(contact_id) {
+                        let hex = to_hex(id);
+                        if !contact.to_ack.contains(&hex) {
+                            contact.to_ack.push(hex);
+                        }
+                    }
+                }
+                store.save()?;
+            }
+        }
         log(&format!(
             "sync round with contact {} over {} done, {} new message(s)",
             contact_id,
@@ -6576,6 +6649,64 @@ mod angebots_tests {
             "erhalten heisst: nicht noch einmal anfordern"
         );
         assert!(c.anforderungs_runden.is_empty());
+    }
+
+    /// Die Gegenseite quittiert erst, nachdem sie unser Ende gelesen hat --
+    /// so tut es Briar. Wer da schon aufgelegt hat, verliert die Quittungen;
+    /// die Nachlese nimmt sie noch mit.
+    #[test]
+    fn nachlese_verbucht_spaete_quittungen() {
+        let period = current_time_period();
+        let node = knoten("nachlese", period);
+        let master = key_from_hex(IHR);
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let gegenseite = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut roh = strom.try_clone().unwrap();
+            let mut marke = [0u8; TAG_LEN];
+            roh.read_exact(&mut marke).unwrap();
+            let ihre = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, false);
+            let unsere = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, true);
+            let mut schreiber = StreamWriter::new(strom.try_clone().unwrap(), &ihre, 0);
+            sync::write_versions(&mut schreiber).unwrap();
+            schreiber.flush().unwrap();
+            // Alles lesen, was der Dienst schreibt, bis zu seinem Ende -- das
+            // kommt erst, wenn er die Stille bemerkt hat.
+            let mut leser = StreamReader::new(roh, unsere.header_key, 0);
+            let mut gesehen: Vec<SecretKey> = Vec::new();
+            loop {
+                match read_record(&mut leser) {
+                    Ok(Some(r)) if r.record_type == sync::MESSAGE => {
+                        if let Some((g, t, b)) = ids::parse_raw_message(&r.payload) {
+                            gesehen.push(ids::message_id(&g, t, &b));
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => panic!("Lesen bei der Gegenseite: {}", e),
+                }
+            }
+            // Erst jetzt die Quittungen, dann unser Ende.
+            sync::write_ack(&mut schreiber, &gesehen).unwrap();
+            schreiber.send_end_of_stream().unwrap();
+            gesehen.len()
+        });
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        node.run_sync(Conn::Tcp(strom), LAN_TRANSPORT_ID, 1, None, None, true)
+            .expect("die Runde geht durch");
+        let quittiert = gegenseite.join().unwrap();
+        assert!(quittiert >= 2, "Versionsansage und Adressmeldung muessen draussen sein");
+        let s = node.store.lock().unwrap();
+        let c = s.contact(1).unwrap();
+        assert!(
+            c.outbox.is_empty(),
+            "die spaeten Quittungen muessen den Korb leeren: {:?}",
+            c.outbox.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
     }
 
     /// Ein Angebot, auf das nichts folgt: die Kennung bleibt fuer die naechste
