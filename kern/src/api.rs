@@ -310,6 +310,14 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             }
             let ids: std::collections::BTreeSet<String> =
                 betroffen.iter().map(|(id, _)| id.clone()).collect();
+            // Im Korb liegen die Anhaenge als eigene Nachrichten -- unter ihrer
+            // eigenen Kennung, nicht unter der des Textes.
+            let im_korb: std::collections::BTreeSet<String> = betroffen
+                .iter()
+                .flat_map(|(id, anhaenge)| {
+                    std::iter::once(id.clone()).chain(anhaenge.iter().cloned())
+                })
+                .collect();
             // Erst die Anhaenge, dann die Eintraege: nach dem Streichen wuesste
             // niemand mehr, welche Datei gemeint war.
             for (_, anhaenge) in &betroffen {
@@ -319,8 +327,11 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
             }
             if let Some(c) = locked.contact_mut(contact_id) {
                 c.messages.retain(|m| !ids.contains(&m.id));
-                // Was noch nicht hinaus ist, geht auch nicht mehr hinaus.
-                c.outbox.retain(|m| !ids.contains(&m.id));
+                // Was noch nicht hinaus ist, geht auch nicht mehr hinaus --
+                // die Datei ebensowenig wie der Text. Vorher blieb der
+                // Anhang im Korb und ging beim naechsten Treffen doch hinaus,
+                // als Nachricht ohne Text.
+                c.outbox.retain(|m| !im_korb.contains(&m.id));
             }
             let _ = locked.save();
             json!({"ok": true, "removed": ids.len()})
@@ -1995,6 +2006,95 @@ mod gruppenablehnung_tests {
             korb.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
         );
         assert_eq!(sitzung.eigener_zeitstempel, korb.iter().find(|m| m.id == kennung).unwrap().timestamp);
+    }
+}
+
+#[cfg(test)]
+mod loeschen_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    const IHR: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// Der Anhang liegt unter seiner eigenen Kennung im Korb. Wird die
+    /// Nachricht geloescht, bevor sie hinaus ist, muss er mitgehen -- vorher
+    /// ging er beim naechsten Treffen doch noch hinaus, als Bild ohne Text.
+    #[test]
+    fn geloeschte_nachricht_nimmt_ihren_anhang_aus_dem_korb() {
+        let mut p = std::env::temp_dir();
+        p.push("briar-loeschen-test.json");
+        let _ = std::fs::remove_file(&p);
+        let mut store = Store::open(&p, 7327).unwrap();
+        store.create_identity("ich").unwrap();
+        store.state.contacts.push(crate::store::Contact {
+            id: 1,
+            name: "Gegenueber".to_string(),
+            author_id: IHR.to_string(),
+            signature_public: IHR.to_string(),
+            handshake_public: Some(IHR.to_string()),
+            master_key: IHR.to_string(),
+            alice: true,
+            creation_period: 0,
+            transports: BTreeMap::new(),
+            messages: Vec::new(),
+            outbox: Vec::new(),
+            to_ack: Vec::new(),
+            to_request: Vec::new(),
+            last_seen: 0,
+            versioning_sent: String::new(),
+            versioning_version: 0,
+            sent_properties: None,
+            props_sent_version: 0,
+            last_read: 0,
+            loesch_timer: crate::store::kein_timer(),
+            loesch_vorher: crate::store::keine_vorige(),
+            loesch_stempel: 0,
+            fremde_fassungen: Default::default(),
+            fremde_ansage_nummer: 0,
+        });
+        {
+            let c = store.contact_mut(1).unwrap();
+            c.messages.push(crate::store::Message {
+                id: "t1".to_string(),
+                timestamp: 1,
+                text: String::new(),
+                outgoing: true,
+                acked: false,
+                attachment: None,
+                attachment_type: None,
+                anhaenge: vec![crate::store::Anhangskopf {
+                    id: "a1".to_string(),
+                    content_type: Some("text/plain".to_string()),
+                }],
+                loesch_dauer: None,
+                loesch_frist: None,
+            });
+            for id in ["t1", "a1", "bleibt"] {
+                c.outbox.push(OutMessage {
+                    id: id.to_string(),
+                    group: String::new(),
+                    timestamp: 1,
+                    body: String::new(),
+                    acked: false,
+                    intern: false,
+                    loesch_dauer: None,
+                });
+            }
+        }
+        let shared: Shared = Arc::new(Mutex::new(store));
+        let antwort = handle(
+            Arc::clone(&shared),
+            "POST",
+            "/message/delete",
+            "",
+            &json!({"contact": 1, "ids": ["t1"]}),
+        );
+        assert_eq!(antwort["ok"], json!(true), "{}", antwort);
+        let s = shared.lock().unwrap();
+        let korb: Vec<&str> = s.contact(1).unwrap().outbox.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(korb, vec!["bleibt"]);
+        assert!(s.contact(1).unwrap().messages.is_empty());
     }
 }
 

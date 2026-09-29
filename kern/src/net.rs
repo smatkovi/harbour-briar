@@ -5906,8 +5906,12 @@ pub fn verschwundenes_fegen(store: &mut Store, jetzt: u64) -> bool {
             !weg
         });
         // Die eigene Kopie im Korb geht mit -- sie ist quittiert, sonst liefe
-        // die Uhr gar nicht.
-        contact.outbox.retain(|o| !ids.contains(&o.id));
+        // die Uhr gar nicht. Die Anhaenge auch: sie reisen als eigene
+        // Nachrichten und liegen als solche im Korb; blieben sie, ginge eine
+        // verschwundene Datei beim naechsten Treffen doch noch hinaus.
+        contact
+            .outbox
+            .retain(|o| !ids.contains(&o.id) && !anhaenge.contains(&o.id));
     }
     for a in &anhaenge {
         let _ = store.anhang_loeschen(a);
@@ -6024,6 +6028,52 @@ mod verschwinden_tests {
         assert!(!verschwundenes_fegen(&mut store, 60_999), "noch nicht faellig");
         assert!(verschwundenes_fegen(&mut store, 61_000), "jetzt faellig");
         assert!(store.contact(1).unwrap().messages.is_empty());
+    }
+
+    /// Der Anhang reist als eigene Nachricht und liegt als solche im Korb --
+    /// der Besen muss ihn dort mitnehmen, sonst geht die verschwundene Datei
+    /// beim naechsten Treffen doch noch hinaus.
+    #[test]
+    fn der_besen_nimmt_den_anhang_aus_dem_korb() {
+        let mut store = speicher("anhang-besen");
+        {
+            let c = store.contact_mut(1).unwrap();
+            c.messages.push(Message {
+                id: "m1".to_string(),
+                timestamp: 1,
+                text: String::new(),
+                outgoing: true,
+                acked: true,
+                attachment: None,
+                attachment_type: None,
+                anhaenge: vec![crate::store::Anhangskopf {
+                    id: "h1".to_string(),
+                    content_type: None,
+                }],
+                loesch_dauer: Some(1),
+                loesch_frist: Some(5),
+            });
+            for id in ["m1", "h1", "bleibt"] {
+                c.outbox.push(OutMessage {
+                    id: id.to_string(),
+                    group: String::new(),
+                    timestamp: 1,
+                    body: String::new(),
+                    acked: true,
+                    intern: false,
+                    loesch_dauer: None,
+                });
+            }
+        }
+        assert!(verschwundenes_fegen(&mut store, 5));
+        let korb: Vec<String> = store
+            .contact(1)
+            .unwrap()
+            .outbox
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(korb, vec!["bleibt".to_string()]);
     }
 
     /// Eine Nachricht ohne Dauer bleibt liegen, auch nach Jahren.
