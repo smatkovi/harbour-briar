@@ -1724,6 +1724,15 @@ fn status(store: &Shared) -> Value {
         "lockAfter": locked.state.sperre_nach_minuten,
         "tor": locked.state.tor,
         "onion": locked.state.tor_onion,
+        // Steht der erste Tor-Start noch aus? Dann fehlt der Verzeichniscache,
+        // und Tor zieht beim Start rund 23 MB ueber die Leitung (gemessen
+        // 29.09.2026) -- auf 2G eine Viertelstunde bis eine Stunde. Danach
+        // sind es Kilobyte. Die Oberflaeche sagt das neben dem Schalter.
+        "torFirstRun": locked
+            .path
+            .parent()
+            .map(|p| !p.join("tor").join("cached-microdescs").exists())
+            .unwrap_or(true),
         "revision": locked.state.revision,
         // Steht die Uhr dieses Geraets erkennbar falsch? Dann kommt nichts an,
         // ohne dass es jemand merkt: Briar verwirft eine Nachricht, deren

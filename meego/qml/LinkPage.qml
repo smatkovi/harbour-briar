@@ -81,6 +81,18 @@ Page {
                     text: fenster.tr("torSwitchHint")
                     color: "#a0a0a0"
                     font.pixelSize: 18
+                    width: seite.width - torSchalter.width - 48
+                    wrapMode: Text.Wrap
+                }
+                // Vor dem ersten Lauf dazu, was der kostet: Tor holt sich
+                // das ganze Verzeichnis, und auf 2G dauert das.
+                Label {
+                    visible: fenster.zustand.torFirstRun === true
+                    text: fenster.tr("torFirstRun")
+                    color: "#a0a0a0"
+                    font.pixelSize: 18
+                    width: seite.width - torSchalter.width - 48
+                    wrapMode: Text.Wrap
                 }
             }
         }

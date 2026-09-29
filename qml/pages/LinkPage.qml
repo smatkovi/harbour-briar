@@ -70,7 +70,10 @@ Page {
             // stops with this switch; the daemon notices within a few seconds.
             TextSwitch {
                 text: app.tr("torSwitch")
+                // Vor dem ersten Lauf dazu, was der kostet: Tor holt sich
+                // das ganze Verzeichnis, und auf 2G dauert das.
                 description: app.tr("torSwitchHint")
+                             + (app.status.torFirstRun === true ? "\n" + app.tr("torFirstRun") : "")
                 checked: app.status.tor === true
                 automaticCheck: false
                 onClicked: Briar.setTor(!checked, app.refresh)
