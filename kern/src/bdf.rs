@@ -25,6 +25,17 @@ const LIST: u8 = 0x60;
 const DICTIONARY: u8 = 0x70;
 const END: u8 = 0x80;
 
+/// Die groesste Zeichenkette oder Rohfolge, die der Leser annimmt -- Briars
+/// BdfReader.DEFAULT_MAX_BUFFER_SIZE. Sicherheitsbefund H1: die 8- und
+/// 16-Bit-Laengen wurden vorzeichenbehaftet gelesen, 0xff wurde zu usize::MAX
+/// und `vec![0; len]` zum Panic; mit panic = "abort" starb der ganze Dienst
+/// an einem Byte von einem Kontakt oder aus einem QR-Code. Briar wirft hier
+/// eine FormatException und verwirft nur die Nachricht -- wir jetzt auch.
+const MAX_LAENGE: usize = 64 * 1024;
+/// So tief duerfen Listen und Woerterbuecher verschachtelt sein -- Briars
+/// BdfReader.DEFAULT_NESTED_LIMIT.
+const MAX_TIEFE: usize = 5;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Bdf {
     Null,
@@ -174,11 +185,27 @@ pub fn to_bytes(value: &Bdf) -> Vec<u8> {
 pub struct Reader<R: Read> {
     inner: R,
     peeked: Option<u8>,
+    /// Wie tief wir gerade in Listen und Woerterbuechern stecken.
+    tiefe: usize,
 }
 
 impl<R: Read> Reader<R> {
     pub fn new(inner: R) -> Self {
-        Reader { inner, peeked: None }
+        Reader {
+            inner,
+            peeked: None,
+            tiefe: 0,
+        }
+    }
+
+    /// Eine Ebene hinein -- Briars BdfReaderImpl: `if (++level > nestedLimit)
+    /// throw new FormatException()`.
+    fn hinein(&mut self) -> std::io::Result<()> {
+        self.tiefe += 1;
+        if self.tiefe > MAX_TIEFE {
+            return Err(bad("BDF nested too deeply"));
+        }
+        Ok(())
     }
 
     fn read_byte(&mut self) -> std::io::Result<u8> {
@@ -253,20 +280,24 @@ impl<R: Read> Reader<R> {
                 Ok(Bdf::Raw(self.read_exact_vec(len)?))
             }
             LIST => {
+                self.hinein()?;
                 let mut items = Vec::new();
                 loop {
                     let t = self.read_byte()?;
                     if t == END {
+                        self.tiefe -= 1;
                         return Ok(Bdf::List(items));
                     }
                     items.push(self.read_with_type(t)?);
                 }
             }
             DICTIONARY => {
+                self.hinein()?;
                 let mut m = std::collections::BTreeMap::new();
                 loop {
                     let t = self.read_byte()?;
                     if t == END {
+                        self.tiefe -= 1;
                         return Ok(Bdf::Dict(m));
                     }
                     let key = match self.read_with_type(t)? {
@@ -281,20 +312,28 @@ impl<R: Read> Reader<R> {
         }
     }
 
+    /// Die Laenge einer Zeichenkette oder Rohfolge: vorzeichenlos gelesen und
+    /// gegen MAX_LAENGE geprueft, BEVOR etwas zugeteilt wird. Briar liest sie
+    /// zwar vorzeichenbehaftet, verwirft aber alles Negative und alles ueber
+    /// maxBufferSize -- der angenommene Bereich ist derselbe.
     fn read_length(&mut self, t: u8, t8: u8, t16: u8) -> std::io::Result<usize> {
-        if t == t8 {
-            Ok(self.read_byte()? as i8 as usize)
+        let len = if t == t8 {
+            self.read_byte()? as usize
         } else if t == t16 {
             let b = self.read_exact_vec(2)?;
-            Ok(crate::util::read_u16(&b) as i16 as usize)
+            crate::util::read_u16(&b) as usize
         } else {
             let b = self.read_exact_vec(4)?;
             let v = ((b[0] as u32) << 24)
                 | ((b[1] as u32) << 16)
                 | ((b[2] as u32) << 8)
                 | b[3] as u32;
-            Ok(v as usize)
+            v as usize
+        };
+        if len > MAX_LAENGE {
+            return Err(bad("BDF length exceeds 64 KiB"));
         }
+        Ok(len)
     }
 
     /// True if the stream has no more bytes.
