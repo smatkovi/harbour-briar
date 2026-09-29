@@ -1290,7 +1290,8 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                         key_from_hex(&g.id),
                         g.our_previous.clone(),
                         g.vorgaenger_zeit(),
-                        g.contacts.clone(),
+                        // Nicht an offene Einladungen -- siehe empfaenger().
+                        g.empfaenger(),
                         g.joined,
                         g.aufgeloest,
                     ),

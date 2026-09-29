@@ -3467,7 +3467,7 @@ impl Node {
             GroupMessage::Post { text, .. } => (text.clone(), false),
         };
         let others: Vec<u32>;
-        let mut neu_dabei = false;
+        let neu_dabei: bool;
         {
             let group_entry = match store.group_mut(&group_hex) {
                 Some(g) => g,
@@ -3515,9 +3515,8 @@ impl Node {
                 group_entry.contacts.push(contact_id);
             }
             others = group_entry
-                .contacts
-                .iter()
-                .copied()
+                .empfaenger()
+                .into_iter()
                 .filter(|c| *c != contact_id)
                 .collect();
         }

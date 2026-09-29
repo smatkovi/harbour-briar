@@ -510,6 +510,31 @@ impl PrivateGroup {
         }
         self.messages.iter().map(|m| m.timestamp).max().unwrap_or(0)
     }
+
+    /// An wen ein Beitrag geht: die Mitglieder, deren Einladung nicht mehr
+    /// offen ist. Fuer ein echtes Briar gibt es die Gruppe vor der Zusage
+    /// nicht -- sie ist unsichtbar, und in einer unsichtbaren Gruppe wird jede
+    /// Nachricht verworfen UND nicht quittiert (DatabaseComponentImpl
+    /// .receiveMessage). Der Korb schickte den Verlauf also in jeder Runde
+    /// erneut, bis sie zusagt, und fuer immer, wenn sie nie antwortet. Mit
+    /// der Zusage (receive_einladung_join) geht der Verlauf dann geschlossen
+    /// hinaus, samt allem, was in der Zwischenzeit geschrieben wurde.
+    ///
+    /// Das LEAVE beim Verlassen geht dagegen an ALLE in `contacts`: eine
+    /// offene Einladung muss davon erfahren, sonst laesst sie sich drueben
+    /// noch annehmen (Briars Ersteller schickt es auch in INVITED).
+    pub fn empfaenger(&self) -> Vec<u32> {
+        self.contacts
+            .iter()
+            .copied()
+            .filter(|c| {
+                !matches!(
+                    self.einladungen.get(c).map(|s| s.zustand),
+                    Some(Sitzungszustand::Eingeladen)
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1113,6 +1138,23 @@ mod gruppen_tests {
     fn ohne_nachrichten_null() {
         let g = gruppe(None, Vec::new());
         assert_eq!(g.vorgaenger_zeit(), 0);
+    }
+
+    /// Wer nur eingeladen ist, bekommt noch keine Beitraege -- fuer ein
+    /// echtes Briar gibt es die Gruppe vor der Zusage nicht. Das LEAVE geht
+    /// trotzdem an alle, darum bleibt `contacts` selbst unveraendert.
+    #[test]
+    fn offene_einladungen_bekommen_keine_beitraege() {
+        let mut g = gruppe(None, Vec::new());
+        g.contacts = vec![1, 2, 3];
+        let mut offen = Einladungssitzung::default();
+        offen.zustand = Sitzungszustand::Eingeladen;
+        g.einladungen.insert(2, offen);
+        let mut drin = Einladungssitzung::default();
+        drin.zustand = Sitzungszustand::Beigetreten;
+        g.einladungen.insert(3, drin);
+        assert_eq!(g.empfaenger(), vec![1, 3]);
+        assert_eq!(g.contacts, vec![1, 2, 3]);
     }
 }
 
