@@ -2104,7 +2104,15 @@ impl Node {
 
         let mut writer = StreamWriter::new(conn.try_clone()?, &out_keys, out_stream);
         sync::write_versions(&mut writer)?;
-        sync::write_priority(&mut writer, &crate::util::random(16))?;
+        // Den Vorrang-Satz schreibt nur, wer gewaehlt hat. Briar schickt ihn
+        // allein in der ausgehenden Sitzung einer selbst aufgebauten
+        // Duplex-Verbindung (DuplexOutgoingSession: "priority != null") und
+        // liest ihn auf der annehmenden Seite, um bei zwei gleichzeitigen
+        // Verbindungen eine zu schliessen. Von der annehmenden Seite war er
+        // fuer Briar ein Satz ohne Sinn -- geduldet, aber falsch.
+        if incoming.is_none() {
+            sync::write_priority(&mut writer, &crate::util::random(16))?;
+        }
         sync::write_ack(&mut writer, &to_ack)?;
         sync::write_request(&mut writer, &to_request)?;
         for message in &to_send {
