@@ -18,7 +18,7 @@ cd "$WORK"
 ZLIB=zlib-1.3.1
 LIBEVENT=libevent-2.1.12-stable
 OPENSSL=openssl-3.0.15
-TOR=tor-0.4.8.14
+TOR=tor-0.4.9.12
 
 fetch() {
     test -f "$2" || curl -sSL -o "$2" "$1"
