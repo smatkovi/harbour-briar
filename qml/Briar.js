@@ -128,6 +128,11 @@ function anfrage(method, path, body, callback, nochmal) {
             anfrage(method, path, body, callback, false)
         } else {
             // status 0 means the daemon is not up yet
+            // Kommt gar nichts (Status 0), ist der Dienst weg oder neu -- das
+            // Geheimnis dann lieber neu lesen, denn Qt 4.7 meldet womoeglich
+            // auch ein 401 als 0.
+            if (xhr.status === 0)
+                geheimnis = ""
             fertig({ error: xhr.status === 0
                       ? "der Dienst antwortet nicht"
                       : (xhr.status === 401
@@ -157,12 +162,29 @@ function klartext(fehler) {
 // Entsperren. Der Dienst unterscheidet nach aussen nicht, ob das Passwort
 // falsch oder die Datei beschaedigt ist -- der Grund steht in seinem
 // Protokoll. Fuer die Oberflaeche ist beides "so nicht".
+// Bevor ein Passwort ueber die Leitung geht, muss der Dienst sich frisch
+// ausgewiesen haben: das Geheimnis wird neu geholt, und die Quelle gibt es
+// nur heraus, wenn der Dienst auf dem Port den Nachweis darueber liefert
+// (Daemon.token / dienst.token). Ein Fremder auf dem Port bekommt so weder
+// Geheimnis noch Passwort.
+function ausgewiesen(callback) {
+    geheimnis = ""
+    if (geheimnisHolen() !== "")
+        return true
+    callback({ error: "der Dienst weist sich nicht aus" })
+    return false
+}
+
 function unlock(password, callback) {
+    if (!ausgewiesen(callback))
+        return
     request("POST", "/unlock", { password: password }, callback)
 }
 
 /** Aufsperren mit der Marke vom Zusperren -- nach Fingerabdruck oder Code. */
 function unlock2(token, callback) {
+    if (!ausgewiesen(callback))
+        return
     request("POST", "/unlock", { token: token }, callback)
 }
 
@@ -222,6 +244,8 @@ var PASSWORD_MIN_STRENGTH = 0.5
 // Ist schon eines gesetzt, muss das alte mitkommen: sonst koennte jeder, der
 // kurz an das entsperrte Geraet kommt, den Besitzer aussperren.
 function setPassword(oldPassword, password, callback) {
+    if (!ausgewiesen(callback))
+        return
     request("POST", "/password",
             { old: oldPassword, password: password }, callback)
 }

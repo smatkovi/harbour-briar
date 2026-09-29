@@ -83,12 +83,14 @@ fn bedienen(mut strom: TcpStream, pfad: &Path, default_port: u16) -> Option<Stor
         (400, "{\"error\":\"wrong host\"}".to_string(), None)
     } else if !crate::api::berechtigt(&koepfe) {
         // Ohne Geheimnis nur das Noetigste, als 401 (siehe api::serve):
-        // laeuft, gesperrt, Fassung. Aufsperren und Loeschen gibt es nur mit.
+        // laeuft, gesperrt, und der Nachweis, dass wir das Geheimnis kennen
+        // -- keine Fassung, damit eine aeltere Oberflaeche den Dienst nicht
+        // fuer veraltet haelt. Aufsperren und Loeschen gibt es nur mit.
         (
             401,
             format!(
-                "{{\"error\":\"unauthorised\",\"locked\":true,\"running\":true,\"version\":\"{}\"}}",
-                env!("CARGO_PKG_VERSION")
+                "{{\"error\":\"unauthorised\",\"locked\":true,\"running\":true,\"nachweis\":\"{}\"}}",
+                crate::api::nachweis()
             ),
             None,
         )
@@ -229,7 +231,11 @@ mod nebenlaeufig_tests {
         // Lesen stehen.
         haenger
             .write_all(
-                b"POST /unlock HTTP/1.1\r\nContent-Length: 40\r\n\r\n",
+                format!(
+                    "POST /unlock HTTP/1.1\r\nX-Briar-Geheimnis: {}\r\nContent-Length: 40\r\n\r\n",
+                    geheimnis
+                )
+                .as_bytes(),
             )
             .unwrap();
         haenger.flush().unwrap();
@@ -249,6 +255,32 @@ mod nebenlaeufig_tests {
             "die zweite Verbindung bekam keine Antwort: {:?}",
             antwort
         );
+        // Ohne Geheimnis: 401 mit Nachweis, ohne Fassung.
+        assert!(antwort.starts_with("HTTP/1.1 401"), "{:?}", antwort);
+        assert!(antwort.contains(&format!("\"nachweis\":\"{}\"", crate::api::nachweis())), "{:?}", antwort);
+        assert!(!antwort.contains("\"version\""), "{:?}", antwort);
+        // Mit Geheimnis in der Zweitschreibweise: 200 mit Fassung.
+        let mut mit = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        mit.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        mit.write_all(
+            format!("GET /status HTTP/1.1\r\nX-Briar-Geheimnis: {}\r\n\r\n", geheimnis).as_bytes(),
+        )
+        .unwrap();
+        let mut voll = String::new();
+        let _ = mit.read_to_string(&mut voll);
+        assert!(voll.starts_with("HTTP/1.1 200") && voll.contains("\"version\":\""), "{:?}", voll);
+        // Fremder Host: 400.
+        let mut fremd = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        fremd
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        fremd
+            .write_all(b"GET /status HTTP/1.1\r\nHost: boese.example\r\n\r\n")
+            .unwrap();
+        let mut abgelehnt = String::new();
+        let _ = fremd.read_to_string(&mut abgelehnt);
+        assert!(abgelehnt.starts_with("HTTP/1.1 400"), "{:?}", abgelehnt);
 
         // Ohne Geheimnis kein Aufsperren, auch nicht mit dem richtigen
         // Passwort (Sicherheitsbefund H0/K1).

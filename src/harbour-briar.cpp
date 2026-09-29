@@ -14,6 +14,7 @@
 #include <QTcpSocket>
 #include <QThread>
 #include <csignal>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 
@@ -26,6 +27,51 @@
 namespace {
 
 const quint16 ApiPort = 8105;
+
+static QString dataDir();
+
+/// Das Geheimnis der Schnittstelle, wie es der Dienst neben die state.json
+/// legt -- roh aus der Datei, leer, wenn es keine gibt.
+static QByteArray tokenDatei()
+{
+    QFile f(dataDir() + QStringLiteral("/api-token"));
+    if (!f.open(QIODevice::ReadOnly))
+        return QByteArray();
+    return f.readAll().trimmed();
+}
+
+/// GET /status, roh -- mit Geheimnis, wenn eines uebergeben wird. Leer,
+/// wenn niemand antwortet.
+static QByteArray statusRoh(const QByteArray &geheimnis)
+{
+    QTcpSocket socket;
+    socket.connectToHost(QStringLiteral("127.0.0.1"), ApiPort);
+    if (!socket.waitForConnected(300))
+        return QByteArray();
+    QByteArray anfrage("GET /status HTTP/1.0\r\n");
+    if (!geheimnis.isEmpty())
+        anfrage += "Authorization: Bearer " + geheimnis + "\r\n";
+    anfrage += "\r\n";
+    socket.write(anfrage);
+    if (!socket.waitForBytesWritten(300))
+        return QByteArray();
+    QByteArray answer;
+    while (socket.waitForReadyRead(700))
+        answer += socket.readAll();
+    return answer;
+}
+
+/// Den Wert eines Zeichenkettenfelds aus der rohen Antwort schneiden.
+static QByteArray feld(const QByteArray &antwort, const char *name)
+{
+    const QByteArray schluessel = QByteArray("\"") + name + "\":\"";
+    const int i = antwort.indexOf(schluessel);
+    if (i < 0)
+        return QByteArray();
+    const int a = i + schluessel.size();
+    const int e = antwort.indexOf('"', a);
+    return e < 0 ? QByteArray() : antwort.mid(a, e - a);
+}
 
 bool daemonAnswers()
 {
@@ -42,25 +88,12 @@ bool daemonAnswers()
 #endif
 
 /// Welche Fassung der laufende Dienst ist. Leer heisst: er antwortet nicht
-/// oder sagt es nicht -- dann ist er aelter als 0.35.2.
+/// oder sagt es nicht -- dann ist er aelter als 0.35.2, oder er ist neuer
+/// und kennt unser Geheimnis nicht (seit 0.41.0 nennt er die Fassung nur
+/// noch mit Geheimnis; ein aelterer Dienst ignoriert den Kopf einfach).
 static QString daemonVersion()
 {
-    QTcpSocket socket;
-    socket.connectToHost(QStringLiteral("127.0.0.1"), ApiPort);
-    if (!socket.waitForConnected(300))
-        return QString();
-    socket.write("GET /status HTTP/1.0\r\n\r\n");
-    if (!socket.waitForBytesWritten(300))
-        return QString();
-    QByteArray answer;
-    while (socket.waitForReadyRead(700))
-        answer += socket.readAll();
-    const int i = answer.indexOf("\"version\":\"");
-    if (i < 0)
-        return QString();
-    const int a = i + 11;
-    const int e = answer.indexOf('"', a);
-    return e < 0 ? QString() : QString::fromLatin1(answer.mid(a, e - a));
+    return QString::fromLatin1(feld(statusRoh(tokenDatei()), "version"));
 }
 
 /// Den laufenden Dienst beenden -- ueber /proc.
@@ -146,12 +179,22 @@ public:
     /// state.json legt (api-token). Jedes Mal frisch gelesen: der Dienst
     /// wuerfelt bei jedem Start ein neues, und Briar.js fragt nur nach einem
     /// 401 noch einmal.
+    ///
+    /// Herausgegeben wird es nur, wenn der Dienst auf dem Port nachweist,
+    /// dass er es selbst kennt: sein /status ohne Geheimnis traegt SHA-256
+    /// darueber. Wer den Port haelt, ohne die Datei lesen zu koennen -- ein
+    /// anderes Konto etwa --, bekommt so weder Geheimnis noch das Passwort,
+    /// das die Entsperrseite danach schickt.
     Q_INVOKABLE QString token()
     {
-        QFile f(dataDir() + QStringLiteral("/api-token"));
-        if (!f.open(QIODevice::ReadOnly))
+        const QByteArray geheimnis = tokenDatei();
+        if (geheimnis.isEmpty())
             return QString();
-        return QString::fromLatin1(f.readAll()).trimmed();
+        const QByteArray erwartet =
+                QCryptographicHash::hash(geheimnis, QCryptographicHash::Sha256).toHex();
+        if (feld(statusRoh(QByteArray()), "nachweis") != erwartet)
+            return QString();
+        return QString::fromLatin1(geheimnis);
     }
 
     /// Whether the user unit is enabled -- systemctl answers "enabled" or

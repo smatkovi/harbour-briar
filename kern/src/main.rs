@@ -152,11 +152,15 @@ fn main() {
     // Geheimnis ist genau das, was hier abgeschafft wird (Sicherheitsbefund
     // K1).
     if let Err(e) = briarkern::api::geheimnis_anlegen(&state_path) {
-        eprintln!(
-            "cannot write the API secret beside {}: {}",
+        // Ins Protokoll UND auf stderr: von der App gestartet, geht stderr
+        // verloren, und dann staende nirgends, warum der Dienst nicht kommt.
+        let grund = format!(
+            "cannot write the API secret beside {}: {} -- not starting",
             state_path.display(),
             e
         );
+        net::log(&grund);
+        eprintln!("{}", grund);
         std::process::exit(1);
     }
 

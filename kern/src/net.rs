@@ -1738,8 +1738,10 @@ impl Node {
             alice,
         )?;
         writer.send_end_of_stream()?;
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
+        // Den Rest des Handschlagstroms leeren -- begrenzt: read_to_end
+        // liesse eine Gegenseite, die einfach weiterschickt, den Speicher
+        // fuellen (Gegenpruefung 6, B4).
+        let _ = std::io::copy(&mut (&mut reader).take(64 * 1024), &mut std::io::sink());
         log("handshake succeeded");
 
         // Contact exchange, on the same connection but with its own streams
@@ -1769,8 +1771,10 @@ impl Node {
             alice,
         )?;
         exchange_writer.send_end_of_stream()?;
-        let mut sink = Vec::new();
-        let _ = exchange_reader.read_to_end(&mut sink);
+        let _ = std::io::copy(
+            &mut (&mut exchange_reader).take(64 * 1024),
+            &mut std::io::sink(),
+        );
 
         if !exchange::verify_nonce(&remote.public_key, &master_key, !alice, &remote_signature) {
             return Err(bad("the contact's signature did not verify"));
@@ -5825,8 +5829,7 @@ impl Node {
         let (remote, remote_signature) =
             exchange::exchange(&mut leser, &mut schreiber, &local, &signature, alice)?;
         schreiber.send_end_of_stream()?;
-        let mut eimer = Vec::new();
-        let _ = leser.read_to_end(&mut eimer);
+        let _ = std::io::copy(&mut (&mut leser).take(64 * 1024), &mut std::io::sink());
         if !exchange::verify_nonce(&remote.public_key, &master_key, !alice, &remote_signature) {
             return Err(bad("the contact's signature did not verify"));
         }

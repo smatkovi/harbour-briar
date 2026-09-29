@@ -312,22 +312,36 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    /// Die Laenge einer Zeichenkette oder Rohfolge: vorzeichenlos gelesen und
-    /// gegen MAX_LAENGE geprueft, BEVOR etwas zugeteilt wird. Briar liest sie
-    /// zwar vorzeichenbehaftet, verwirft aber alles Negative und alles ueber
-    /// maxBufferSize -- der angenommene Bereich ist derselbe.
+    /// Die Laenge einer Zeichenkette oder Rohfolge, geprueft BEVOR etwas
+    /// zugeteilt wird -- und zwar mit genau Briars Bereichen: Briar liest sie
+    /// vorzeichenbehaftet und kanonisch (BdfReaderImpl.readInt8/16/32 mit
+    /// canonical = true), also 8 Bit nur 0..127, 16 Bit nur 128..32767,
+    /// 32 Bit nur ab 32768, und alles ueber maxBufferSize ist ein
+    /// Formfehler. Was Briar verwirft, verwerfen wir auch; unser Schreiber
+    /// (write_length_prefixed) ist ohnehin kanonisch.
     fn read_length(&mut self, t: u8, t8: u8, t16: u8) -> std::io::Result<usize> {
         let len = if t == t8 {
-            self.read_byte()? as usize
+            let v = self.read_byte()? as usize;
+            if v > 127 {
+                return Err(bad("BDF 8-bit length is negative"));
+            }
+            v
         } else if t == t16 {
             let b = self.read_exact_vec(2)?;
-            crate::util::read_u16(&b) as usize
+            let v = crate::util::read_u16(&b) as usize;
+            if !(128..=32767).contains(&v) {
+                return Err(bad("BDF 16-bit length is not canonical"));
+            }
+            v
         } else {
             let b = self.read_exact_vec(4)?;
             let v = ((b[0] as u32) << 24)
                 | ((b[1] as u32) << 16)
                 | ((b[2] as u32) << 8)
                 | b[3] as u32;
+            if v < 32768 {
+                return Err(bad("BDF 32-bit length is not canonical"));
+            }
             v as usize
         };
         if len > MAX_LAENGE {

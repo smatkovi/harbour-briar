@@ -16,29 +16,57 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// STRING_8 mit Laengenbyte 0xff: frueher als i8 (-1) gelesen und als usize
-/// riesig. Briar verwirft negative Laengen (BdfReaderImpl.readString).
+/// riesig. Briar verwirft negative Laengen (BdfReaderImpl.readString). Der
+/// Inhalt ist vollstaendig da -- der Fehler kommt von der Laenge, nicht von
+/// einem zu kurzen Strom.
 #[test]
 fn bdf_negative_stringlaenge_ist_ein_formfehler() {
-    let r = std::panic::catch_unwind(|| bdf::from_bytes(&[0x41, 0xff]).is_err());
+    let mut roh = vec![0x41, 0xff];
+    roh.extend(std::iter::repeat(b'a').take(255));
+    let r = std::panic::catch_unwind(|| bdf::from_bytes(&roh).is_err());
     assert!(matches!(r, Ok(true)), "0x41,0xff sollte einen Fehler geben, kein Panic");
+    // 127 ist die groesste 8-Bit-Laenge, die Briar annimmt.
+    let mut gut = vec![0x41, 127];
+    gut.extend(std::iter::repeat(b'a').take(127));
+    assert!(bdf::from_bytes(&gut).is_ok());
 }
 
-/// RAW_16 mit 0x8000: als i16 negativ, als usize riesig.
+/// RAW_16 mit 0x8000: als i16 negativ, als usize riesig -- auch mit
+/// vollstaendigem Inhalt ein Formfehler.
 #[test]
 fn bdf_negative_rohlaenge_ist_ein_formfehler() {
-    let r = std::panic::catch_unwind(|| bdf::from_bytes(&[0x52, 0x80, 0x00]).is_err());
+    let mut roh = vec![0x52, 0x80, 0x00];
+    roh.extend(std::iter::repeat(7u8).take(32768));
+    let r = std::panic::catch_unwind(|| bdf::from_bytes(&roh).is_err());
     assert!(matches!(r, Ok(true)), "0x52,0x80,0x00 sollte einen Fehler geben, kein Panic");
 }
 
+/// Briar liest Laengen kanonisch: eine 16-Bit-Laenge unter 128 und eine
+/// 32-Bit-Laenge unter 32768 sind dort Formfehler -- bei uns jetzt auch, sonst
+/// zeigten wir Gruppenbeitraege, die Briar-Mitglieder verwerfen.
+#[test]
+fn nicht_kanonische_laengen_sind_formfehler() {
+    let mut kurz16 = vec![0x52, 0x00, 0x05];
+    kurz16.extend(std::iter::repeat(7u8).take(5));
+    assert!(bdf::from_bytes(&kurz16).is_err(), "16 Bit fuer 5 Byte");
+    let mut kurz32 = vec![0x54, 0x00, 0x00, 0x7f, 0xff];
+    kurz32.extend(std::iter::repeat(7u8).take(32767));
+    assert!(bdf::from_bytes(&kurz32).is_err(), "32 Bit fuer 32767 Byte");
+    let mut gut16 = vec![0x52, 0x00, 0x80];
+    gut16.extend(std::iter::repeat(7u8).take(128));
+    assert!(bdf::from_bytes(&gut16).is_ok(), "128 ist die kleinste 16-Bit-Laenge");
+    let mut gut32 = vec![0x54, 0x00, 0x00, 0x80, 0x00];
+    gut32.extend(std::iter::repeat(7u8).take(32768));
+    assert!(bdf::from_bytes(&gut32).is_ok(), "32768 ist die kleinste 32-Bit-Laenge");
+}
+
 /// RAW_32 mit 65537 Byte: ueber Briars maxBufferSize, also Formfehler -- und
-/// zwar bevor etwas zugeteilt wird.
+/// zwar bevor etwas zugeteilt wird (der Strom ist absichtlich kurz).
 #[test]
 fn zu_lange_rohfolge_wird_verworfen() {
     assert!(bdf::from_bytes(&[0x54, 0x00, 0x01, 0x00, 0x01]).is_err());
-    // 64 KiB genau gehen noch -- die Laenge wird geprueft, dann fehlen die
-    // Bytes: ein Lesefehler, kein Laengenfehler.
-    let kopf = [0x54, 0x00, 0x01, 0x00, 0x00];
-    let mut ganz = kopf.to_vec();
+    // 64 KiB genau gehen noch, mit vollstaendigem Inhalt.
+    let mut ganz = vec![0x54, 0x00, 0x01, 0x00, 0x00];
     ganz.extend(std::iter::repeat(7u8).take(65536));
     assert!(bdf::from_bytes(&ganz).is_ok());
 }
@@ -170,18 +198,63 @@ fn mit_geheimnis_kommen_die_nachrichten() {
     assert!(c.starts_with("HTTP/1.1 401"), "{}", c);
 }
 
-/// Ohne Geheimnis sagt /status nur, dass der Dienst laeuft und welche
-/// Fassung er ist -- das braucht die App, um einen veralteten Dienst zu
-/// erkennen. Link, Adressen, Kontakte: nichts davon.
+/// Ohne Geheimnis sagt /status nur, dass der Dienst laeuft, ob er gesperrt
+/// ist, und weist mit SHA-256 ueber das Geheimnis nach, dass er es kennt --
+/// damit die Oberflaeche es nicht an einen Fremden auf dem Port gibt. KEINE
+/// Fassung: eine aeltere Oberflaeche hielte den Dienst sonst fuer veraltet
+/// und beendete ihn alle drei Sekunden. Link, Adressen, Kontakte: nichts.
 #[test]
 fn ohne_geheimnis_sagt_status_nur_dass_er_laeuft() {
-    let (port, d, _) = dienst("status");
+    use sha2::{Digest, Sha256};
+    let (port, d, g) = dienst("status");
     let a = anfrage(port, "GET /status HTTP/1.0\r\n\r\n");
     let _ = std::fs::remove_dir_all(&d);
     assert!(a.starts_with("HTTP/1.1 401"), "{}", a);
-    assert!(a.contains("\"version\":\""), "{}", a);
+    assert!(!a.contains("\"version\""), "{}", a);
     assert!(a.contains("\"running\":true"), "{}", a);
+    let erwartet: String = Sha256::digest(g.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    assert!(a.contains(&format!("\"nachweis\":\"{}\"", erwartet)), "{}", a);
     assert!(!a.contains("Bob") && !a.contains("\"link\""), "{}", a);
+}
+
+/// Die Fassung gibt es mit Geheimnis -- so fragt die App seit 0.41.0.
+#[test]
+fn mit_geheimnis_nennt_status_die_fassung() {
+    let (port, d, g) = dienst("fassung");
+    let a = anfrage(port, &format!("GET /status HTTP/1.0\r\nAuthorization: Bearer {}\r\n\r\n", g));
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(a.starts_with("HTTP/1.1 200") && a.contains("\"version\":\""), "{}", a);
+}
+
+/// Konto loeschen ohne Geheimnis: 401, und die state.json steht noch.
+#[test]
+fn konto_loeschen_braucht_das_geheimnis() {
+    let (port, d, _) = dienst("loeschen");
+    let a = anfrage(port, "POST /account/delete HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}");
+    let steht = d.join("state.json").exists();
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(a.starts_with("HTTP/1.1 401"), "{}", a);
+    assert!(steht, "die state.json darf nicht weg sein");
+}
+
+/// Eine Anfragezeile ueber 8 KiB und Kopfzeilen ueber 64 KiB werden nicht
+/// erst gelesen und dann gemessen, sondern an der Grenze abgewiesen.
+#[test]
+fn ueberlange_anfragen_werden_abgewiesen() {
+    let (port, d, _) = dienst("lang");
+    let zeile = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(9000));
+    let a = anfrage(port, &zeile);
+    assert!(a.starts_with("HTTP/1.1 414"), "{}", a);
+    let mut koepfe = String::from("GET /status HTTP/1.1\r\n");
+    for i in 0..20 {
+        koepfe.push_str(&format!("X-Fuell-{}: {}\r\n", i, "b".repeat(4000)));
+    }
+    koepfe.push_str("\r\n");
+    let b = anfrage(port, &koepfe);
+    let _ = std::fs::remove_dir_all(&d);
+    // Zu viel Kopf: keine Antwort (die Verbindung wird abgebrochen), auf
+    // keinen Fall aber ein Inhalt.
+    assert!(!b.starts_with("HTTP/1.1 200"), "{}", b);
 }
 
 /// DNS-Rebinding: der Name einer fremden Seite zeigt auf 127.0.0.1. Der

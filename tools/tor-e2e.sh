@@ -24,7 +24,7 @@ start() {   # start <dir> <api> <lan> <torport> <torcontrol>
 api() {     # api <port> <method> <path> [json]
     # Seit 0.41.0 verlangt die Schnittstelle das Geheimnis, das der Dienst
     # neben seine state.json legt.
-    case $1 in 8301) seite=a ;; 8302) seite=b ;; *) seite=a ;; esac
+    case $1 in 8301) seite=a ;; 8302) seite=b ;; *) echo "api: unbekannter Port $1" >&2; exit 1 ;; esac
     G=$(cat "$WORK/$seite/api-token" 2>/dev/null)
     if [ -n "$4" ]; then
         curl -s -X "$2" -H "Authorization: Bearer $G" -H 'Content-Type: application/json' -d "$4" \

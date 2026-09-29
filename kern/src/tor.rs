@@ -599,19 +599,28 @@ fn command(control: &mut TcpStream, line: &str) -> std::io::Result<(u16, Vec<Str
     let mut reader = BufReader::new(control.try_clone()?);
     let mut code = 0u16;
     let mut lines = Vec::new();
-    loop {
+    // Hoechstens so viele Zeilen und Bytes: ein fremder Prozess auf dem
+    // Steuerport darf uns weder den Speicher fuellen noch mit einem
+    // Mehrbyte-Zeichen an Stelle drei zum Absturz bringen (Gegenpruefung 6:
+    // `answer[..3]` auf "250\u{e9}x" war ein Panic, mit panic = "abort" das
+    // Ende des Dienstes).
+    for _ in 0..4096 {
         let mut answer = String::new();
-        if reader.read_line(&mut answer)? == 0 {
+        if (&mut reader).take(64 * 1024).read_line(&mut answer)? == 0 {
             break;
         }
-        let answer = answer.trim_end().to_string();
-        if answer.len() < 4 {
+        let answer = answer.trim_end();
+        let bytes = answer.as_bytes();
+        if bytes.len() < 4 || !bytes[..3].iter().all(|b| b.is_ascii_digit()) {
             break;
         }
-        code = answer[..3].parse().unwrap_or(0);
-        let separator = answer.as_bytes()[3] as char;
-        lines.push(answer[4..].to_string());
-        if separator == ' ' {
+        code = std::str::from_utf8(&bytes[..3])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let separator = bytes[3];
+        lines.push(String::from_utf8_lossy(&bytes[4..]).into_owned());
+        if separator == b' ' {
             break;
         }
     }

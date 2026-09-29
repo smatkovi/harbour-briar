@@ -23,6 +23,7 @@
 #include <sys/types.h>
 
 #include "../src/imageprep.h"
+#include "sha256.h"
 
 static const quint16 ApiPort = 8105;
 
@@ -69,28 +70,60 @@ static bool dienstAntwortet()
 #define BRIAR_VERSION "unbekannt"
 #endif
 
-/// Welche Fassung der laufende Dienst ist -- leer, wenn er nicht antwortet
-/// oder es nicht sagt (dann ist er aelter als 0.35.2).
-static QString dienstFassung()
+/// Wo der Dienst seinen Zustand hat -- und daneben sein api-token.
+static QString datenOrdner()
+{
+    return QDir::homePath() + QLatin1String("/.local/share/harbour-briar");
+}
+
+/// Das Geheimnis der Schnittstelle, roh aus der Datei; leer, wenn keine da ist.
+static QByteArray tokenDatei()
+{
+    QFile f(datenOrdner() + QLatin1String("/api-token"));
+    if (!f.open(QIODevice::ReadOnly))
+        return QByteArray();
+    return f.readAll().trimmed();
+}
+
+/// GET /status, roh -- mit Geheimnis, wenn eines uebergeben wird.
+static QByteArray statusRoh(const QByteArray &geheimnis)
 {
     QTcpSocket socket;
     socket.connectToHost(QLatin1String("127.0.0.1"), ApiPort);
     if (!socket.waitForConnected(300))
-        return QString();
-    socket.write("GET /status HTTP/1.0\r\n\r\n");
+        return QByteArray();
+    QByteArray anfrage("GET /status HTTP/1.0\r\n");
+    if (!geheimnis.isEmpty())
+        anfrage += "Authorization: Bearer " + geheimnis + "\r\n";
+    anfrage += "\r\n";
+    socket.write(anfrage);
     if (!socket.waitForBytesWritten(300))
-        return QString();
+        return QByteArray();
     QByteArray antwort;
     while (socket.waitForReadyRead(700))
         antwort += socket.readAll();
-    const int i = antwort.indexOf("\"version\":\"");
+    return antwort;
+}
+
+/// Den Wert eines Zeichenkettenfelds aus der rohen Antwort schneiden.
+static QByteArray feld(const QByteArray &antwort, const char *name)
+{
+    const QByteArray schluessel = QByteArray("\"") + name + "\":\"";
+    const int i = antwort.indexOf(schluessel);
     if (i < 0)
-        return QString();
-    const int a = i + 11;
+        return QByteArray();
+    const int a = i + schluessel.size();
     const int e = antwort.indexOf('"', a);
-    if (e < 0)
-        return QString();
-    return QString::fromLatin1(antwort.mid(a, e - a));
+    return e < 0 ? QByteArray() : antwort.mid(a, e - a);
+}
+
+/// Welche Fassung der laufende Dienst ist -- leer, wenn er nicht antwortet
+/// oder es nicht sagt (dann ist er aelter als 0.35.2, oder neuer und kennt
+/// unser Geheimnis nicht: seit 0.41.0 nennt er die Fassung nur mit
+/// Geheimnis, ein aelterer ignoriert den Kopf).
+static QString dienstFassung()
+{
+    return QString::fromLatin1(feld(statusRoh(tokenDatei()), "version"));
 }
 
 /// Den laufenden Dienst beenden.
@@ -135,12 +168,18 @@ void Dienst::starten()
     dienstStarten();
 }
 
+/// Siehe die Sailfish-Seite: nur an einen Dienst, der mit SHA-256 ueber das
+/// Geheimnis nachweist, dass er die Datei selbst kennt.
 QString Dienst::token()
 {
-    QFile f(QDir::homePath() + QLatin1String("/.local/share/harbour-briar/api-token"));
-    if (!f.open(QIODevice::ReadOnly))
+    const QByteArray geheimnis = tokenDatei();
+    if (geheimnis.isEmpty())
         return QString();
-    return QString::fromLatin1(f.readAll()).trimmed();
+    const std::string erwartet = sha256::hex(std::string(geheimnis.constData(), geheimnis.size()));
+    const QByteArray nachweis = feld(statusRoh(QByteArray()), "nachweis");
+    if (std::string(nachweis.constData(), nachweis.size()) != erwartet)
+        return QString();
+    return QString::fromLatin1(geheimnis);
 }
 
 static void dienstStarten()
@@ -168,7 +207,7 @@ static void dienstStarten()
         for (int i = 0; i < 20 && dienstAntwortet(); ++i)
             ::usleep(100 * 1000);
     }
-    const QString daten = QDir::homePath() + QLatin1String("/.local/share/harbour-briar");
+    const QString daten = datenOrdner();
     QDir().mkpath(daten);
     QStringList argumente;
     argumente << QLatin1String("--state") << daten + QLatin1String("/state.json")

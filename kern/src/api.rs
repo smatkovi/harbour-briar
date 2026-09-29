@@ -50,7 +50,7 @@ const MAX_KOPF: u64 = 64 * 1024;
 /// Mehrmals aufrufbar: die Datei wird jedes Mal geschrieben, das Geheimnis
 /// bleibt -- so findet jede Pruefung in ihrem Verzeichnis eines.
 pub fn geheimnis_anlegen(state_path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let wert = GEHEIMNIS.get_or_init(|| to_hex(&crate::util::random(32)));
     let dir = state_path
         .parent()
@@ -58,16 +58,18 @@ pub fn geheimnis_anlegen(state_path: &Path) -> std::io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let pfad = dir.join(GEHEIMNIS_DATEI);
-    // Mit 0600 angelegt, nicht nachtraeglich enger gemacht -- dazwischen
-    // laege ein Fenster. Eine alte Datei wird ueberschrieben und bekommt die
-    // Rechte ausdruecklich.
+    // Erst weg damit, dann neu und ausschliesslich anlegen, mit 0600 und
+    // ohne einem Link zu folgen. Entfernen darf der Benutzer im eigenen
+    // Verzeichnis auch eine Datei, die root gehoert (etwa nach einem Start
+    // per devel-su); create_new + O_NOFOLLOW verhindern, dass ein gelegter
+    // Link auf eine fremde Datei zeigt und die ueberschrieben wird.
+    let _ = std::fs::remove_file(&pfad);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&pfad)?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     f.write_all(wert.as_bytes())?;
     f.flush()
 }
@@ -76,6 +78,26 @@ pub fn geheimnis_anlegen(state_path: &Path) -> std::io::Result<()> {
 /// ist niemand berechtigt.
 pub fn geheimnis() -> &'static str {
     GEHEIMNIS.get().map(|s| s.as_str()).unwrap_or("")
+}
+
+/// Der Nachweis, dass WIR das Geheimnis kennen: SHA-256 darueber, als
+/// Hexzahl. Steht in jeder Antwort ohne Geheimnis auf /status.
+///
+/// Wozu: die Oberflaeche schickt Geheimnis und -- beim Aufsperren -- das
+/// Passwort aus dem Schluesselbund an den, der auf dem Port antwortet. Ohne
+/// Nachweis waere das jeder Prozess, der den Port zuerst bindet, auch einer
+/// eines anderen Kontos (Gegenpruefung 6, A1; Sicherheitsbefund M5). Die
+/// Oberflaeche liest das Geheimnis aus der Datei, rechnet denselben Hash
+/// und gibt das Geheimnis nur an einen Dienst heraus, dessen Nachweis passt.
+/// Wer die Datei nicht lesen kann, kann den Nachweis nicht faelschen; wer
+/// sie lesen kann, braucht ihn nicht.
+pub fn nachweis() -> String {
+    use sha2::{Digest, Sha256};
+    let g = geheimnis();
+    if g.is_empty() {
+        return String::new();
+    }
+    to_hex(&Sha256::digest(g.as_bytes()))
 }
 
 /// Die Kopfzeilen einer Anfrage, soweit sie hier zaehlen.
@@ -96,12 +118,14 @@ pub fn koepfe_lesen(leser: &mut impl BufRead) -> std::io::Result<Koepfe> {
     let mut gelesen = 0u64;
     loop {
         let mut zeile = String::new();
-        let n = leser.read_line(&mut zeile)?;
+        // Je Zeile hoechstens 8 KiB, insgesamt hoechstens MAX_KOPF -- beides
+        // beim Lesen, nicht hinterher.
+        let n = (&mut *leser).take(8192 + 1).read_line(&mut zeile)?;
         gelesen += n as u64;
         if n == 0 || zeile.trim().is_empty() {
             break;
         }
-        if gelesen > MAX_KOPF {
+        if n > 8192 || gelesen > MAX_KOPF {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "headers too long",
@@ -181,8 +205,15 @@ pub fn run(store: Shared, port: u16) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
-            net::log(&format!("cannot bind the API to port {}: {}", port, e));
-            return;
+            // Nicht ohne Schnittstelle weiterlaufen: dann redete die
+            // Oberflaeche mit dem, der den Port hat, und wir wuessten es
+            // nicht. Ein zweiter eigener Dienst kommt gar nicht bis hierher
+            // (Instanzsperre); wer den Port hat, ist ein Fremder.
+            net::log(&format!(
+                "cannot bind the API to port {}: {} -- stopping",
+                port, e
+            ));
+            std::process::exit(1);
         }
     };
     net::log(&format!("API on 127.0.0.1:{}", port));
@@ -203,9 +234,15 @@ pub fn run(store: Shared, port: u16) {
 
 fn serve(store: Shared, socket: TcpStream) -> std::io::Result<()> {
     // Alles zusammen begrenzt, Kopf wie Rumpf: mehr liest der Dienst nicht.
+    // Und nicht ewig: eine Gegenseite, die troepfelt, bindet sonst einen
+    // Faden je Verbindung, beliebig viele.
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = socket.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let mut reader = BufReader::new(socket.try_clone()?).take(MAX_KOPF + MAX_RUMPF as u64);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    // Die Anfragezeile hoechstens 8 KiB, gelesen mit genau dieser Grenze --
+    // nicht erst hinterher gemessen.
+    (&mut reader).take(8192 + 1).read_line(&mut request_line)?;
     if request_line.len() > 8192 {
         return antworten(socket, 414, &json!({"error": "request line too long"}));
     }
@@ -225,15 +262,21 @@ fn serve(store: Shared, socket: TcpStream) -> std::io::Result<()> {
     };
     if !berechtigt(&koepfe) {
         // Ohne Geheimnis nur, was die App zum Anlaufen braucht: laeuft der
-        // Dienst, welche Fassung, gesperrt oder nicht. Als 401, nicht als
-        // 200 -- die Oberflaeche liest bei 401 ihr Geheimnis neu und fragt
-        // noch einmal; die Fassungsabfrage der App sucht nur nach "version"
-        // im Text. Der Rumpf wird gar nicht erst gelesen.
+        // Dienst, gesperrt oder nicht, und der Nachweis, dass wir das
+        // Geheimnis kennen. Als 401, nicht als 200 -- die Oberflaeche liest
+        // bei 401 ihr Geheimnis neu und fragt noch einmal. Der Rumpf wird
+        // gar nicht erst gelesen.
+        //
+        // KEINE Fassung hier. Die Fassungsabfrage der App fragt seit 0.41.0
+        // mit Geheimnis; eine aeltere Oberflaeche (bis 0.40.0) fragt ohne,
+        // laese hier eine fremde Fassung, hielte den Dienst fuer veraltet
+        // und beendete ihn -- alle drei Sekunden, bis sie geschlossen wird
+        // (Gegenpruefung 6, A2). Ohne Fassung laesst sie ihn stehen.
         let mut antwort = json!({"error": "unauthorised"});
         if method == "GET" && path == "/status" {
             antwort["running"] = json!(true);
-            antwort["version"] = json!(env!("CARGO_PKG_VERSION"));
             antwort["locked"] = json!(ist_gesperrt());
+            antwort["nachweis"] = json!(nachweis());
         }
         return antworten(socket, 401, &antwort);
     }
@@ -248,6 +291,28 @@ fn serve(store: Shared, socket: TcpStream) -> std::io::Result<()> {
     };
     let response = handle(store, &method, &path, &query, &body);
     antworten(socket, 200, &response)
+}
+
+/// Eine gewoehnliche Datei bis `capacity` Byte lesen; groessere liefern ihre
+/// Laenge zurueck, damit die Meldung stimmt, ohne dass alles im Speicher
+/// landet. Kein FIFO, kein Geraet: `is_file` sagt es vorher.
+fn datei_lesen_begrenzt(path: &str, capacity: usize) -> std::io::Result<Vec<u8>> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut data = Vec::new();
+    std::fs::File::open(path)?
+        .take(capacity as u64 + 1)
+        .read_to_end(&mut data)?;
+    if data.len() > capacity {
+        // Die echte Groesse fuer die Meldung, ohne sie zu lesen.
+        data.resize(meta.len() as usize, 0);
+    }
+    Ok(data)
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {
@@ -347,6 +412,9 @@ pub fn sperrwaechter(store: Shared) {
 pub fn konto_loeschen(pfad: &std::path::Path) {
     let ordner = pfad.parent().map(|p| p.to_path_buf());
     let _ = std::fs::remove_file(pfad);
+    if let Some(ordner) = pfad.parent() {
+        let _ = std::fs::remove_file(ordner.join(GEHEIMNIS_DATEI));
+    }
     if let Some(ordner) = ordner {
         let _ = std::fs::remove_dir_all(ordner.join("attachments"));
         let _ = std::fs::remove_dir_all(ordner.join("tor"));
@@ -737,15 +805,20 @@ fn handle(store: Shared, method: &str, path: &str, query: &str, body: &Value) ->
                 };
                 let mut attachments: Vec<(crate::crypto::SecretKey, String)> = Vec::new();
                 if let Some(path) = file {
-                    let data = match std::fs::read(&path) {
-                        Ok(d) => d,
-                        Err(e) => return json!({"error": format!("{}: {}", path, e)}),
-                    };
                     let content_type = body["contentType"]
                         .as_str()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| guess_content_type(&path));
                     let capacity = crate::sync::attachment_capacity(&content_type);
+                    // Nicht blind die ganze Datei lesen -- unter dem
+                    // Speicherschloss: ein 2-GB-Video waere OOM, ein FIFO
+                    // stuende fuer immer, und mit ihm der ganze Dienst.
+                    // Erst nachsehen, was das ist, dann hoechstens so viel
+                    // lesen, wie in eine Nachricht passt.
+                    let data = match datei_lesen_begrenzt(&path, capacity) {
+                        Ok(d) => d,
+                        Err(e) => return json!({"error": format!("{}: {}", path, e)}),
+                    };
                     if data.len() > capacity {
                         // Briar puts an attachment in a single message, and a
                         // message body cannot grow past 32 KiB. That is why
@@ -1791,6 +1864,18 @@ fn group_json(store: &Store, group: &PrivateGroup) -> Value {
 
 fn status(store: &Shared) -> Value {
     let locked = store.lock().unwrap();
+    // Zugesperrt heisst zugesperrt: nur, was die Entsperrseite braucht.
+    // Kontakte, Adressen und zuletzt der Text der letzten Nachricht blieben
+    // sonst fuer jeden lesbar, der das Geheimnis hat (Sicherheitsbefund M1).
+    if ist_gesperrt() {
+        return json!({
+            "locked": true,
+            "running": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "encrypted": locked.verschluesselt(),
+            "language": locked.state.language.clone().unwrap_or_else(|| "en".to_string()),
+        });
+    }
     let identity = locked.identity().map(|i| {
         json!({
             "name": i.name,

@@ -206,9 +206,13 @@ fn post(port: u16, path: &str, body: &str) {
         body
     );
     if let Ok(mut socket) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = socket.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let _ = socket.write_all(request.as_bytes());
+        // Begrenzt: die Gegenseite ist unser eigener Dienst -- es sei denn,
+        // ein Fremder hat den Port.
         let mut answer = Vec::new();
-        let _ = socket.read_to_end(&mut answer);
+        let _ = socket.take(64 * 1024).read_to_end(&mut answer);
     }
 }
 

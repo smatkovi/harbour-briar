@@ -437,7 +437,11 @@ pub fn lookup_channel(address: &str, uuid: &str) -> io::Result<u8> {
     let mut leser = &strom;
     let gelesen = leser.read(&mut antwort)?;
     antwort.truncate(gelesen);
-    if gelesen < 5 || antwort[0] != SDP_SERVICE_SEARCH_ATTR_RSP {
+    // Mindestens der Kopf (5 Byte) und die zwei Laengenbytes davor, sonst
+    // griffe `antwort[7..]` ins Leere -- ein Panic, mit panic = "abort" das
+    // Ende des Dienstes, und zwar bei jedem Verbindungsversuch zu dieser
+    // Adresse wieder (Gegenpruefung 6, B3).
+    if gelesen < 7 || antwort[0] != SDP_SERVICE_SEARCH_ATTR_RSP {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SDP answered something else",
