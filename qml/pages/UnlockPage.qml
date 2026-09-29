@@ -23,24 +23,23 @@ Page {
     /// Meldung, damit ein Haenger sich selbst erklaert.
     property string hinweis: ""
 
-    // Briar auf Android sperrt mit dem Bildschirmschloss des Telefons auf, nicht
-    // mit dem Briar-Passwort (KeyguardManager, Fingerabdruck ueber
-    // BiometricPrompt). Das geht hier auch: org.nemomobile.devicelock fragt
-    // Fingerabdruck oder Gerätecode ab.
-    //
-    // Der Dienst weiss davon nichts, also bekommt die App beim Zusperren eine
-    // einmalige Marke und gibt sie nach geglueckter Pruefung zurueck. Die Marke
-    // liegt nur im Arbeitsspeicher; nach einem Neustart des Dienstes ist der
-    // Speicher ohnehin versiegelt, und dann hilft nur das Passwort.
-    // Zwei Wege mit dem Telefon:
-    //  * die Marke -- nur wenn diese App gerade selbst zugesperrt hat,
-    //  * der Schluesselbund -- auch nach einem Neustart, wenn das Passwort dort
-    //    hinterlegt ist. Der zweite fragt beim Herausgeben selbst nach dem
-    //    Fingerabdruck (DeviceLockVerifyLock), der erste braucht die Pruefung
-    //    von uns.
-    property bool mitTelefonMoeglich: (app.sperrMarke.length > 0
-                                       && pruefer.availableMethods !== 0)
-                                      || app.schluesselbundDa
+    // Zwei Wege ohne Passwort:
+    //  * der Schluesselbund (Sailfish Secrets): liegt das Passwort dort, wird
+    //    er gleich beim Aufbau der Seite gefragt -- so wie Storeman es haelt.
+    //    Ob und wie er den Benutzer prueft, entscheidet der Geheimnisdienst
+    //    selbst mit seinem eigenen Dialog; die App fragt nicht vorher noch
+    //    einmal nach Sperrcode oder Fingerabdruck. Scheitert er oder wischt
+    //    der Benutzer den Dialog weg, bleibt das Passwort. Ein Schalter setzt
+    //    ihn fuer diese Sitzung aus (app.schluesselbundPause).
+    //  * das Geraeteschloss mit der einmaligen Marke -- nur wenn diese App
+    //    gerade selbst zugesperrt hat und kein Schluesselbund im Spiel ist:
+    //    org.nemomobile.devicelock fragt Fingerabdruck oder Geraetecode ab,
+    //    und die Marke geht an den Dienst zurueck. Nach einem Neustart des
+    //    Dienstes ist der Speicher versiegelt, dann hilft nur das Passwort.
+    property bool schluesselbundAktiv: app.schluesselbundDa && !app.schluesselbundPause
+    property bool mitSchlossMoeglich: !app.schluesselbundDa
+                                      && app.sperrMarke.length > 0
+                                      && pruefer.availableMethods !== 0
 
     // Der Schluesselbund antwortet nebenher.
     Connections {
@@ -69,52 +68,54 @@ Page {
             // wir das Passwort neu in den Schluesselbund.
             page.schluesselbundVersagt = true
             page.message = app.tr("unlockFallback")
+            feld.forceActiveFocus()
         }
     }
 
-    /// Sobald die Seite steht und im Schluesselbund etwas liegt: gleich nach
-    /// Fingerabdruck oder Sperrcode fragen. Glueckt das, wird das Passwort
-    /// ohne weitere Rueckfrage geholt und die App geht von selbst auf -- ein
-    /// Schritt statt dreier (Knopf, Fingerabdruck, "Erlauben").
+    /// Den Schluesselbund fragen. Er prueft den Benutzer selbst, wenn er es
+    /// fuer noetig haelt, und antwortet ueber die Connections oben.
+    function schluesselbund() {
+        if (page.busy)
+            return
+        page.busy = true
+        page.message = app.tr("keychainWaiting")
+        nachfrage.restart()
+        Schluesselbund.holen()
+    }
+
+    /// Sobald die Seite steht und im Schluesselbund etwas liegt: ihn gleich
+    /// fragen. Glueckt das, geht die App von selbst auf -- ein Schritt, kein
+    /// Knopf, keine eigene Abfrage davor.
     Component.onCompleted: {
         // Das Tippen bleibt immer moeglich: der Fokus geht ins Feld, auch
-        // wenn daneben nach dem Fingerabdruck gefragt wird. Wer die Abfrage
-        // wegwischt, gibt einfach das Passwort ein.
+        // wenn daneben der Geheimnisdienst fragt. Wer dessen Dialog wegwischt,
+        // gibt einfach das Passwort ein.
         feld.forceActiveFocus()
-        if (app.schluesselbundDa && pruefer.availableMethods !== 0)
+        if (page.schluesselbundAktiv)
             vonSelbst.start()
     }
 
     Timer {
         id: vonSelbst
         interval: 250
-        // Dieselbe kurze Kennung wie beim Knopf weiter unten. Ein ganzer
-        // uebersetzter Satz ist kein Pruefcode -- damit kam die Abfrage
-        // des Geraeteschlosses gar nicht erst.
-        onTriggered: pruefer.authenticate("briar-unlock")
+        onTriggered: page.schluesselbund()
     }
 
+    // Nur fuer die Marke: das Geraeteschloss prueft, der Dienst bekommt die
+    // Marke zurueck. Dieselbe kurze Kennung wie frueher -- ein ganzer
+    // uebersetzter Satz ist kein Pruefcode, damit kam die Abfrage gar nicht.
     Authenticator {
         id: pruefer
         onAuthenticated: {
-            page.busy = true
-            nachfrage.restart()
-            // Ohne Marke gibt es nichts aufzusperren -- dann kommt das
-            // Passwort aus dem Schluesselbund, jetzt ohne zweite Rueckfrage.
             if (app.sperrMarke.length === 0) {
-                if (app.schluesselbundDa) {
-                    page.message = app.tr("unlockWorking")
-                    Schluesselbund.holen()
-                } else {
-                    // Schloss bestanden, aber nichts hinterlegt: sagen, statt
-                    // stumm stehenzubleiben.
-                    nachfrage.stop()
-                    page.busy = false
-                    page.message = app.tr("unlockFallback")
-                    feld.forceActiveFocus()
-                }
+                // Schloss bestanden, aber keine Marke mehr: sagen, statt stumm
+                // stehenzubleiben.
+                page.message = app.tr("unlockFallback")
+                feld.forceActiveFocus()
                 return
             }
+            page.busy = true
+            nachfrage.restart()
             Briar.unlock2(app.sperrMarke, function(answer) {
                 nachfrage.stop()
                 page.busy = false
@@ -231,10 +232,56 @@ Page {
             onClicked: page.versuchen()
         }
 
-        // Mit dem Telefon statt mit dem Passwort -- nur wenn diese App gerade
-        // selbst zugesperrt hat und das Telefon ein Schloss kennt.
+        // Was der Dienst gerade sagt, wenn es haengt -- damit ein Haenger
+        // sich selbst erklaert.
+        Label {
+            x: Theme.horizontalPageMargin
+            width: parent.width - 2 * Theme.horizontalPageMargin
+            visible: page.hinweis.length > 0
+            wrapMode: Text.Wrap
+            horizontalAlignment: Text.AlignHCenter
+            color: Theme.highlightColor
+            font.pixelSize: Theme.fontSizeExtraSmall
+            text: page.hinweis
+        }
+
+        // Der Schluesselbund: fuer diese Sitzung aussetzen, oder noch einmal
+        // fragen, wenn sein Dialog weggewischt wurde.
         Column {
-            visible: page.mitTelefonMoeglich
+            visible: app.schluesselbundDa
+            width: parent.width
+            spacing: Theme.paddingSmall
+
+            TextSwitch {
+                text: app.tr("keychainSkip")
+                description: app.tr("keychainSkipHint")
+                checked: app.schluesselbundPause
+                automaticCheck: false
+                enabled: !page.busy
+                onClicked: {
+                    app.schluesselbundPause = !app.schluesselbundPause
+                    if (app.schluesselbundPause) {
+                        page.message = app.tr("lockedHint")
+                        feld.forceActiveFocus()
+                    } else {
+                        page.schluesselbund()
+                    }
+                }
+            }
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: !app.schluesselbundPause
+                text: app.tr("keychainAsk")
+                enabled: !page.busy
+                onClicked: page.schluesselbund()
+            }
+        }
+
+        // Mit dem Geraeteschloss statt mit dem Passwort -- nur wenn diese App
+        // gerade selbst zugesperrt hat, das Telefon ein Schloss kennt und kein
+        // Schluesselbund im Spiel ist.
+        Column {
+            visible: page.mitSchlossMoeglich
             width: parent.width
             spacing: Theme.paddingSmall
 
@@ -242,24 +289,7 @@ Page {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.tr("unlockWithDevice")
                 enabled: !page.busy
-                onClicked: {
-                    // IMMER zuerst das Geraeteschloss -- Fingerabdruck oder
-                    // Sperrcode. Frueher sprang der Knopf ohne Marke am
-                    // Schloss vorbei direkt zum Schluesselbund; dann fragte
-                    // niemand nach dem Finger, und der Schluesselbund
-                    // schwieg. Was danach geschieht, entscheidet
-                    // onAuthenticated: Marke, sonst Schluesselbund.
-                    if (pruefer.availableMethods !== 0) {
-                        pruefer.authenticate("briar-unlock")
-                        return
-                    }
-                    // Kein Geraeteschloss eingerichtet: dann bleibt nur der
-                    // Schluesselbund selbst, mit seiner eigenen Rueckfrage.
-                    page.busy = true
-                    page.message = app.tr("unlockWorking")
-                    nachfrage.restart()
-                    Schluesselbund.holen()
-                }
+                onClicked: pruefer.authenticate("briar-unlock")
             }
             Label {
                 x: Theme.horizontalPageMargin
@@ -269,16 +299,6 @@ Page {
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
                 text: app.tr("unlockDeviceHint")
-            }
-            Label {
-                x: Theme.horizontalPageMargin
-                width: parent.width - 2 * Theme.horizontalPageMargin
-                visible: page.hinweis.length > 0
-                wrapMode: Text.Wrap
-                horizontalAlignment: Text.AlignHCenter
-                color: Theme.highlightColor
-                font.pixelSize: Theme.fontSizeExtraSmall
-                text: page.hinweis
             }
         }
 

@@ -22,6 +22,11 @@ ApplicationWindow {
     /// Liegt das Passwort im Geraeteschloss? Dann genuegt der Finger, auch nach
     /// einem Neustart des Dienstes.
     property bool schluesselbundDa: false
+    /// Der Schluesselbund ist fuer diese Sitzung ausgesetzt: die Entsperrseite
+    /// fragt dann nur nach dem Passwort. Gilt bis zum naechsten Start der
+    /// App -- ein Schalter auf der Entsperrseite, kein Eintrag in den
+    /// Einstellungen, damit sich nichts dauerhaft verstellt.
+    property bool schluesselbundPause: false
 
     // Every label goes through this, so one comma expression ties all of
     // them to languageRevision -- otherwise the texts would only change on
