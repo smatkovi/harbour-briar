@@ -288,6 +288,12 @@ pub fn confirmation(
 ///
 /// Wer zuerst spricht, haengt an der Rolle -- Alice schickt, Bob hoert zu.
 /// Genau so steht es in KeyAgreementProtocol.perform().
+///
+/// Scheitert die Sitzung bei uns, erfaehrt die Gegenseite es: ein ABORT geht
+/// hinaus, bevor der Fehler zurueckkehrt (Briars KeyAgreementProtocol
+/// .perform: jeder Fehlerfall endet in sendAbort). Ohne ihn wartete sie bis
+/// zur Zeitgrenze auf einen Satz, der nie kommt -- eine Minute bei Briar,
+/// und die Anzeige stand die ganze Zeit auf "verbinde".
 #[allow(clippy::too_many_arguments)]
 pub fn sitzung<S: std::io::Read + std::io::Write>(
     strom: &mut S,
@@ -298,9 +304,48 @@ pub fn sitzung<S: std::io::Read + std::io::Write>(
     their_commitment: &[u8],
     alice: bool,
 ) -> std::io::Result<SecretKey> {
+    match verhandeln(
+        strom,
+        our_private,
+        our_public,
+        our_payload,
+        their_payload,
+        their_commitment,
+        alice,
+    ) {
+        // Hat die Gegenseite abgebrochen, ist nichts mehr zu sagen.
+        Err(e) if e.kind() != std::io::ErrorKind::ConnectionAborted => {
+            abbruch_senden(strom);
+            Err(e)
+        }
+        ergebnis => ergebnis,
+    }
+}
+
+/// Der Gegenseite sagen, dass wir aufgeben. Bestes Bemuehen: scheitert das
+/// Schreiben, ist die Leitung ohnehin tot. Der Rumpf ist leer, wie bei Briar
+/// (KeyAgreementTransport.sendAbort).
+fn abbruch_senden<S: std::io::Write>(strom: &mut S) {
+    let _ = crate::record::write_record(
+        strom,
+        &crate::record::Record::new(PROTOCOL_VERSION, ABORT, Vec::new()),
+    );
+    let _ = strom.flush();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verhandeln<S: std::io::Read + std::io::Write>(
+    strom: &mut S,
+    our_private: &SecretKey,
+    our_public: &[u8; 32],
+    our_payload: &[u8],
+    their_payload: &[u8],
+    their_commitment: &[u8],
+    alice: bool,
+) -> std::io::Result<SecretKey> {
     let fehler = |text: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, text);
 
-    let mut schluessel_senden = |strom: &mut S| -> std::io::Result<()> {
+    let schluessel_senden = |strom: &mut S| -> std::io::Result<()> {
         crate::record::write_record(
             strom,
             &crate::record::Record::new(PROTOCOL_VERSION, KEY, our_public.to_vec()),
@@ -379,7 +424,10 @@ pub fn sitzung<S: std::io::Read + std::io::Write>(
 
 /// Den naechsten Satz der erwarteten Art lesen. Saetze derselben Fassung mit
 /// unbekannter Art werden uebersprungen -- so haelt es Briars
-/// KeyAgreementTransport --, ein ABORT beendet den Versuch.
+/// KeyAgreementTransport --, ein ABORT beendet den Versuch, und ein bekannter
+/// Satz ausser der Reihe ebenso: ein CONFIRM vor dem KEY ist kein Versehen,
+/// sondern eine Gegenseite, die das Verfahren nicht einhaelt (Briar wirft
+/// dort AbortException und bricht ab, statt weiterzulesen).
 fn lies<S: std::io::Read>(strom: &mut S, art: u8) -> std::io::Result<Vec<u8>> {
     loop {
         let satz = crate::record::read_record(strom)?.ok_or_else(|| {
@@ -399,6 +447,12 @@ fn lies<S: std::io::Read>(strom: &mut S, art: u8) -> std::io::Result<Vec<u8>> {
         }
         if satz.record_type == art {
             return Ok(satz.payload);
+        }
+        if satz.record_type == KEY || satz.record_type == CONFIRM {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ein Satz ausser der Reihe",
+            ));
         }
         // Unbekannte Art: ueberspringen, nicht abbrechen.
     }
@@ -547,6 +601,112 @@ mod tests {
         strom.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
         let mut rest = [0u8; 1];
         assert!(strom.read(&mut rest).is_err() || true);
+    }
+
+    /// Scheitert Bob am Schluessel, erfaehrt Alice es sofort: ein ABORT statt
+    /// einer Minute Warten auf einen Satz, der nie kommt.
+    #[test]
+    fn wer_scheitert_sagt_es_der_gegenseite() {
+        let lauscher = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let adresse = lauscher.local_addr().unwrap();
+        let a_priv = crate::crypto::generate_agreement_private_key();
+        let b_priv = crate::crypto::generate_agreement_private_key();
+        let a_pub = crate::crypto::agreement_public_key(&a_priv);
+        let b_pub = crate::crypto::agreement_public_key(&b_priv);
+        let a_payload = encode(&Payload {
+            commitment: commitment(&a_pub),
+            descriptors: vec![],
+        });
+        let b_payload = encode(&Payload {
+            commitment: commitment(&b_pub),
+            descriptors: vec![],
+        });
+        let a_ist_alice = ist_alice(&commitment(&a_pub), &commitment(&b_pub));
+        // B kennt fuer A eine falsche Verpflichtung -- als haette jemand den
+        // Code vertauscht. Gleich, wer Alice ist: B liest A's Schluessel und
+        // scheitert daran, A wartet danach auf B's naechsten Satz.
+        let falsch = commitment(&crate::crypto::agreement_public_key(
+            &crate::crypto::generate_agreement_private_key(),
+        ));
+        let (bp, ap) = (b_payload.clone(), a_payload.clone());
+        let faden = std::thread::spawn(move || {
+            let (mut strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            sitzung(&mut strom, &b_priv, &b_pub, &bp, &ap, &falsch, !a_ist_alice)
+        });
+        let mut strom = std::net::TcpStream::connect(adresse).unwrap();
+        strom
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let bei_a = sitzung(
+            &mut strom,
+            &a_priv,
+            &a_pub,
+            &a_payload,
+            &b_payload,
+            &commitment(&b_pub),
+            a_ist_alice,
+        );
+        let bei_b = faden.join().unwrap();
+        assert!(bei_b.is_err(), "B darf den Schluessel nicht annehmen");
+        let e = bei_a.expect_err("A darf nicht weiterkommen");
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionAborted,
+            "A muss das ABORT gelesen haben, nicht in die Zeitgrenze laufen: {}",
+            e
+        );
+    }
+
+    /// Ein bekannter Satz ausser der Reihe -- ein CONFIRM vor dem KEY -- ist
+    /// kein Versehen, sondern eine Gegenseite, die das Verfahren nicht
+    /// einhaelt: abbrechen und es ihr sagen, statt weiterzulesen.
+    #[test]
+    fn satz_ausser_der_reihe_bricht_ab() {
+        use std::io::Write;
+        let lauscher = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let adresse = lauscher.local_addr().unwrap();
+        let faden = std::thread::spawn(move || {
+            let (mut strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            crate::record::write_record(
+                &mut strom,
+                &crate::record::Record::new(PROTOCOL_VERSION, CONFIRM, vec![0; 32]),
+            )
+            .unwrap();
+            strom.flush().unwrap();
+            crate::record::read_record(&mut strom)
+                .unwrap()
+                .expect("ein Satz")
+                .record_type
+        });
+        let privat = crate::crypto::generate_agreement_private_key();
+        let oeffentlich = crate::crypto::agreement_public_key(&privat);
+        let payload = encode(&Payload {
+            commitment: commitment(&oeffentlich),
+            descriptors: vec![],
+        });
+        let mut strom = std::net::TcpStream::connect(adresse).unwrap();
+        strom
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // Wir sind Bob und warten auf den KEY.
+        let e = sitzung(
+            &mut strom,
+            &privat,
+            &oeffentlich,
+            &payload,
+            &payload,
+            &commitment(&oeffentlich),
+            false,
+        )
+        .expect_err("ein CONFIRM vor dem KEY darf nicht durchgehen");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(faden.join().unwrap(), ABORT, "die Gegenseite bekommt ein ABORT");
     }
 
     #[test]
