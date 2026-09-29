@@ -9,34 +9,44 @@
 //! angefasst -- und die wird beendet, nicht weiterbetrieben.
 
 use briarkern::tor::{self, Vorgefunden};
+use briarkern::util::{from_hex, to_hex};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+const SERVER_SCHLUESSEL: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
+const CLIENT_SCHLUESSEL: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
+
 /// Ein Tor-Steuerport aus Pappe: merkt sich jeden Befehl und antwortet
 /// 250 OK -- ausser auf GETINFO config-file und process/pid, da nennt er,
-/// was ihm gesagt wurde, oder 552, wenn nichts. Mit `cookie` verlangt er
-/// genau dieses Cookie (wie ein Tor mit CookieAuthentication 1) und schliesst
-/// nach einem Fehlversuch die Verbindung, wie Tor es tut; ohne nimmt er das
-/// leere Passwort (wie ein Tor bis 0.38.0). Schliesst die Gegenseite, steht
-/// "<zu>" in der Liste.
+/// was ihm gesagt wurde, oder 552, wenn nichts. Mit `cookie` spricht er
+/// SAFECOOKIE wie ein Tor mit CookieAuthentication 1 (weist sich mit dem
+/// Server-HMAC aus, prueft den Client-HMAC) und schliesst nach einem
+/// Fehlversuch die Verbindung, wie Tor es tut; ohne nimmt er das leere
+/// Passwort (wie ein Tor bis 0.38.0). Ein `faelscher` sagt zu allem 250 --
+/// auch auf AUTHCHALLENGE, mit einem erfundenen Hash. Schliesst die
+/// Gegenseite, steht "<zu>" in der Liste.
 struct Attrappe {
     port: u16,
     befehle: Arc<Mutex<Vec<String>>>,
 }
 
 fn attrappe(config_file: Option<&str>, pid: Option<u32>) -> Attrappe {
-    attrappe_mit(config_file, pid, None)
+    attrappe_mit(config_file, pid, None, false)
 }
 
-fn attrappe_mit(config_file: Option<&str>, pid: Option<u32>, cookie: Option<Vec<u8>>) -> Attrappe {
+fn attrappe_mit(
+    config_file: Option<&str>,
+    pid: Option<u32>,
+    cookie: Option<Vec<u8>>,
+    faelscher: bool,
+) -> Attrappe {
     let lauscher = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = lauscher.local_addr().unwrap().port();
     let befehle = Arc::new(Mutex::new(Vec::new()));
     let merker = Arc::clone(&befehle);
     let config = config_file.map(|s| s.to_string());
-    let erwartet = cookie.map(|c| format!("AUTHENTICATE {}", briarkern::util::to_hex(&c)));
     std::thread::spawn(move || {
         for socket in lauscher.incoming() {
             let socket = match socket {
@@ -45,19 +55,62 @@ fn attrappe_mit(config_file: Option<&str>, pid: Option<u32>, cookie: Option<Vec<
             };
             let merker = Arc::clone(&merker);
             let config = config.clone();
-            let erwartet = erwartet.clone();
+            let cookie = cookie.clone();
             std::thread::spawn(move || {
                 let mut leser = BufReader::new(socket.try_clone().unwrap());
                 let mut schreiber = socket;
                 let mut zeile = String::new();
+                // Was ein echter Client nach der Herausforderung schicken muss.
+                let mut erwartete_antwort: Option<String> = None;
                 while leser.read_line(&mut zeile).map(|n| n > 0).unwrap_or(false) {
                     let befehl = zeile.trim_end().to_string();
                     merker.lock().unwrap().push(befehl.clone());
-                    if befehl.starts_with("AUTHENTICATE") {
-                        let richtig = match &erwartet {
-                            Some(e) => &befehl == e,
-                            None => befehl == "AUTHENTICATE \"\"",
+                    if let Some(rest) = befehl.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
+                        if faelscher {
+                            let _ = schreiber.write_all(
+                                b"250 AUTHCHALLENGE SERVERHASH=00 SERVERNONCE=00\r\n",
+                            );
+                            zeile.clear();
+                            continue;
+                        }
+                        let cookie = match &cookie {
+                            Some(c) => c.clone(),
+                            None => {
+                                let _ = schreiber.write_all(
+                                    b"513 SAFECOOKIE authentication is not enabled\r\n",
+                                );
+                                zeile.clear();
+                                continue;
+                            }
                         };
+                        let client_nonce = from_hex(rest).unwrap_or_default();
+                        let server_nonce: Vec<u8> = (0u8..32).map(|i| 200u8.wrapping_add(i)).collect();
+                        let mut m = cookie.clone();
+                        m.extend_from_slice(&client_nonce);
+                        m.extend_from_slice(&server_nonce);
+                        let server_hash = tor::hmac_sha256(SERVER_SCHLUESSEL, &m);
+                        erwartete_antwort = Some(format!(
+                            "AUTHENTICATE {}",
+                            to_hex(&tor::hmac_sha256(CLIENT_SCHLUESSEL, &m))
+                        ));
+                        let _ = schreiber.write_all(
+                            format!(
+                                "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                                to_hex(&server_hash),
+                                to_hex(&server_nonce)
+                            )
+                            .as_bytes(),
+                        );
+                        zeile.clear();
+                        continue;
+                    }
+                    if befehl.starts_with("AUTHENTICATE") {
+                        let richtig = faelscher
+                            || match (&cookie, &erwartete_antwort) {
+                                (Some(_), Some(e)) => &befehl == e,
+                                (Some(_), None) => false,
+                                (None, _) => befehl == "AUTHENTICATE \"\"",
+                            };
                         if richtig {
                             let _ = schreiber.write_all(b"250 OK\r\n");
                             zeile.clear();
@@ -262,18 +315,21 @@ fn symlink_im_pfad_hindert_die_erkennung_nicht() {
 
 
 #[test]
-fn mit_cookie_angemeldet_ist_vertraut() {
+fn mit_cookie_angemeldet_ist_vertraut_und_das_cookie_bleibt_zu_hause() {
     let (d, cookie) = tor_verzeichnis_mit_cookie("cookie");
-    let a = attrappe_mit(None, None, Some(cookie.clone()));
+    let a = attrappe_mit(None, None, Some(cookie.clone()), false);
     let tor = tor::connect_to(a.port, 0, Some(&d)).expect("Cookie passt");
     assert!(tor.vertraut);
     let gesehen = a.gesehen();
-    assert_eq!(
-        gesehen.first().map(|s| s.as_str()),
-        Some(format!("AUTHENTICATE {}", briarkern::util::to_hex(&cookie)).as_str()),
+    assert!(
+        gesehen.first().map(|s| s.starts_with("AUTHCHALLENGE SAFECOOKIE ")).unwrap_or(false),
         "{:?}",
         gesehen
     );
+    assert!(gesehen.iter().any(|b| b.starts_with("AUTHENTICATE ") && b.len() > 20));
+    // Das Cookie selbst geht nie ueber die Leitung, nur ein HMAC darueber.
+    let hex = to_hex(&cookie);
+    assert!(!gesehen.iter().any(|b| b.contains(&hex)), "{:?}", gesehen);
     // Das leere Passwort wurde gar nicht erst probiert.
     assert!(!gesehen.iter().any(|b| b == "AUTHENTICATE \"\""), "{:?}", gesehen);
     let _ = std::fs::remove_dir_all(&d);
@@ -281,15 +337,47 @@ fn mit_cookie_angemeldet_ist_vertraut() {
 
 #[test]
 fn ohne_passendes_cookie_kommt_keine_verbindung_zustande() {
-    // Tor verlangt ein Cookie, wir haben ein anderes (oder gar keins): nach
-    // dem Fehlversuch schliesst Tor, das leere Passwort scheitert auch --
+    // Tor verlangt ein Cookie, wir haben ein anderes: sein Server-HMAC passt
+    // nicht zu unserem, wir brechen ab; das leere Passwort scheitert auch --
     // Ergebnis ist ein Fehler, kein untergeschobenes Tor.
     let (d, _) = tor_verzeichnis_mit_cookie("falsch");
     let fremd: Vec<u8> = vec![0xaa; 32];
-    let a = attrappe_mit(None, None, Some(fremd));
+    let a = attrappe_mit(None, None, Some(fremd), false);
     assert!(tor::connect_to(a.port, 0, Some(&d)).is_err());
     let gesehen = a.gesehen_bis_zu();
-    assert!(gesehen.iter().any(|b| b.starts_with("AUTHENTICATE ")), "{:?}", gesehen);
+    assert!(gesehen.iter().any(|b| b.starts_with("AUTHCHALLENGE")), "{:?}", gesehen);
+    // Nach der falschen Herausforderung haben wir keinen Client-HMAC gesandt.
+    assert!(
+        !gesehen.iter().any(|b| b.starts_with("AUTHENTICATE ") && b.len() > 20),
+        "{:?}",
+        gesehen
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn ein_faelscher_der_zu_allem_ja_sagt_ist_nicht_vertraut() {
+    // Gegenpruefung 0.39.0, B1: wer unseren Port belegt und auf alles 250
+    // antwortet, galt mit COOKIE als unser Tor und bekam Cookie und
+    // Onion-Schluessel. Mit SAFECOOKIE muss er das Cookie kennen -- kann er
+    // nicht, bleibt er ein Fremder, und ueber die Leitung ging nichts, was
+    // ihm nuetzt.
+    let (d, cookie) = tor_verzeichnis_mit_cookie("faelscher");
+    let a = attrappe_mit(None, None, None, true);
+    let tor = tor::connect_to(a.port, 0, Some(&d)).expect("der Faelscher nimmt auch das leere Passwort");
+    assert!(!tor.vertraut, "ein Faelscher darf nie vertraut sein");
+    let gesehen = a.gesehen();
+    let hex = to_hex(&cookie);
+    assert!(!gesehen.iter().any(|b| b.contains(&hex)), "Cookie verraten: {:?}", gesehen);
+    assert!(
+        !gesehen.iter().any(|b| b.starts_with("AUTHENTICATE ") && b != "AUTHENTICATE \"\""),
+        "HMAC an einen Faelscher gesandt: {:?}",
+        gesehen
+    );
+    // Und ein unvertrautes Tor bekommt keinen Dienst: connect() liefert es
+    // nicht -- das prueft der Aufrufer ueber `vertraut`; hier genuegt, dass
+    // die Kennung stimmt.
+    assert!(!tor.vertraut);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -299,6 +387,8 @@ fn ein_halb_geschriebenes_cookie_zaehlt_nicht() {
     // liest, sieht eine kurze Datei. Die darf nicht als Cookie gelten.
     let d = tor_verzeichnis("kurz");
     std::fs::write(tor::cookie_pfad(&d), [1u8; 10]).unwrap();
+    // Eine kurze Datei kann nur etwas Fremdes sein (Tor schreibt atomar 32
+    // Byte); sie zaehlt nicht als Cookie.
     let a = attrappe(None, None);
     let tor = tor::connect_to(a.port, 0, Some(&d)).unwrap();
     assert!(!tor.vertraut);

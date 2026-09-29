@@ -18,10 +18,11 @@ use std::time::Duration;
 
 pub const VIRTUAL_PORT: u16 = 80;
 const TIMEOUT: Duration = Duration::from_secs(20);
-/// A system Tor uses the usual 9051/9050. It is only ever used with its
-/// cookie -- which a plain user cannot read on either device, so in practice
-/// the bundled Tor below is the one that runs.
-const SYSTEM: (u16, u16) = (9051, 9050);
+/// Kein System-Tor mehr: bis 0.38.0 wurde ein Tor auf 9051 zuerst probiert.
+/// Auf keinem der Geraete gibt es eines, und wer den Port (frei fuer jeden
+/// Benutzer) belegt und "250" sagt, bekaeme sonst unsere Anmeldung und den
+/// Onion-Schluessel gereicht (Gegenpruefung 0.39.0, B1). Briar startet
+/// ebenfalls immer sein eigenes Tor und spricht nie einen fremden Port an.
 /// Der Steuerport unseres eigenen Tor; SOCKS liegt eins darunter. Nur fuer
 /// zwei Dienste auf einer Maschine (tools/tor-e2e.sh) umzustellen -- mit
 /// Cookie-Anmeldung kann der zweite das Tor des ersten nicht mitbenutzen,
@@ -80,17 +81,31 @@ pub struct Tor {
     /// Our own Tor, if we started it -- it is stopped again with us, so
     /// switching the transport off gives the memory back.
     child: Option<std::process::Child>,
-    /// Mit Cookie angemeldet. Ohne Cookie (altes Tor bis 0.38.0 mit
-    /// CookieAuthentication 0) darf diese Verbindung nur eines: das Tor
-    /// einordnen und, wenn es eine Waise ist, beenden. Nie einen Dienst
-    /// darauf anmelden -- wer auf unserem Port ohne Geheimnis antwortet,
-    /// bekaeme sonst unseren Onion-Schluessel.
+    /// Beidseitig ausgewiesen (SAFECOOKIE: Tor hat bewiesen, dass es unser
+    /// Cookie kennt, und wir ihm). Ohne das (altes Tor bis 0.38.0 mit
+    /// CookieAuthentication 0, oder etwas Fremdes auf unserem Port) darf
+    /// diese Verbindung nur eines: das Tor einordnen und, wenn es eine Waise
+    /// ist, beenden. Nie einen Dienst darauf anmelden -- wer auf unserem
+    /// Port antwortet, ohne das Cookie zu kennen, bekaeme sonst unseren
+    /// Onion-Schluessel.
     pub vertraut: bool,
 }
 
 impl Drop for Tor {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
+            // Erst die Steuerverbindung schliessen: Tor gehoert ihr
+            // (TAKEOWNERSHIP), endet von selbst und raeumt dabei sein Cookie
+            // weg. Nach SIGKILL bliebe das Cookie liegen, und beim naechsten
+            // Einschalten laege es fuer jeden bereit, der unseren Port
+            // belegt. SIGKILL nur, wenn Tor nicht binnen fuenf Sekunden geht.
+            let _ = self.control.shutdown(std::net::Shutdown::Both);
+            for _ in 0..50 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -107,14 +122,11 @@ impl Drop for Tor {
 /// Liefert nur ein Tor, dem zu trauen ist (Cookie-Anmeldung); `tor_dir` ist
 /// das Verzeichnis unseres eigenen Tor, wo sein Cookie liegt.
 pub fn connect(tor_dir: Option<&Path>) -> Option<Tor> {
-    for (control_port, socks_port) in [SYSTEM, eigener()] {
-        if let Ok(tor) = connect_to(control_port, socks_port, tor_dir) {
-            if tor.vertraut {
-                return Some(tor);
-            }
-        }
+    let (control_port, socks_port) = eigener();
+    match connect_to(control_port, socks_port, tor_dir) {
+        Ok(tor) if tor.vertraut => Some(tor),
+        _ => None,
     }
-    None
 }
 
 /// Verbindet sich mit dem Tor auf dem genannten Steuerport. Getrennt von
@@ -153,7 +165,8 @@ pub fn connect_to(
 ///   die Datei im statischen Bau ohnehin; die Zeilen halten das so, auch
 ///   wenn einmal ein System-Tor mit geoip herhalten sollte.
 /// - ConnectionPadding 0: keine Fuellzellen. Spart keinen Speicher, aber
-///   Funk und Akku, auf 2G Datenvolumen; Briar setzt es ebenso.
+///   Funk und Akku, auf 2G Datenvolumen. Briar schreibt dieselbe Zeile,
+///   schaltet das Padding aber im WLAN am Ladegeraet wieder ein; wir nie.
 /// - MaxMemInQueues 64 MB: Notbremse gegen Lastspitzen, im Leerlauf ohne
 ///   Wirkung. 64 MB ist der kleinste Wert, den Tor ohne Warnung nimmt
 ///   (MIN_UNWARNED_CLIENT_MB), statt der Vorgabe von 768 MB am N9.
@@ -330,13 +343,6 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
     let (control_port, socks_port) = eigener();
     let torrc = tor_dir.join("torrc");
     let _ = std::fs::write(&torrc, torrc_text(socks_port, control_port, &tor_dir));
-    // Ein System-Tor: nur mit seinem Cookie, und das kann ein gewoehnlicher
-    // Benutzer auf keinem der Geraete lesen. Bleibt also in aller Regel aus.
-    if let Ok(tor) = connect_to(SYSTEM.0, SYSTEM.1, Some(&tor_dir)) {
-        if tor.vertraut {
-            return Some(tor);
-        }
-    }
     if let Ok(mut tor) = connect_to(control_port, socks_port, Some(&tor_dir)) {
         match einordnen(&mut tor, &tor_dir) {
             Vorgefunden::Waise => {
@@ -443,20 +449,25 @@ pub fn connect_or_start(data_dir: &Path) -> Option<Tor> {
     None
 }
 
-/// Oeffnet den Steuerport und meldet sich an. Erst mit jedem Cookie, das
-/// zu lesen ist (unseres zuerst, dann die des Systems), zuletzt ohne -- und
-/// das Ergebnis sagt, welcher Weg es war. Tor schliesst die Verbindung nach
-/// einem Fehlversuch, darum je Versuch eine neue.
+/// Oeffnet den Steuerport und meldet sich an -- erst per SAFECOOKIE mit
+/// unserem Cookie, dann, auf einer neuen Verbindung (Tor schliesst nach
+/// einem Fehlversuch), ohne. Das Ergebnis sagt, welcher Weg es war.
+///
+/// SAFECOOKIE statt COOKIE, weil COOKIE nur uns ausweist: wir schickten das
+/// Cookie, und jeder, der "250" sagt, galt als Tor. Bei SAFECOOKIE beweist
+/// Tor zuerst mit einem HMAC ueber Cookie und beide Zufallswerte, dass es
+/// das Cookie kennt; erst dann beweisen wir dasselbe. Das Cookie selbst
+/// geht nie ueber die Leitung. Wer unseren Port belegt, ohne die Datei
+/// lesen zu koennen, bleibt damit ein Fremder (Gegenpruefung 0.39.0, B1).
 ///
 /// Der Weg ohne Cookie bleibt nur, um ein altes Tor (CookieAuthentication 0,
 /// Fassungen bis 0.38.0) einordnen und als Waise beenden zu koennen. Er
 /// verraet kein Geheimnis, und eine so gewonnene Verbindung wird nie fuer
 /// einen Dienst benutzt (`Tor::vertraut` ist dann false).
 fn open_control(port: u16, tor_dir: Option<&Path>) -> std::io::Result<(TcpStream, bool)> {
-    for cookie in cookies(tor_dir) {
+    if let Some(cookie) = tor_dir.and_then(cookie_lesen) {
         let mut tor = verbinden(port)?;
-        let (code, _) = command(&mut tor, &format!("AUTHENTICATE {}\r\n", cookie))?;
-        if code == 250 {
+        if safecookie(&mut tor, &cookie)? {
             return Ok((tor, true));
         }
     }
@@ -479,27 +490,94 @@ fn verbinden(port: u16) -> std::io::Result<TcpStream> {
     Ok(socket)
 }
 
-/// Alle Cookies, die zu lesen sind, als Hex: das unseres eigenen Tor
-/// zuerst, dann die ueblichen Ablagen eines System-Tor. Ein Cookie hat 32
-/// Byte; was kuerzer ist, ist eine halb geschriebene Datei.
-fn cookies(tor_dir: Option<&Path>) -> Vec<String> {
-    let mut pfade: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = tor_dir {
-        pfade.push(cookie_pfad(dir));
+/// Das Cookie unseres eigenen Tor: genau 32 Byte, atomar geschrieben. Eine
+/// andere Laenge ist keine halbe Datei (das kann Tor nicht), sondern etwas
+/// Fremdes -- und zaehlt nicht.
+fn cookie_lesen(tor_dir: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(cookie_pfad(tor_dir)).ok()?;
+    if bytes.len() == 32 {
+        Some(bytes)
+    } else {
+        None
     }
-    for p in [
-        "/var/lib/tor/control_auth_cookie",
-        "/run/tor/control.authcookie",
-        "/var/run/tor/control.authcookie",
-    ] {
-        pfade.push(std::path::PathBuf::from(p));
+}
+
+const SAFECOOKIE_SERVER: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
+const SAFECOOKIE_CLIENT: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
+
+/// Tors SAFECOOKIE-Verfahren (control-spec 3.24): AUTHCHALLENGE mit unserem
+/// Zufall, Tor antwortet mit seinem Zufall und
+/// HMAC-SHA256(Serverschluessel, Cookie | unser Zufall | sein Zufall); stimmt
+/// der, schicken wir HMAC-SHA256(Clientschluessel, dasselbe). Gibt Ok(false)
+/// zurueck, wenn Tor sich nicht ausweisen kann oder uns nicht nimmt -- die
+/// Verbindung ist dann verbraucht.
+fn safecookie(tor: &mut TcpStream, cookie: &[u8]) -> std::io::Result<bool> {
+    let unser_zufall = crate::util::random(32);
+    let (code, lines) = command(
+        tor,
+        &format!("AUTHCHALLENGE SAFECOOKIE {}\r\n", crate::util::to_hex(&unser_zufall)),
+    )?;
+    if code != 250 {
+        return Ok(false);
     }
-    pfade
-        .iter()
-        .filter_map(|p| std::fs::read(p).ok())
-        .filter(|bytes| bytes.len() >= 32)
-        .map(|bytes| crate::util::to_hex(&bytes))
-        .collect()
+    let mut server_hash = None;
+    let mut server_zufall = None;
+    for zeile in &lines {
+        for teil in zeile.split_whitespace() {
+            if let Some(h) = teil.strip_prefix("SERVERHASH=") {
+                server_hash = crate::util::from_hex(h);
+            } else if let Some(n) = teil.strip_prefix("SERVERNONCE=") {
+                server_zufall = crate::util::from_hex(n);
+            }
+        }
+    }
+    let (server_hash, server_zufall) = match (server_hash, server_zufall) {
+        (Some(h), Some(n)) => (h, n),
+        _ => return Ok(false),
+    };
+    let mut nachricht = Vec::with_capacity(cookie.len() + 64);
+    nachricht.extend_from_slice(cookie);
+    nachricht.extend_from_slice(&unser_zufall);
+    nachricht.extend_from_slice(&server_zufall);
+    let erwartet = hmac_sha256(SAFECOOKIE_SERVER, &nachricht);
+    if !gleich_in_konstanter_zeit(&erwartet, &server_hash) {
+        return Ok(false);
+    }
+    let antwort = hmac_sha256(SAFECOOKIE_CLIENT, &nachricht);
+    let (code, _) = command(
+        tor,
+        &format!("AUTHENTICATE {}\r\n", crate::util::to_hex(&antwort)),
+    )?;
+    Ok(code == 250)
+}
+
+fn gleich_in_konstanter_zeit(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// HMAC-SHA256 nach RFC 2104, von Hand: die zwei Zeilen sind billiger als
+/// eine weitere Kiste, und sha2 liegt ohnehin im Baum. Gegen RFC 4231
+/// geprueft (Test unten).
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = block.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = block.iter().map(|b| b ^ 0x5c).collect();
+    let inner = Sha256::new().chain_update(&ipad).chain_update(message).finalize();
+    let outer = Sha256::new().chain_update(&opad).chain_update(inner).finalize();
+    outer.into()
 }
 
 /// Sends one command and reads the reply, following Tor's multi-line form.
@@ -727,4 +805,34 @@ pub fn connect_through_socks(socks_port: u16, onion: &str) -> std::io::Result<Tc
 
 fn bad(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, message.to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 4231, Testfall 2.
+    #[test]
+    fn hmac_sha256_trifft_rfc_4231() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            crate::util::to_hex(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    /// RFC 4231, Testfall 6: Schluessel laenger als ein Block.
+    #[test]
+    fn hmac_sha256_mit_langem_schluessel() {
+        let key = [0xaau8; 131];
+        let mac = hmac_sha256(
+            &key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            crate::util::to_hex(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
 }

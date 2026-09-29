@@ -1728,10 +1728,17 @@ fn status(store: &Shared) -> Value {
         // und Tor zieht beim Start rund 23 MB ueber die Leitung (gemessen
         // 29.09.2026) -- auf 2G eine Viertelstunde bis eine Stunde. Danach
         // sind es Kilobyte. Die Oberflaeche sagt das neben dem Schalter.
+        // Auch das Journal zaehlt: nach einem kurzen ersten Lauf liegt alles
+        // in cached-microdescs.new, die eigentliche Datei kommt erst nach
+        // zwei Minuten -- geladen wird dann trotzdem nichts mehr.
         "torFirstRun": locked
             .path
             .parent()
-            .map(|p| !p.join("tor").join("cached-microdescs").exists())
+            .map(|p| {
+                let tor = p.join("tor");
+                !tor.join("cached-microdescs").exists()
+                    && !tor.join("cached-microdescs.new").exists()
+            })
             .unwrap_or(true),
         "revision": locked.state.revision,
         // Steht die Uhr dieses Geraets erkennbar falsch? Dann kommt nichts an,
