@@ -206,7 +206,8 @@ fn post(sockel: &std::path::Path, path: &str, body: &str) {
         body.len(),
         body
     );
-    // Ueber den Sockel, den es immer gibt -- den TCP-Port nur mit --api-port.
+    // Ueber den Sockel, den es immer gibt -- den TCP-Port nur mit --api-port
+    // und BRIAR_API_TCP=1 (api::tcp_erlaubt).
     if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(sockel) {
         let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(30)));
         let _ = socket.set_write_timeout(Some(std::time::Duration::from_secs(30)));

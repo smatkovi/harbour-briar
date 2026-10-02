@@ -158,6 +158,37 @@ pub(crate) fn anforderungen_fortschreiben(
     runden.retain(|id, _| bleibt.contains(id));
 }
 
+/// Zurueckgestellte Gruppenbeitraege (Gruppeneingang::Zurueckgestellt) fuer
+/// die naechste Runde vormerken: fehlende Kennungen mit Zaehler 0, vorhandene
+/// bleiben, wie sie sind -- sonst zaehlte eine immer wieder zurueckgestellte
+/// Kennung nie hoch und ginge ohne Ende als REQUEST hinaus.
+///
+/// Ohne das kaeme so ein Beitrag erst nach Briars Rueckzug wieder: unquittiert
+/// bietet Briar ihn erneut an, aber erst nach 2 * maxLatency * 2^txCount
+/// (ExponentialBackoff.java; maxLatency fuer Tor und LAN 30 s), nach k
+/// Zurueckstellungen also nach 60 s * 2^k. Ein eigener REQUEST setzt diesen
+/// Rueckzug zurueck (DatabaseComponentImpl.receiveRequest: resetExpiryTime),
+/// und die Nachricht kommt in der naechsten Runde. Nachpruefung 8, N2.
+pub(crate) fn zurueckgestellte_vormerken<'a>(
+    to_request: &mut Vec<String>,
+    runden: &mut BTreeMap<String, u8>,
+    ids: impl IntoIterator<Item = &'a SecretKey>,
+) {
+    for id in ids {
+        let hex = to_hex(id);
+        if !to_request.contains(&hex) {
+            runden.insert(hex.clone(), 0);
+            to_request.push(hex);
+        }
+    }
+    if to_request.len() > MAX_ANGEFORDERT {
+        let ueber = to_request.len() - MAX_ANGEFORDERT;
+        for weg in to_request.drain(..ueber) {
+            runden.remove(&weg);
+        }
+    }
+}
+
 /// Die Handschlaege, die gerade laufen, nach dem Schluessel des Wartenden.
 ///
 /// Zwei Handschlaege mit demselben Wartenden zugleich -- einer angewaehlt,
@@ -385,7 +416,10 @@ pub(crate) enum Gruppeneingang {
     Verworfen,
     /// Die Warteliste hat fuer ihn keinen Platz. NICHT quittiert: Briar
     /// schickt ihn dann spaeter wieder (getUnackedMessagesToSend, solange
-    /// seen = FALSE), und bis dahin ist vielleicht Platz.
+    /// seen = FALSE), und bis dahin ist vielleicht Platz. Von sich aus aber
+    /// erst nach seinem exponentiellen Rueckzug (ExponentialBackoff.java,
+    /// 60 s * 2^k nach k Zurueckstellungen) -- darum fordern wir ihn selbst
+    /// wieder an, was den Rueckzug zuruecksetzt (zurueckgestellte_vormerken).
     Zurueckgestellt,
 }
 
@@ -2959,23 +2993,6 @@ impl Node {
         {
             let mut store = self.store.lock().unwrap();
             if let Some(contact) = store.contact_mut(contact_id) {
-                // Die Anforderungsliste fuer die naechste Runde: was nicht kam,
-                // bleibt; was neu angeboten wurde und fehlt, kommt dazu
-                // (anforderungen_fortschreiben sagt, warum nicht geleert wird).
-                let bekannt: std::collections::BTreeSet<String> = contact
-                    .messages
-                    .iter()
-                    .map(|m| m.id.clone())
-                    .collect();
-                let erhalten: std::collections::BTreeSet<String> =
-                    received.iter().map(|(id, ..)| to_hex(id)).collect();
-                anforderungen_fortschreiben(
-                    &mut contact.to_request,
-                    &mut contact.anforderungs_runden,
-                    &offered_ids,
-                    &erhalten,
-                    &bekannt,
-                );
                 let peer_acked: std::collections::BTreeSet<String> =
                     acked_ids.iter().map(|id| to_hex(id)).collect();
                 quittungen_verbuchen(contact, &peer_acked);
@@ -3068,6 +3085,39 @@ impl Node {
                         contact.to_ack.push(hex);
                     }
                 }
+            }
+            // Die Anforderungsliste fuer die naechste Runde: was nicht kam,
+            // bleibt; was neu angeboten wurde und fehlt, kommt dazu
+            // (anforderungen_fortschreiben sagt, warum nicht geleert wird).
+            // Erst nach dem Einsortieren -- vorher weiss niemand, was
+            // zurueckgestellt wird. Das gilt nicht als erhalten, sondern wird
+            // wieder angefordert (zurueckgestellte_vormerken); vorgemerkt VOR
+            // dem Fortschreiben, damit es mitzaehlt und nach
+            // MAX_ANFORDERUNGS_RUNDEN herausfaellt -- dann bleibt Briars
+            // eigener Rueckzug.
+            if let Some(contact) = store.contact_mut(contact_id) {
+                let bekannt: std::collections::BTreeSet<String> = contact
+                    .messages
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect();
+                let erhalten: std::collections::BTreeSet<String> = received
+                    .iter()
+                    .filter(|(id, ..)| !zurueckgestellt.contains(id))
+                    .map(|(id, ..)| to_hex(id))
+                    .collect();
+                zurueckgestellte_vormerken(
+                    &mut contact.to_request,
+                    &mut contact.anforderungs_runden,
+                    &zurueckgestellt,
+                );
+                anforderungen_fortschreiben(
+                    &mut contact.to_request,
+                    &mut contact.anforderungs_runden,
+                    &offered_ids,
+                    &erhalten,
+                    &bekannt,
+                );
             }
             // Was gleich hier quittiert wird, braucht in der Liste fuer die
             // naechste Runde nicht zu stehen. Scheitert das Schreiben unten,
@@ -3173,7 +3223,8 @@ impl Node {
                     quittungen_verbuchen(contact, &peer_acked);
                 }
                 // Was spaet kam, wird in der naechsten Runde quittiert --
-                // ausser es ist zurueckgestellt.
+                // ausser es ist zurueckgestellt: das wird in der naechsten
+                // Runde wieder angefordert (zurueckgestellte_vormerken).
                 for (id, group, timestamp, body) in &spaete_nachrichten {
                     let eingang =
                         self.receive_message(&mut store, contact_id, id, group, *timestamp, body);
@@ -3181,6 +3232,13 @@ impl Node {
                         new_messages += 1;
                     }
                     if eingang == Eingang::Zurueckgestellt {
+                        if let Some(contact) = store.contact_mut(contact_id) {
+                            zurueckgestellte_vormerken(
+                                &mut contact.to_request,
+                                &mut contact.anforderungs_runden,
+                                [id],
+                            );
+                        }
                         continue;
                     }
                     if let Some(contact) = store.contact_mut(contact_id) {
@@ -4304,12 +4362,9 @@ impl Node {
         timestamp: u64,
         body: &[u8],
     ) -> Gruppeneingang {
-        if self.zu_weit_in_der_zukunft(contact_id, "ein Gruppenbeitrag", timestamp) {
-            return Gruppeneingang::Verworfen;
-        }
         let group_hex = to_hex(group);
         let message_id = to_hex(id);
-        let creator = {
+        {
             let g = match store.group(&group_hex) {
                 Some(g) => g,
                 None => return Gruppeneingang::Verworfen,
@@ -4322,6 +4377,25 @@ impl Node {
             if g.wartend.iter().any(|w| w.id == message_id) {
                 return Gruppeneingang::Wartend;
             }
+        }
+        // Zu weit in der Zukunft: bei Briar INVALID, und die Abhaengigen
+        // fallen mit (BdfMessageValidator.java Z. 59-63, dann
+        // ValidationManagerImpl.java Z. 243-247: invalidateNextMessageAsync).
+        // Frueher wurde der Beitrag nur verworfen und quittiert, aber nicht
+        // gemerkt -- wer auf ihm aufbaut, wartete fuer immer (Nachpruefung 8,
+        // N4). Die Kennung haengt am Zeitstempel; spaeter gueltig wird
+        // dieselbe Kennung nie.
+        if self.zu_weit_in_der_zukunft(contact_id, "ein Gruppenbeitrag", timestamp) {
+            if let Some(g) = store.group_mut(&group_hex) {
+                verwerfen_samt_wartenden(g, &message_id);
+            }
+            return Gruppeneingang::Verworfen;
+        }
+        let creator = {
+            let g = match store.group(&group_hex) {
+                Some(g) => g,
+                None => return Gruppeneingang::Verworfen,
+            };
             // Wer gegangen ist, kommt nicht durch einen Nachlaeufer zurueck.
             // Das muss VOR dem Speichern stehen: bisher landete der Beitrag
             // erst in der Gruppe und wurde weitergereicht, und erst danach
@@ -6122,6 +6196,31 @@ mod gruppenkette_tests {
         let (angenommen, id) = w.empfangen(1, 500, &rumpf);
         assert!(angenommen);
         assert!(w.gespeichert(&id));
+    }
+
+    /// Nachpruefung 8, N4: ein Beitrag mehr als einen Tag in der Zukunft ist
+    /// bei Briar INVALID (BdfMessageValidator Z. 59-63) -- er wird gemerkt,
+    /// und wer auf ihm aufbaut, faellt mit, statt fuer immer zu warten.
+    #[test]
+    fn zukunftsbeitrag_wird_gemerkt_und_nimmt_die_wartenden_mit() {
+        let mut w = welt("zukunft");
+        let join = w.mitglied_join(500);
+        let (_, join_id) = w.empfangen(1, 500, &join);
+        let spaeter = now_ms() + 2 * MAX_CLOCK_DIFFERENCE;
+        let zukunft = w.mitglied_post(spaeter, &join_id, "aus der Zukunft");
+        let zukunft_id = to_hex(&ids::message_id(&w.gruppe, spaeter, &zukunft));
+        // Der Nachfolger kommt zuerst und wartet auf ihn.
+        let folge = w.mitglied_post(700, &zukunft_id, "danach");
+        let (lage, folge_id) = w.eingang(1, 700, &folge);
+        assert_eq!(lage, Gruppeneingang::Wartend);
+        let (lage, id) = w.eingang(1, spaeter, &zukunft);
+        assert_eq!(lage, Gruppeneingang::Verworfen);
+        assert_eq!(id, zukunft_id);
+        assert!(!w.gespeichert(&zukunft_id));
+        assert!(w.g().verworfen.contains(&zukunft_id), "gemerkt");
+        assert!(w.g().verworfen.contains(&folge_id), "der Wartende faellt mit");
+        assert!(w.g().wartend.is_empty());
+        assert!(!w.im_korb(2, &zukunft_id), "nicht weitergereicht");
     }
 
     #[test]
@@ -8350,7 +8449,8 @@ mod angebots_tests {
 
     /// Ein Gruppenbeitrag, fuer den die Warteliste keinen Platz hat, wird
     /// zurueckgestellt: er geht NICHT in die Quittung dieser Runde und nicht
-    /// in die Liste fuer die naechste -- Briar schickt ihn dann spaeter wieder.
+    /// in die Quittungen fuer die naechste -- er wird stattdessen wieder
+    /// angefordert (zurueckgestellter_beitrag_wird_wieder_angefordert).
     /// Eine gewoehnliche Nachricht derselben Runde wird quittiert wie immer.
     #[test]
     fn zurueckgestellter_gruppenbeitrag_wird_nicht_quittiert() {
@@ -8439,6 +8539,137 @@ mod angebots_tests {
         let g = s.group(&to_hex(&gruppe)).unwrap();
         assert_eq!(g.wartend.len(), crate::store::MAX_WARTEND_JE_KONTAKT);
         assert!(!g.wartend.iter().any(|w| w.id == to_hex(&beitrag_id)));
+    }
+
+    /// Ein Knoten mit einer Gruppe, deren Warteliste fuer Kontakt 1 voll ist,
+    /// und ein gueltiger Beitrag darin, der also zurueckgestellt wird.
+    /// Liefert Gruppe, Zeit, Rumpf und Kennung des Beitrags.
+    fn volle_gruppe(node: &Node) -> (SecretKey, u64, Vec<u8>, SecretKey) {
+        let gruppe: SecretKey = [0x71; 32];
+        let ersteller_seed = [0x72u8; 32];
+        let mut s = node.store.lock().unwrap();
+        let mut g = crate::store::PrivateGroup {
+            id: to_hex(&gruppe),
+            name: "voll".to_string(),
+            creator_name: "Erstellerin".to_string(),
+            creator_public: to_hex(&crate::crypto::signature_public_key(&ersteller_seed)),
+            joined: true,
+            contacts: vec![1],
+            ..Default::default()
+        };
+        for n in 0..crate::store::MAX_WARTEND_JE_KONTAKT {
+            assert!(g.warten_lassen(crate::store::WartenderBeitrag {
+                id: format!("{:064x}", n),
+                contact_id: 1,
+                timestamp: 1,
+                previous: "fehlt".to_string(),
+                ..Default::default()
+            }));
+        }
+        s.state.groups.push(g);
+        let autor_seed = [0x73u8; 32];
+        let autor = Author {
+            name: "Wegwerf".to_string(),
+            public_key: crate::crypto::signature_public_key(&autor_seed).to_vec(),
+        };
+        let zeit = now_ms();
+        let beitrag = groups::post_body(&gruppe, zeit, &autor, &autor_seed, None, &[0x74; 32], "zuviel");
+        let id = ids::message_id(&gruppe, zeit, &beitrag);
+        (gruppe, zeit, beitrag, id)
+    }
+
+    /// Eine Runde, in der die Gegenseite den Beitrag schickt und gleich ihr
+    /// Ende; sie liest dann alles, was der Dienst schreibt. Liefert, ob der
+    /// Dienst die Kennung angefordert und ob er sie quittiert hat.
+    fn runde_mit_beitrag(
+        node: &Node,
+        period: u64,
+        gruppe: SecretKey,
+        zeit: u64,
+        beitrag: Vec<u8>,
+        id: SecretKey,
+        nummer: u64,
+    ) -> (bool, bool) {
+        let master = key_from_hex(IHR);
+        let lauscher = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = lauscher.local_addr().unwrap().port();
+        let gegenseite = std::thread::spawn(move || {
+            let (strom, _) = lauscher.accept().unwrap();
+            strom
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut roh = strom.try_clone().unwrap();
+            let mut marke = [0u8; TAG_LEN];
+            roh.read_exact(&mut marke).unwrap();
+            let ihre = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, false);
+            let unsere = derive_rotation_keys(LAN_TRANSPORT_ID, &master, period, period, true);
+            let mut schreiber = StreamWriter::new(strom.try_clone().unwrap(), &ihre, nummer);
+            sync::write_versions(&mut schreiber).unwrap();
+            sync::write_message(&mut schreiber, &gruppe, zeit, &beitrag).unwrap();
+            schreiber.send_end_of_stream().unwrap();
+            let mut leser = StreamReader::new(roh, unsere.header_key, nummer);
+            let (mut angefordert, mut quittiert) = (false, false);
+            loop {
+                match read_record(&mut leser) {
+                    Ok(Some(r)) if r.record_type == sync::REQUEST => {
+                        angefordert |= sync::parse_ids(&r.payload).contains(&id)
+                    }
+                    Ok(Some(r)) if r.record_type == sync::ACK => {
+                        quittiert |= sync::parse_ids(&r.payload).contains(&id)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => panic!("Lesen bei der Gegenseite: {}", e),
+                }
+            }
+            (angefordert, quittiert)
+        });
+        let strom = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        node.run_sync(Conn::Tcp(strom), LAN_TRANSPORT_ID, 1, None, None, true)
+            .expect("die Runde geht durch");
+        gegenseite.join().unwrap()
+    }
+
+    /// Nachpruefung 8, N2: ein zurueckgestellter Beitrag wird nicht
+    /// quittiert, aber fuer die naechste Runde angefordert -- mit Zaehler 1,
+    /// wie alles, was angefordert war und nicht ankam. Sonst kaeme er erst
+    /// nach Briars Rueckzug wieder.
+    #[test]
+    fn zurueckgestellter_beitrag_wird_wieder_angefordert() {
+        let period = current_time_period();
+        let node = knoten("zurueck-anfordern", period);
+        let (gruppe, zeit, beitrag, id) = volle_gruppe(&node);
+        let (angefordert, quittiert) = runde_mit_beitrag(&node, period, gruppe, zeit, beitrag, id, 0);
+        assert!(!angefordert, "in der ersten Runde war er noch nicht bekannt");
+        assert!(!quittiert, "zurueckgestellt heisst: nicht quittiert");
+        let s = node.store.lock().unwrap();
+        let c = s.contact(1).unwrap();
+        assert_eq!(c.to_request, vec![to_hex(&id)]);
+        assert_eq!(c.anforderungs_runden.get(&to_hex(&id)), Some(&1));
+        assert!(!c.to_ack.contains(&to_hex(&id)));
+    }
+
+    /// Nachpruefung 8, N2: immer wieder zurueckgestellt, wird er hoechstens
+    /// MAX_ANFORDERUNGS_RUNDEN Mal angefordert; danach faellt er heraus, und
+    /// es gilt Briars eigener Rueckzug.
+    #[test]
+    fn immer_wieder_zurueckgestelltes_faellt_nach_den_anforderungsrunden_heraus() {
+        let period = current_time_period();
+        let node = knoten("zurueck-heraus", period);
+        let (gruppe, zeit, beitrag, id) = volle_gruppe(&node);
+        // Die erste Runde bringt ihn ungefragt.
+        runde_mit_beitrag(&node, period, gruppe, zeit, beitrag.clone(), id, 0);
+        // Jede Runde ein neuer Strom, auf beiden Seiten die naechste Nummer.
+        for runde in 1..=MAX_ANFORDERUNGS_RUNDEN {
+            let (angefordert, quittiert) =
+                runde_mit_beitrag(&node, period, gruppe, zeit, beitrag.clone(), id, runde as u64);
+            assert!(angefordert, "Anforderung {} ging nicht hinaus", runde);
+            assert!(!quittiert);
+        }
+        let s = node.store.lock().unwrap();
+        let c = s.contact(1).unwrap();
+        assert!(c.to_request.is_empty(), "nach {} Anforderungen weg", MAX_ANFORDERUNGS_RUNDEN);
+        assert!(c.anforderungs_runden.is_empty());
     }
 
     /// Ein Angebot, auf das nichts folgt: die Kennung bleibt fuer die naechste
@@ -8534,6 +8765,25 @@ mod abgleich_tests {
         anforderungen_fortschreiben(&mut liste, &mut runden, &[k(5)], &BTreeSet::new(), &BTreeSet::new());
         assert_eq!(liste, vec![to_hex(&k(5))]);
         assert_eq!(runden.get(&to_hex(&k(5))), Some(&0));
+    }
+
+    /// Zurueckgestellte: neue mit Zaehler 0, vorhandene unveraendert, und die
+    /// Liste waechst auch so nicht ueber MAX_ANGEFORDERT.
+    #[test]
+    fn zurueckgestellte_werden_vorgemerkt_ohne_den_zaehler_zurueckzusetzen() {
+        let mut liste = vec![to_hex(&k(1))];
+        let mut runden: BTreeMap<String, u8> = [(to_hex(&k(1)), 3)].into_iter().collect();
+        zurueckgestellte_vormerken(&mut liste, &mut runden, &[k(1), k(2)]);
+        assert_eq!(liste, vec![to_hex(&k(1)), to_hex(&k(2))]);
+        assert_eq!(runden.get(&to_hex(&k(1))), Some(&3), "vorhanden: unveraendert");
+        assert_eq!(runden.get(&to_hex(&k(2))), Some(&0), "neu");
+
+        let mut voll: Vec<String> = (0..MAX_ANGEFORDERT).map(|i| format!("{:064x}", i)).collect();
+        let mut zaehler: BTreeMap<String, u8> = voll.iter().map(|i| (i.clone(), 0)).collect();
+        zurueckgestellte_vormerken(&mut voll, &mut zaehler, &[k(9)]);
+        assert_eq!(voll.len(), MAX_ANGEFORDERT);
+        assert_eq!(zaehler.len(), MAX_ANGEFORDERT);
+        assert_eq!(voll.last().unwrap(), &to_hex(&k(9)));
     }
 
     #[test]

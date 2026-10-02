@@ -212,6 +212,19 @@ fn main() {
     // Das Nichtwarten haengt am blossen Schalter, nicht an BRIAR_API_TCP:
     // es ist genau fuer die alte Oberflaeche da, die ihn setzt.
     instanzsperre(&state_path, api_port.is_none());
+
+    // Antwortet am Sockel schon ein Dienst, gehen wir -- und zwar vor allem
+    // anderen. Die Instanzsperre haelt einen zweiten sonst auf, aber nicht,
+    // wenn sie selbst nicht zu haben war ("running unlocked"). Dann leerte
+    // der zweite frueher erst den Laufzeitordner des ersten und schrieb ein
+    // neues api-token, bevor lauscher_oeffnen ihn bemerkte; die Oberflaeche
+    // bekam vom ersten danach nur noch 401 (7b, A2; Nachpruefung 8, N1).
+    // Kein Fehler: es laeuft ja einer.
+    let sockel = api_socket.unwrap_or_else(|| briarkern::api::sockel_pfad(&state_path));
+    if briarkern::api::sockel_lebt(&sockel) {
+        net::log("another briard answers on the API socket -- exiting");
+        std::process::exit(0);
+    }
     let tcp_port =
         briarkern::api::tcp_erlaubt(api_port, std::env::var_os("BRIAR_API_TCP").as_deref());
     if api_port.is_some() && tcp_port.is_none() {
@@ -245,13 +258,10 @@ fn main() {
     // Die Lauscher einmal oeffnen -- nach der Instanzsperre (sonst raeumte
     // ein zweiter Dienst den Sockel des ersten weg) und nach dem Geheimnis.
     // Der Wartedienst und danach api::run bedienen dieselben.
-    let sockel = api_socket.unwrap_or_else(|| briarkern::api::sockel_pfad(&state_path));
     let lauscher = match briarkern::api::lauscher_oeffnen(&state_path, &sockel, tcp_port) {
         Ok(l) => l,
-        // Am Sockel antwortet schon ein Dienst. Die Instanzsperre haelt einen
-        // zweiten sonst auf -- aber nicht, wenn sie selbst nicht zu haben war
-        // ("running unlocked"); dann nahm der zweite dem ersten frueher den
-        // Sockel weg (7b, A2). Kein Fehler: es laeuft ja einer.
+        // Am Sockel antwortet doch ein Dienst: er kam erst nach dem Anklopfen
+        // oben hoch. Selten, aber dieselbe Antwort.
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             net::log("another briard answers on the API socket -- exiting");
             std::process::exit(0);

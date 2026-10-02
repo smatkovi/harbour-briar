@@ -80,7 +80,11 @@ fn bedienen(mut strom: Strom, pfad: &Path, lan_port: u16) -> Option<Store> {
     // Begrenzt wie die grosse Schnittstelle (Sicherheitsbefund H2).
     let mut leser = BufReader::new(strom.try_clone().ok()?).take(64 * 1024 + 4096);
     let mut zeile = String::new();
-    leser.read_line(&mut zeile).ok()?;
+    // Nichts gelesen: ein zweiter Dienst hat nur angeklopft (api::sockel_lebt)
+    // -- dem keine Antwort hinterherschreiben.
+    if leser.read_line(&mut zeile).ok()? == 0 {
+        return None;
+    }
     let mut teile = zeile.split_whitespace();
     let verb = teile.next().unwrap_or("");
     let weg = teile.next().unwrap_or("");

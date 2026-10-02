@@ -42,6 +42,12 @@ public:
     void setVersandOrdner(const QString &ordner)
     {
         m_versand = ordner;
+        // Ohne abschliessenden Schraegstrich: mit "/" am Ende folgt lstat
+        // einem Link, isSymLink() sagt dann nein, und ein Link auf den
+        // Bilderordner galt als echter Ordner -- der wuerde gleich unten
+        // geleert (Nachpruefung 8, N6).
+        while (m_versand.length() > 1 && m_versand.endsWith(QLatin1Char('/')))
+            m_versand.chop(1);
         if (!versandBereit())
             return;
         const QFileInfoList reste = QDir(m_versand).entryInfoList(
@@ -62,6 +68,11 @@ public:
         if (p.startsWith(QLatin1String("file://")))
             p = p.mid(7);
         if (p.isEmpty() || m_versand.isEmpty())
+            return;
+        // Ist der versand-Ordner selbst ein Link, zeigte canonicalFilePath
+        // unten dorthin, wohin er zeigt -- etwa auf den Bilderordner, und das
+        // Original fiele (Nachpruefung 8, N6). Dann nichts loeschen.
+        if (QFileInfo(m_versand).isSymLink())
             return;
         const QString ordner = QFileInfo(m_versand).canonicalFilePath();
         const QFileInfo datei(p);
