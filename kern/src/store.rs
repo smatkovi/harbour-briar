@@ -505,6 +505,23 @@ fn anhang_vorbereiten(
     }))
 }
 
+/// Liegengebliebene `*.neu` im Anhangordner entfernen -- nur gewoehnliche
+/// Dateien: keinem Link folgen, keinen Ordner anfassen.
+fn neu_reste_entfernen(ordner: &Path) {
+    let Ok(eintraege) = std::fs::read_dir(ordner) else {
+        return;
+    };
+    for eintrag in eintraege.flatten() {
+        let pfad = eintrag.path();
+        if pfad.extension().map(|e| e == "neu").unwrap_or(false)
+            // file_type folgt keinem Link (lstat).
+            && eintrag.file_type().map(|t| t.is_file()).unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&pfad);
+        }
+    }
+}
+
 /// Einen einzelnen Anhang gleich umlegen -- fuer das Nachholen beim Oeffnen,
 /// wo jeder Anhang fuer sich gelingt oder nicht. Die alte Datei (falls sie
 /// anders heisst) kommt zurueck und wird erst geloescht, wenn der Zustand
@@ -1220,19 +1237,47 @@ impl Store {
                 return Err(fehler(format!("ein Anhang liess sich nicht umlegen: {}", e)));
             }
         }
+        // Was jeder Eintrag vorher war, fuer den Rueckweg, falls das
+        // Speichern scheitert.
+        let mut vorher: Vec<(String, String, bool)> = Vec::new();
+        let mut neue_dateien = Vec::new();
         for u in vorbereitet {
             if let Some(anhang) = self.state.attachments.get_mut(&u.id) {
+                vorher.push((u.id.clone(), anhang.path.clone(), anhang.versiegelt));
                 anhang.path = u.ziel.to_string_lossy().to_string();
                 anhang.versiegelt = neues.is_some();
             }
             if u.alt != u.ziel {
                 alte_dateien.push(u.alt);
+                neue_dateien.push(u.ziel);
             }
         }
-        self.siegel = neues;
-        // Kopien aus der Zeit davor gelten nicht mehr.
+        let altes = std::mem::replace(&mut self.siegel, neues);
+        // Scheitert das Speichern, gilt auf der Platte weiter das alte
+        // Passwort -- dann auch hier (Nachpruefung 8, N3). Frueher stand im
+        // Speicher schon das neue Siegel, /password meldete einen Fehler,
+        // und das naechste erfolgreiche Speichern haette das neue still
+        // festgeschrieben. Die alten Dateien liegen noch (geloescht wird erst
+        // nach dem Speichern), die Eintraege zeigen wieder auf sie. Wo der
+        // Name gleich blieb, ist die neue Fassung schon an ihrem Platz; sie
+        // traegt denselben Speicherschluessel und bleibt lesbar.
+        if let Err(e) = self.save() {
+            self.siegel = altes;
+            for (id, pfad, versiegelt) in vorher {
+                if let Some(anhang) = self.state.attachments.get_mut(&id) {
+                    anhang.path = pfad;
+                    anhang.versiegelt = versiegelt;
+                }
+            }
+            for datei in neue_dateien {
+                let _ = std::fs::remove_file(datei);
+            }
+            crate::net::log("the state could not be saved -- the password stays as it was");
+            return Err(e);
+        }
+        // Kopien aus der Zeit davor gelten nicht mehr -- erst nach dem
+        // Speichern, sonst waeren sie nach einem Fehlschlag grundlos weg.
         self.anhang_kopien_leeren();
-        self.save()?;
         // Erst jetzt: vorher zeigte der gespeicherte Zustand noch auf sie.
         for datei in alte_dateien {
             let _ = std::fs::remove_file(datei);
@@ -1499,6 +1544,12 @@ impl Store {
                 store.verwerfe_gruppenpost(contact_id, &group_hex);
             }
         }
+        // Halbfertige Fassungen (`<ziel>.neu`) von einem Passwortwechsel, den
+        // ein Absturz oder ein volles Dateisystem unterbrochen hat. Auf sie
+        // zeigt kein Eintrag; liegen bleiben sie sonst fuer immer
+        // (Nachpruefung 8, N3). Vor dem Nachholen unten, das selbst solche
+        // Dateien anlegt.
+        neu_reste_entfernen(&store.attachment_dir());
         // Mit Passwort, aber noch Klartext-Anhaenge auf der Platte: aus einer
         // Fassung, die sie nie versiegelt hat, oder ein Umlegen ist beim
         // Passwortsetzen fehlgeschlagen. Jetzt nachholen. Kein eigener
@@ -2865,6 +2916,91 @@ mod anhang_tests {
         let s = mit_passwort(&o, "geheim");
         assert_eq!(s.attachment("a1").unwrap().path, a.path);
         assert_eq!(std::fs::read(s.anhang_pfad("a1").unwrap()).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    /// Nachpruefung 8, N3: scheitert das Speichern beim ersten Passwort,
+    /// bleibt alles offen -- im Speicher, auf der Platte und bei den
+    /// Anhaengen; keine halbe .siegel-Datei bleibt liegen.
+    #[test]
+    fn scheitert_das_speichern_bleibt_der_speicher_offen() {
+        let o = ordner("speichern-scheitert");
+        let mut s = speicher(&o);
+        let klar = s.store_attachment("a1", "image/png", PNG).unwrap();
+        // Ein Ordner, wo save() seine state.tmp schreiben will: EISDIR.
+        std::fs::create_dir(o.join("state.tmp")).unwrap();
+        assert!(s.passwort_setzen(None, "geheim").is_err());
+        assert!(!s.verschluesselt(), "im Speicher kein Passwort");
+        assert!(!Store::ist_verschluesselt(&o.join("state.json")), "auf der Platte keines");
+        let a = s.attachment("a1").unwrap();
+        assert_eq!(a.path, klar);
+        assert!(!a.versiegelt);
+        assert_eq!(std::fs::read(&klar).unwrap(), PNG);
+        let reste: Vec<_> = std::fs::read_dir(s.attachment_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n != "a1.png")
+            .collect();
+        assert!(reste.is_empty(), "liegengeblieben: {:?}", reste);
+        // Ist der Weg wieder frei, geht es.
+        std::fs::remove_dir(o.join("state.tmp")).unwrap();
+        s.passwort_setzen(None, "geheim").unwrap();
+        assert!(s.verschluesselt());
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    /// Nachpruefung 8, N3: scheitert das Speichern beim Wechsel, gilt das
+    /// alte Passwort weiter, im Speicher wie auf der Platte, und die Anhaenge
+    /// bleiben lesbar. Die entschluesselten Kopien bleiben auch.
+    #[test]
+    fn scheitert_das_speichern_beim_wechsel_bleibt_das_alte_passwort() {
+        let o = ordner("wechsel-speichern");
+        let mut s = speicher(&o);
+        s.passwort_setzen(None, "alt").unwrap();
+        s.store_attachment("a1", "image/png", PNG).unwrap();
+        s.save().unwrap();
+        let kopie = s.anhang_pfad("a1").unwrap();
+        std::fs::create_dir(o.join("state.tmp")).unwrap();
+        assert!(s.passwort_setzen(Some("alt"), "neu").is_err());
+        assert!(Path::new(&kopie).exists(), "die Kopie bleibt");
+        // Im Speicher: "neu" gilt nicht als altes Passwort, "alt" schon.
+        let falsch = s.passwort_setzen(Some("neu"), "");
+        assert_eq!(falsch.map_err(|e| e.kind()), Err(std::io::ErrorKind::PermissionDenied));
+        assert!(s.passwort_stimmt("alt"));
+        std::fs::remove_dir(o.join("state.tmp")).unwrap();
+        drop(s);
+        assert!(Store::open_mit_passwort(&o.join("state.json"), 7327, "neu").is_err());
+        let s = mit_passwort(&o, "alt");
+        assert_eq!(std::fs::read(s.anhang_pfad("a1").unwrap()).unwrap(), PNG);
+        let _ = std::fs::remove_dir_all(&o);
+    }
+
+    /// Nachpruefung 8, N3: halbfertige `*.neu` raeumt das Oeffnen weg --
+    /// aber nur gewoehnliche Dateien, keinen Link und keinen Ordner.
+    #[test]
+    fn liegengebliebene_neu_dateien_raeumt_das_oeffnen_weg() {
+        let o = ordner("neu-reste");
+        let s = speicher(&o);
+        let anhaenge = s.attachment_dir();
+        drop(s);
+        std::fs::create_dir_all(&anhaenge).unwrap();
+        let rest = anhaenge.join("a1.png.siegel.neu");
+        std::fs::write(&rest, b"halb").unwrap();
+        let fremd = o.join("fremd.txt");
+        std::fs::write(&fremd, b"bleibt").unwrap();
+        let link = anhaenge.join("link.neu");
+        std::os::unix::fs::symlink(&fremd, &link).unwrap();
+        let ordner_neu = anhaenge.join("ordner.neu");
+        std::fs::create_dir(&ordner_neu).unwrap();
+        let andere = anhaenge.join("a2.png");
+        std::fs::write(&andere, PNG).unwrap();
+        drop(speicher(&o));
+        assert!(!rest.exists(), "der Rest ist weg");
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "der Link bleibt");
+        assert_eq!(std::fs::read(&fremd).unwrap(), b"bleibt");
+        assert!(ordner_neu.is_dir(), "der Ordner bleibt");
+        assert!(andere.exists(), "andere Dateien bleiben");
         let _ = std::fs::remove_dir_all(&o);
     }
 

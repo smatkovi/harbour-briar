@@ -86,7 +86,9 @@ function geheimnisHolen() {
 // Signal zurueck, das die QML-Wurzel an antwortErhalten weitergibt. Gesetzt
 // wird die Bruecke wie die Geheimnisquelle als Eigenschafts-Bindung der
 // Wurzel. Ohne Bruecke (Werkzeuge, qmlscene) geht es wie frueher ueber
-// XMLHttpRequest an base -- das braucht einen Dienst mit --api-port.
+// XMLHttpRequest an base -- das braucht einen Dienst mit --api-port UND
+// BRIAR_API_TCP=1 in seiner Umgebung; --api-port allein oeffnet keinen Port
+// (api::tcp_erlaubt).
 var bruecke = null
 // Die Rueckrufe der laufenden Anfragen, nach ihrer Nummer.
 var offen = {}

@@ -323,6 +323,15 @@ pub enum Lauscher {
     Tcp(TcpListener),
 }
 
+/// Antwortet am Sockel ein lebender Dienst? Nur connect(), ohne ein Byte zu
+/// schicken: ein toter Sockel lehnt ab (ECONNREFUSED), ein fehlender gibt
+/// ENOENT. main.rs fragt das gleich nach der Instanzsperre -- vor allem, was
+/// einem laufenden Dienst etwas wegnaehme (Laufzeitordner, Geheimnis,
+/// Sockel), Nachpruefung 8, N1.
+pub fn sockel_lebt(pfad: &Path) -> bool {
+    UnixStream::connect(pfad).is_ok()
+}
+
 impl Lauscher {
     /// Den Sockel anlegen: ein alter von einem beendeten Dienst wird vorher
     /// entfernt, danach bekommt die Datei 0600. Der Ordner ist dann schon
@@ -335,10 +344,12 @@ impl Lauscher {
     /// still den Sockel weg (7b, A2). Darum vorher anklopfen: antwortet
     /// jemand, ist dort ein lebender Dienst, und die Antwort ist `AddrInUse`
     /// -- main.rs beendet sich dann. Ein toter Sockel lehnt ab
-    /// (ECONNREFUSED) und wird ersetzt.
+    /// (ECONNREFUSED) und wird ersetzt. main.rs klopft schon vorher selbst
+    /// an (`sockel_lebt`); dieses hier faengt nur noch den Fall, dass einer
+    /// genau dazwischen hochkam.
     pub fn unix(pfad: &Path) -> std::io::Result<Lauscher> {
         use std::os::unix::fs::PermissionsExt;
-        if UnixStream::connect(pfad).is_ok() {
+        if sockel_lebt(pfad) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 "another briard answers on the API socket",
@@ -503,7 +514,27 @@ fn serve(store: Shared, socket: Strom) -> std::io::Result<()> {
     let mut request_line = String::new();
     // Die Anfragezeile hoechstens 8 KiB, gelesen mit genau dieser Grenze --
     // nicht erst hinterher gemessen.
-    (&mut reader).take(8192 + 1).read_line(&mut request_line)?;
+    //
+    // Geht die Gegenseite vor dem ersten Byte wieder, ist das kein Fehler:
+    // so klopft ein zweiter Dienst an (`sockel_lebt`). Frueher bekam er
+    // trotzdem eine 401, die ins Leere ging, und im Protokoll des ersten
+    // stand "API request failed: Broken pipe" (Nachpruefung 8, N1).
+    match (&mut reader).take(8192 + 1).read_line(&mut request_line) {
+        Ok(0) => return Ok(()),
+        Err(e)
+            if request_line.is_empty()
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+        {
+            return Ok(())
+        }
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
     if request_line.len() > 8192 {
         return antworten(socket, 414, &json!({"error": "request line too long"}));
     }

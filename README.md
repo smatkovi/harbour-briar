@@ -204,10 +204,10 @@ tools/      building, packaging, installing
 
 ## The interface
 
-The daemon answers HTTP/1.0 on `~/.local/share/harbour-briar/api.sock` (next
-to `state.json`; `--state` moves both, `--api-socket` only the socket). Every
-request needs the secret the daemon writes to `api-token` in the same
-directory at each start:
+The daemon answers HTTP/1.1, one request per connection (`Connection: close`),
+on `~/.local/share/harbour-briar/api.sock` (next to `state.json`; `--state`
+moves both, `--api-socket` only the socket). Every request needs the secret
+the daemon writes to `api-token` in the same directory at each start:
 
 ```sh
 D=~/.local/share/harbour-briar
@@ -218,6 +218,10 @@ curl --unix-socket $D/api.sock -H "Authorization: Bearer $(cat $D/api-token)" \
 TCP on `127.0.0.1` is for tests only: it needs both `--api-port <port>` and
 `BRIAR_API_TCP=1` in the environment. Without the variable `--api-port` opens
 no port — an interface up to 0.41.0 still passes it when it starts the daemon.
+
+`/messages` is not paged: it returns the whole history of a chat at once. Both
+interfaces accept at most 16 MiB per answer, so a very long chat can exceed
+that and then fails to load.
 
 ## Building
 

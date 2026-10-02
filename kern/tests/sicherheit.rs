@@ -630,3 +630,80 @@ fn drossel_laesst_eine_zeile_je_minute_durch() {
     assert!(!drossel_faellig(&zuletzt, 1_059_999));
     assert!(drossel_faellig(&zuletzt, 1_060_000));
 }
+
+/// Nachpruefung 8, N1: `sockel_lebt` sagt nur bei einem lauschenden Sockel
+/// ja -- nicht bei einem fehlenden, nicht bei einem toten.
+#[test]
+fn sockel_lebt_nur_mit_lauscher() {
+    use briarkern::api::sockel_lebt;
+    let mut d = std::env::temp_dir();
+    d.push(format!("briar-sich-lebt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let sockel = d.join("api.sock");
+    let fehlend = sockel_lebt(&sockel);
+    let lauscher = std::os::unix::net::UnixListener::bind(&sockel).unwrap();
+    let lebend = sockel_lebt(&sockel);
+    drop(lauscher);
+    let tot = sockel_lebt(&sockel);
+    let liegt = sockel.exists();
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(!fehlend, "kein Sockel");
+    assert!(lebend, "ein Lauscher");
+    assert!(liegt, "die Datei bleibt nach dem Ende liegen");
+    assert!(!tot, "toter Sockel");
+}
+
+/// Nachpruefung 8, N1: laeuft ein Dienst ohne Instanzsperre, geht ein
+/// zweiter, ohne ihm etwas wegzunehmen -- mit rc 0, das api-token byteweise
+/// unveraendert, die entschluesselten Kopien im Laufzeitordner bleiben.
+/// Der erste ist hier ein blosser Lauscher auf api.sock; die Sperre haelt
+/// niemand, genau wie bei "running unlocked".
+#[test]
+fn zweiter_dienst_laesst_das_geheimnis_des_ersten_stehen() {
+    let mut d = std::env::temp_dir();
+    d.push(format!("briar-sich-zweitstart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let laufzeit = d.join("laufzeit");
+    let kopien = laufzeit.join("harbour-briar").join("anhaenge");
+    std::fs::create_dir_all(&kopien).unwrap();
+    let kopie = kopien.join("bild.jpg");
+    std::fs::write(&kopie, b"entschluesselt").unwrap();
+    let pfad = d.join("state.json");
+    let token = d.join(briarkern::api::GEHEIMNIS_DATEI);
+    std::fs::write(&token, b"geheimnis-des-ersten").unwrap();
+    let erster = std::os::unix::net::UnixListener::bind(briarkern::api::sockel_pfad(&pfad)).unwrap();
+
+    let mut kind = std::process::Command::new(env!("CARGO_BIN_EXE_briard"))
+        .arg("--state")
+        .arg(&pfad)
+        .env("XDG_RUNTIME_DIR", &laufzeit)
+        .env("HOME", &d)
+        .env_remove("BRIAR_STATE_DIR")
+        .env_remove("BRIAR_API_TCP")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Hoechstens zehn Sekunden; laeuft er dann noch, ist er nicht gegangen.
+    let mut rc = None;
+    for _ in 0..200 {
+        if let Some(s) = kind.try_wait().unwrap() {
+            rc = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if rc.is_none() {
+        let _ = kind.kill();
+        let _ = kind.wait();
+    }
+    let token_nachher = std::fs::read(&token).ok();
+    let kopie_bleibt = kopie.exists();
+    drop(erster);
+    let _ = std::fs::remove_dir_all(&d);
+    let rc = rc.expect("der zweite Dienst ist nicht gegangen");
+    assert_eq!(rc.code(), Some(0));
+    assert_eq!(token_nachher.as_deref(), Some(&b"geheimnis-des-ersten"[..]), "api-token unveraendert");
+    assert!(kopie_bleibt, "der Laufzeitordner des ersten bleibt");
+}
