@@ -96,7 +96,9 @@ Page {
         // above every bubble, including one's own.
         delegate: Item {
             width: liste.width
-            height: blase.height + absender.height + 16
+            // Die Uhrzeit steht unter der Blase und gehoert zur Hoehe: ohne
+            // sie schiebt sich der naechste Beitrag darueber.
+            height: absender.height + blase.height + zeit.height + 16
 
             property bool eigen: fenster.zustand.identity
                                  && modelData.authorId === fenster.zustand.identity.authorId
@@ -142,6 +144,7 @@ Page {
             }
 
             Text {
+                id: zeit
                 textFormat: Text.PlainText
                 anchors {
                     top: blase.bottom

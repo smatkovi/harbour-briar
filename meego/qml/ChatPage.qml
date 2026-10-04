@@ -69,6 +69,13 @@ Page {
 
     property string loeschKennung: ""
 
+    // Eine einzelne Nachricht loeschen, mit Rueckfrage. Zwei Bereiche in der
+    // Blase rufen das -- die Blase selbst und jeder Anhang darauf.
+    function nachrichtLoeschen(kennung) {
+        seite.loeschKennung = kennung
+        einzelneLoeschen.open()
+    }
+
     QueryDialog {
         id: einzelneLoeschen
         titleText: fenster.tr("deleteMessage")
@@ -168,12 +175,25 @@ Page {
         // bubble instead makes the two chase each other, and the bubble ends
         // up a couple of characters wide.
         delegate: Item {
+            id: zeile
             width: liste.width
-            height: blase.height + 14
+            // Die Uhrzeit steht unter der Blase und gehoert zur Hoehe: ohne
+            // sie schiebt sich die naechste Nachricht darueber.
+            height: blase.height + zeit.height + 14
+
+            // Die Nachricht selbst. Im Anhang-Repeater ist `modelData` der
+            // Anhang, dort ist sie sonst nicht mehr zu erreichen.
+            property variant nachricht: modelData
+            // Die breiteste Anhangsvorschau. Die Kinder des Repeaters melden
+            // sie herauf -- ihre Kennungen gelten nur in ihrem eigenen
+            // Bauteil und sind von hier aus nicht sichtbar.
+            property real anhangBreite: 0
 
             Rectangle {
                 id: blase
-                width: Math.max(text.paintedWidth, bild.width, anhang.paintedWidth) + 28
+                width: Math.min(Math.max(text.visible ? text.paintedWidth : 0,
+                                         zeile.anhangBreite) + 28,
+                                liste.width - 20)
                 height: inhalt.height + 22
                 radius: 8
                 color: modelData.outgoing ? "#1d4d1d" : "#2a2a2a"
@@ -183,33 +203,35 @@ Page {
                     margins: 10
                 }
 
+                // Antippen zeigt den Anhang in der App -- eigene ebenso wie
+                // empfangene. Die Datei bleibt dabei im Datenordner. Der
+                // Bereich liegt vor der Spalte, damit ein Anhang den Tipp
+                // zuerst bekommt; in der Column selbst waere er fehl am
+                // Platz, denn Positionierer verbieten anchors.fill.
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        var anhaenge = Briar.attachmentsOf(zeile.nachricht)
+                        if (anhaenge.length > 0 && anhaenge[0].path)
+                            pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
+                                "pfad": anhaenge[0].path,
+                                "typ": "" + anhaenge[0].type,
+                                "groesse": anhaenge[0].size ? anhaenge[0].size : 0
+                            })
+                    }
+                    // Halten loescht sie -- nur hier, die Gegenseite
+                    // behaelt ihre Kopie.
+                    onPressAndHold: seite.nachrichtLoeschen(zeile.nachricht.id)
+                }
+
                 Column {
                     id: inhalt
                     x: 14
                     y: 11
+                    // Fest, nicht aus der Blase: so bleibt der Umbruch
+                    // unabhaengig davon, wie breit die Blase wird.
                     width: liste.width - 48
                     spacing: 6
-
-                    // Antippen zeigt den Anhang in der App -- eigene ebenso
-                    // wie empfangene. Die Datei bleibt dabei im Datenordner.
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            var liste = Briar.attachmentsOf(modelData)
-                            if (liste.length > 0 && liste[0].path)
-                                pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
-                                    "pfad": liste[0].path,
-                                    "typ": "" + liste[0].type,
-                                    "groesse": liste[0].size ? liste[0].size : 0
-                                })
-                        }
-                        // Halten loescht sie -- nur hier, die Gegenseite
-                        // behaelt ihre Kopie.
-                        onPressAndHold: {
-                            seite.loeschKennung = modelData.id
-                            einzelneLoeschen.open()
-                        }
-                    }
 
                     // Alle Anhaenge, nicht nur der erste: Briar haengt bis zu
                     // zehn Bilder an eine Nachricht.
@@ -219,6 +241,16 @@ Page {
                         Item {
                             width: parent.width
                             height: einzelbild.visible ? einzelbild.height : einzeltext.height
+
+                            // Was die Blase von diesem Anhang wissen muss.
+                            // Von aussen ist hier nichts zu sehen, also wird
+                            // es hinaufgemeldet; die breiteste gewinnt.
+                            property real eigenBreite: einzelbild.visible
+                                    ? einzelbild.width : einzeltext.paintedWidth
+                            onEigenBreiteChanged: if (eigenBreite > zeile.anhangBreite)
+                                                      zeile.anhangBreite = eigenBreite
+                            Component.onCompleted: if (eigenBreite > zeile.anhangBreite)
+                                                       zeile.anhangBreite = eigenBreite
 
                             Image {
                                 id: einzelbild
@@ -256,6 +288,11 @@ Page {
                                         "typ": "" + modelData.type,
                                         "groesse": modelData.size ? modelData.size : 0
                                     })
+                                // Auch auf dem Bild haelt man die Nachricht
+                                // zum Loeschen fest: dieser Bereich liegt
+                                // ueber dem der Blase und bekaeme es sonst
+                                // allein, ohne etwas damit zu tun.
+                                onPressAndHold: seite.nachrichtLoeschen(zeile.nachricht.id)
                             }
                         }
                     }
@@ -275,6 +312,7 @@ Page {
             }
 
             Text {
+                id: zeit
                 textFormat: Text.PlainText
                 anchors {
                     top: blase.bottom

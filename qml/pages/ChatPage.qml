@@ -228,6 +228,14 @@ Page {
         page.gewaehltAnzahl = 0
     }
 
+    // Eine einzelne Nachricht loeschen, mit Bedenkzeit. Zwei Bereiche in der
+    // Blase rufen das -- die Blase selbst und jeder Anhang darauf.
+    function nachrichtLoeschen(id) {
+        entfernen.execute(app.tr("deleteMessage"), function() {
+            Briar.deleteMessage(page.contactId, id, function() { page.reload() })
+        })
+    }
+
     SilicaListView {
         id: view
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: hinweisZeile.top }
@@ -288,13 +296,30 @@ Page {
             }
         }
 
+        // Der Inhalt bekommt zuerst seine eigene Breite, die Blase nimmt
+        // danach die, die wirklich gemalt wurde. Umgekehrt -- der Text so
+        // breit wie die Blase, die Blase so breit wie der Text -- jagen die
+        // beiden einander, und am Ende ist die Blase ein paar Zeichen breit.
         delegate: Item {
+            id: zeile
             width: view.width
-            height: bubble.height + Theme.paddingMedium
+            // Die Uhrzeit steht unter der Blase und gehoert zur Hoehe: ohne
+            // sie schiebt sich die naechste Nachricht darueber.
+            height: bubble.height + zeit.height + Theme.paddingMedium
+
+            // Die Nachricht selbst. Im Anhang-Repeater ist `modelData` der
+            // Anhang, dort ist sie sonst nicht mehr zu erreichen.
+            property var nachricht: modelData
+            // Die breiteste Anhangsvorschau. Die Kinder des Repeaters melden
+            // sie herauf -- ihre Kennungen gelten nur in ihrem eigenen
+            // Bauteil und sind von hier aus nicht sichtbar.
+            property real anhangBreite: 0
 
             Rectangle {
                 id: bubble
-                width: Math.min(content.widest + 2 * Theme.paddingMedium,
+                width: Math.min(Math.max(body.visible ? body.paintedWidth : 0,
+                                         zeile.anhangBreite)
+                                + 2 * Theme.paddingMedium,
                                 view.width * 0.8)
                 height: content.height + 2 * Theme.paddingMedium
                 radius: Theme.paddingSmall
@@ -309,47 +334,39 @@ Page {
                     margins: Theme.horizontalPageMargin
                 }
 
-                Column {
-                    id: content
-                    anchors.centerIn: parent
-                    width: parent.width - 2 * Theme.paddingMedium
-                    spacing: Theme.paddingSmall
-
-                    // What the bubble is sized from. Declaring implicitWidth
-                    // on a Column would shadow Item's own property.
-                    property real widest: Math.max(
-                            body.visible ? body.implicitWidth : 0,
-                            picture.visible ? picture.width : 0,
-                            other.visible ? other.implicitWidth : 0)
-
-                    // Ein Anhang laesst sich antippen und dann in der App
-                    // ansehen -- eigene ebenso wie empfangene. Aus der Hand
-                    // gegeben wird er dabei nicht: die Datei bleibt im
-                    // Datenordner, der auf 0700 steht.
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            if (page.auswahl) {
-                                page.auswahlUmschalten(modelData.id)
-                                return
-                            }
-                            var liste = Briar.attachmentsOf(modelData)
-                            if (liste.length > 0 && liste[0].path)
-                                pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
-                                    "pfad": liste[0].path,
-                                    "typ": "" + liste[0].type,
-                                    "groesse": liste[0].size || 0
-                                })
+                // Die ganze Blase ist antippbar. Sie liegt vor der Spalte,
+                // damit ein Anhang den Tipp zuerst bekommt. In einer Column
+                // waere sie fehl am Platz: Positionierer verbieten
+                // anchors.fill, der Bereich bliebe ohne Groesse.
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (page.auswahl) {
+                            page.auswahlUmschalten(zeile.nachricht.id)
+                            return
                         }
-                        // Halten loescht sie -- nur hier, die Gegenseite
-                        // behaelt ihre Kopie. Mit Bedenkzeit, denn zurueck
-                        // geht es nicht.
-                        onPressAndHold: entfernen.execute(
-                            app.tr("deleteMessage"), function() {
-                                Briar.deleteMessage(page.contactId, modelData.id,
-                                                    function() { page.reload() })
+                        var liste = Briar.attachmentsOf(zeile.nachricht)
+                        if (liste.length > 0 && liste[0].path)
+                            pageStack.push(Qt.resolvedUrl("AttachmentPage.qml"), {
+                                "pfad": liste[0].path,
+                                "typ": "" + liste[0].type,
+                                "groesse": liste[0].size || 0
                             })
                     }
+                    // Halten loescht sie -- nur hier, die Gegenseite
+                    // behaelt ihre Kopie. Mit Bedenkzeit, denn zurueck
+                    // geht es nicht.
+                    onPressAndHold: page.nachrichtLoeschen(zeile.nachricht.id)
+                }
+
+                Column {
+                    id: content
+                    x: Theme.paddingMedium
+                    y: Theme.paddingMedium
+                    // Fest, nicht aus der Blase: so bleibt der Umbruch
+                    // unabhaengig davon, wie breit die Blase wird.
+                    width: view.width * 0.8 - 2 * Theme.paddingMedium
+                    spacing: Theme.paddingSmall
 
                     // Alle Anhaenge, nicht nur der erste: Briar haengt bis
                     // zu zehn Bilder an eine Nachricht. Jeder laesst sich
@@ -360,6 +377,16 @@ Page {
                         Item {
                             width: parent.width
                             height: bild.visible ? bild.height : sonstiges.height
+
+                            // Was die Blase von diesem Anhang wissen muss.
+                            // Von aussen ist hier nichts zu sehen, also wird
+                            // es hinaufgemeldet; die breiteste gewinnt.
+                            property real eigenBreite: bild.visible
+                                    ? bild.width : sonstiges.paintedWidth
+                            onEigenBreiteChanged: if (eigenBreite > zeile.anhangBreite)
+                                                      zeile.anhangBreite = eigenBreite
+                            Component.onCompleted: if (eigenBreite > zeile.anhangBreite)
+                                                       zeile.anhangBreite = eigenBreite
 
                             // Die Quelle nur fuer Bilder: ein Image laedt auch
                             // unsichtbar, und Qt waehlt den Leser am Inhalt,
@@ -407,6 +434,11 @@ Page {
                                         "typ": "" + modelData.type,
                                         "groesse": modelData.size || 0
                                     })
+                                // Auch auf dem Bild haelt man die Nachricht
+                                // zum Loeschen fest: dieser Bereich liegt
+                                // ueber dem der Blase und bekaeme es sonst
+                                // allein, ohne etwas damit zu tun.
+                                onPressAndHold: page.nachrichtLoeschen(zeile.nachricht.id)
                             }
                         }
                     }
@@ -425,6 +457,7 @@ Page {
             }
 
             Label {
+                id: zeit
                 textFormat: Text.PlainText
                 anchors {
                     top: bubble.bottom
